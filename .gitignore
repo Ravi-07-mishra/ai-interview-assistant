@@ -1,0 +1,24 @@
+# Python
+ai-interview-ai-service/__pycache__/
+ai-interview-ai-service/.venv/
+*.pyc
+
+# Node
+node_modules/
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+
+# Backend
+ai-interview-backend/node_modules/
+ai-interview-backend/.env
+
+# Frontend
+ai-interview-frontend/node_modules/
+ai-interview-frontend/.next/
+ai-interview-frontend/out/
+ai-interview-frontend/.env.local
+
+# OS
+.DS_Store
+Thumbs.db
