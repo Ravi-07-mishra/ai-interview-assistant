@@ -22,3 +22,5 @@ ai-interview-frontend/.env.local
 # OS
 .DS_Store
 Thumbs.db
+.env
+**/.env
