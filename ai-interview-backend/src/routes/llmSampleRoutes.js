@@ -1,8 +1,9 @@
-import express from "express";
-import { saveSample } from "../controllers/llmSampleController.js";
-
+const express = require("express");
 const router = express.Router();
 
-router.post("/save", saveSample);
+const llmSampleController = require("../controllers/llmSampleController");
+const auth = require("../middleware/authMiddleware");
 
-export default router;
+router.post("/", auth, llmSampleController.createLLMSample);
+
+module.exports = router;
