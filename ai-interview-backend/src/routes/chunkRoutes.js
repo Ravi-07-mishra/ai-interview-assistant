@@ -1,8 +1,10 @@
-import express from "express";
-import { saveChunks } from "../controllers/chunkController.js";
-
+const express = require("express");
 const router = express.Router();
 
-router.post("/save", saveChunks);
+const chunkController = require("../controllers/chunkController");
+const auth = require("../middleware/authMiddleware");
 
-export default router;
+router.post("/", auth, chunkController.saveChunks);
+router.get("/document/:documentId", auth, chunkController.getChunksForDocument);
+
+module.exports = router;
