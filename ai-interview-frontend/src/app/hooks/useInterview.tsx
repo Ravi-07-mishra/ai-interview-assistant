@@ -1,3 +1,4 @@
+// hooks/useInterview.tsx
 "use client";
 
 import { useCallback, useState } from "react";
@@ -102,6 +103,40 @@ export function useInterview() {
     if (!token) return {};
     return { Authorization: `Bearer ${token}` };
   }, [token]);
+
+  /**
+   * reportViolation(reason)
+   * - always POSTs to /interview/violation with { sessionId, reason }
+   * - returns the parsed server response (or throws for network errors)
+   * - caller should handle or ignore failures as appropriate
+   */
+  const reportViolation = useCallback(async (reason: string) => {
+    if (!sessionId) {
+      // No active session: return a consistent shape so callers can proceed gracefully.
+      return { ok: false, error: "no_session", message: "No active sessionId" };
+    }
+
+    try {
+      const res = await fetch(`${API}/interview/violation`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+        body: JSON.stringify({
+          sessionId,
+          reason
+        })
+      });
+
+      // Try to parse JSON body safely
+      const body = await res.json().catch(() => ({}));
+
+      // Return server body so UI can inspect / show messages if needed.
+      return body;
+    } catch (e: any) {
+      // Network-level error — bubble up so callers can decide what to do.
+      console.warn("reportViolation network error", e?.message ?? e);
+      throw e;
+    }
+  }, [sessionId, getAuthHeaders]);
 
   const startInterview = useCallback(async () => {
     setError(null);
@@ -310,9 +345,18 @@ export function useInterview() {
     [sessionId, currentQuestion, buildConversationFromHistory, buildQuestionHistory, resumeParsed, token, getAuthHeaders]
   );
 
-  const endInterview = useCallback(async () => {
+  const endInterview = useCallback(async (reason?: string, markRejected = false) => {
     setError(null);
     
+    // best-effort: report violation/event before ending if reason present
+    if (reason) {
+      try {
+        await reportViolation(reason);
+      } catch (e) {
+        console.warn("reportViolation failed before endInterview", e);
+      }
+    }
+
     if (!token) {
       setError("Please log in to end the interview.");
       setStage("done");
@@ -330,12 +374,19 @@ export function useInterview() {
       const res = await fetch(`${API}/interview/end`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...getAuthHeaders() },
-        body: JSON.stringify({ sessionId }),
+        body: JSON.stringify({ sessionId, reason: reason ?? null, terminated_by_violation: !!markRejected }),
       });
       
+      const body = await res.json().catch(() => ({}));
       if (!res.ok) {
-        const b = await res.json().catch(() => ({}));
-        console.warn("endInterview error:", b);
+        console.warn("endInterview error:", body);
+      } else {
+        // if backend returned a decision, save it
+        if (body && body.finalDecisionRef) {
+          setFinalDecision({ ref: body.finalDecisionRef, reason: reason ?? null, terminated_by_violation: !!markRejected });
+        } else if (body && body.session && body.session.finalVerdict) {
+          setFinalDecision({ verdict: body.session.finalVerdict, reason: body.session.finalReason });
+        }
       }
     } catch (e) {
       console.warn("endInterview network error:", e);
@@ -343,7 +394,7 @@ export function useInterview() {
       setStage("done");
       setCurrentQuestion(null);
     }
-  }, [sessionId, token, getAuthHeaders]);
+  }, [sessionId, token, getAuthHeaders, reportViolation]);
 
   return {
     sessionId,
@@ -361,6 +412,7 @@ export function useInterview() {
     startInterview,
     submitAnswer,
     endInterview,
+    reportViolation,      // <-- expose this so components can call it directly if needed
     setResumeParsed,
     setError,
   };

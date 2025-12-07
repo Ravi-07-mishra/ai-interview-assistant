@@ -1,4 +1,4 @@
-// server.js - Fixed version with proper routing
+// server.js - Updated: adds /interview/violation and enhanced /interview/end handling
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
@@ -94,6 +94,7 @@ async function createSessionDB(userId = null, metadata = {}) {
     metadata, 
     status: "active", 
     qaIds: [],
+    events: [],
     startedAt: new Date() 
   });
   return s.toObject ? s.toObject() : s;
@@ -653,11 +654,40 @@ app.post("/interview/answer", requireAuth, async (req, res) => {
   }
 });
 
-// Interview end
+// ---------------- New: record a violation event ----------------
+app.post("/interview/violation", requireAuth, async (req, res) => {
+  try {
+    const { sessionId, reason, timestamp } = req.body || {};
+    if (!sessionId) return res.status(400).json({ error: "sessionId required" });
+
+    const s = await Session.findOne({ sessionId });
+    if (!s) return res.status(404).json({ error: "session_not_found" });
+
+    const ev = {
+      id: uuidv4(),
+      type: "violation",
+      reason: reason || "screen-change",
+      at: timestamp ? new Date(timestamp) : new Date(),
+      by: req.userId || null
+    };
+
+    // push event
+    await Session.updateOne({ sessionId }, { $push: { events: ev } });
+
+    console.log(`⚠️ Violation recorded for session ${sessionId}: ${ev.reason}`);
+
+    return res.json({ ok: true, event: ev });
+  } catch (err) {
+    console.error("❌ Violation recording failed:", err.message);
+    return res.status(500).json({ error: "failed_to_record_violation" });
+  }
+});
+
+// Interview end (enhanced: accept reason + terminated_by_violation)
 app.post("/interview/end", requireAuth, async (req, res) => {
   try {
     console.log("🏁 Ending interview:", req.body.sessionId);
-    const { sessionId } = req.body || {};
+    const { sessionId, reason, terminated_by_violation } = req.body || {};
     if (!sessionId) return res.status(400).json({ error: "missing sessionId" });
 
     const s = await getSessionByIdDB(sessionId);
@@ -667,15 +697,53 @@ app.post("/interview/end", requireAuth, async (req, res) => {
     const scores = recs.map(r => r.score).filter(v => v !== null && v !== undefined && !isNaN(v));
     const avgScore = scores.length ? (scores.reduce((a, b) => a + b, 0) / scores.length) : null;
 
-    await markSessionCompletedDB(sessionId);
-    
-    console.log("✅ Interview ended successfully");
-    
+    const extras = {};
+    if (reason) extras.endedReason = reason;
+    if (terminated_by_violation) {
+      extras.terminatedByViolation = true;
+      extras.finalVerdict = "reject";
+      extras.finalReason = reason || "screen-change violation";
+    }
+
+    // mark session completed with extras
+    const updatedSession = await markSessionCompletedDB(sessionId, extras);
+
+    // if terminated by violation, create a Decision record for audit trail
+    let decisionDoc = null;
+    if (terminated_by_violation) {
+      try {
+        decisionDoc = await Decision.create({
+          decisionId: uuidv4(),
+          sessionId,
+          decidedBy: "system",
+          verdict: "reject",
+          confidence: 1.0,
+          reason: extras.finalReason,
+          recommended_role: null,
+          key_strengths: [],
+          critical_weaknesses: [],
+          rawModelOutput: { terminated_by_violation: true, reason: extras.finalReason },
+          performanceMetrics: { averageScore: avgScore },
+          decidedAt: new Date()
+        });
+
+        // link to session
+        await Session.findOneAndUpdate({ sessionId }, { $set: { finalDecisionRef: decisionDoc._id } });
+      } catch (e) {
+        console.warn("⚠️ Failed to create Decision for violation end:", e.message);
+      }
+    }
+
+    console.log("✅ Interview ended successfully", { sessionId, terminated_by_violation: !!terminated_by_violation });
+
     return res.json({ 
       ok: true, 
       sessionId, 
       finalScore: avgScore !== null ? Math.round(avgScore * 1000) / 10 : null,
-      totalQuestions: recs.length
+      totalQuestions: recs.length,
+      terminated_by_violation: !!terminated_by_violation,
+      finalDecisionRef: decisionDoc ? decisionDoc._id : null,
+      session: updatedSession
     });
   } catch (err) {
     console.error("❌ Interview end error:", err.message);
@@ -713,6 +781,7 @@ app.use((req, res) => {
       "POST /process-resume",
       "POST /interview/start",
       "POST /interview/answer",
+      "POST /interview/violation",
       "POST /interview/end"
     ]
   });
