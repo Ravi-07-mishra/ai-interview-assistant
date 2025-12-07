@@ -1,8 +1,10 @@
-import express from "express";
-import { saveQA } from "../controllers/qaRecordController.js";
-
+const express = require("express");
 const router = express.Router();
 
-router.post("/save", saveQA);
+const qaRecordController = require("../controllers/qaRecordController");
+const auth = require("../middleware/authMiddleware");
 
-export default router;
+router.post("/", auth, qaRecordController.createQARecord);
+router.get("/session/:sessionId", auth, qaRecordController.getQAForSession);
+
+module.exports = router;
