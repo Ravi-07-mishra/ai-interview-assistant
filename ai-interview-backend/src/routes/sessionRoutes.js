@@ -1,9 +1,11 @@
-import express from "express";
-import { startSession, endSession } from "../controllers/sessionController.js";
-
+const express = require("express");
 const router = express.Router();
 
-router.post("/start", startSession);
-router.post("/end/:id", endSession);
+const sessionController = require("../controllers/sessionController");
+const auth = require("../middleware/authMiddleware");
 
-export default router;
+router.post("/", auth, sessionController.createSession);
+router.patch("/:id/end", auth, sessionController.endSession);
+router.get("/:id", auth, sessionController.getSession);
+
+module.exports = router;
