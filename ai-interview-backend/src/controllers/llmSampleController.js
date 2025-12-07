@@ -1,6 +1,19 @@
-import LLMSample from "../models/LLMSample.js";
+const LLMSample = require("../modells/LLMSample");
 
-export const saveSample = async (req, res) => {
-    const sample = await LLMSample.create(req.body);
-    res.json(sample);
+exports.createLLMSample = async (req, res) => {
+  try {
+    const { sessionId, prompt, rawOutput, meta } = req.body;
+
+    const sample = await LLMSample.create({
+      sessionId,
+      prompt,
+      rawOutput,
+      meta
+    });
+
+    res.status(201).json(sample);
+  } catch (err) {
+    console.error("Create LLM sample error:", err.message);
+    res.status(500).json({ error: "Failed to create LLM sample" });
+  }
 };
