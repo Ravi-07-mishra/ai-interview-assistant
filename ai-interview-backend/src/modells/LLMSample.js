@@ -1,9 +1,13 @@
-import mongoose from "mongoose";
+const mongoose = require("mongoose");
 
-const llmSampleSchema = new mongoose.Schema({
-  prompt: String,
-  rawOutput: String,
-  meta: Object
-}, { timestamps: true });
+const llmSampleSchema = new mongoose.Schema(
+  {
+    sessionId: { type: mongoose.Schema.Types.ObjectId, ref: "Session" },
+    prompt: { type: String, required: true },
+    rawOutput: { type: String, required: true },
+    meta: { type: Object, default: {} }
+  },
+  { timestamps: true }
+);
 
-export default mongoose.model("LLMSample", llmSampleSchema);
+module.exports = mongoose.model("LLMSample", llmSampleSchema);
