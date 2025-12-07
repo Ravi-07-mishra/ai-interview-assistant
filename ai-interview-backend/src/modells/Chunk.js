@@ -1,9 +1,13 @@
-import mongoose from "mongoose";
+const mongoose = require("mongoose");
 
-const chunkSchema = new mongoose.Schema({
-  documentId: { type: mongoose.Schema.Types.ObjectId, ref: "Document" },
-  content: String,
-  vector: [Number]
-}, { timestamps: true });
+const chunkSchema = new mongoose.Schema(
+  {
+    documentId: { type: mongoose.Schema.Types.ObjectId, ref: "Document", required: true },
+    index: { type: Number },     // order of chunk in doc
+    content: { type: String, required: true },
+    vector: { type: [Number], default: [] }  // embedding
+  },
+  { timestamps: true }
+);
 
-export default mongoose.model("Chunk", chunkSchema);
+module.exports = mongoose.model("Chunk", chunkSchema);
