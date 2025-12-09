@@ -138,11 +138,39 @@ export function useInterview() {
     }
   }, [sessionId, getAuthHeaders]);
 
-  const startInterview = useCallback(async () => {
+  const startInterview = useCallback(async (
+    jobTitle?: string,
+    difficulty?: string,
+    techStack?: string,
+    existingSessionId?: string, // NEW: Accept existing session ID
+    existingQuestionData?: any  // NEW: Accept existing question data
+  ) => {
     setError(null);
     setLastFeedback(null);
     setPerformanceMetrics(null);
+if (existingSessionId && existingQuestionData) {
+        console.log("Hydrating interview state from existing session:", existingSessionId);
+        setSessionId(existingSessionId);
+        
+        // Normalize the question data passed from the Page
+        const backendId = existingQuestionData.qaId || existingQuestionData.questionId;
+        const normalizedQuestion: InterviewQuestion = {
+            questionId: backendId || `q_${Date.now()}`,
+            questionText: existingQuestionData.question || existingQuestionData.questionText || "",
+            target_project: existingQuestionData.target_project,
+            technology_focus: existingQuestionData.technology_focus,
+            expectedAnswerType: existingQuestionData.expected_answer_type || existingQuestionData.expectedAnswerType || "medium",
+            difficulty: existingQuestionData.difficulty || "medium",
+            ideal_outline: existingQuestionData.ideal_answer_outline || existingQuestionData.ideal_outline || "",
+            red_flags: existingQuestionData.red_flags || [],
+            confidence: existingQuestionData.confidence
+        };
 
+        setCurrentQuestion(normalizedQuestion);
+        setStage("running");
+        setLoading(false);
+        return; // EXIT EARLY - Do not fetch again
+    }
     if (!token) {
       setError("Please log in to start an interview.");
       return;

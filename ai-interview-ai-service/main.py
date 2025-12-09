@@ -11,7 +11,15 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from groq import Groq
 from dotenv import load_dotenv
+from deepface import DeepFace
+import cv2
+from fastapi.responses import JSONResponse
+import numpy as np
+import base64
 import os, io, json, re, logging
+from typing import Dict
+import time
+FACE_DB: Dict[str, Dict[str, Any]] = {}  # sessionId -> {embedding: [...], thumbnail_b64: str, created: ts}
 
 import pdfplumber, docx2txt, requests
 
@@ -27,10 +35,12 @@ DEFAULT_TOKEN_BUDGET = int(os.getenv("DEFAULT_TOKEN_BUDGET", "5000"))
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 app = FastAPI(title="Enhanced AI Interview Service")
-
+STRICT_DISTANCE_THRESHOLD = 0.55
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai-service")
-
+print("⏳ Loading VGG-Face model... please wait...")
+DeepFace.build_model("VGG-Face")
+print("✅ Model loaded!")
 # ==========================================
 # CORE CONFIGURATION
 # ==========================================
@@ -86,13 +96,75 @@ def extract_text_from_pdf_bytes(b: bytes) -> str:
     except Exception:
         return ""
     return "\n".join(text_parts)
+import base64
+import numpy as np
+import cv2
+import logging
+from typing import Optional
+import binascii # Import this for specific error catching
 
+logger = logging.getLogger("ai-service")
+
+def decode_base64_image(base64_string: str) -> Optional[np.ndarray]:
+    """Decodes a Base64 string (data:image/jpeg;base64,...) to an OpenCV NumPy array."""
+    if not base64_string:
+        logger.error("Received empty base64 string.")
+        return None
+
+    original_start = base64_string[:50]
+    
+    # 1. Strip common prefixes (e.g., 'data:image/jpeg;base64,')
+    if "," in base64_string:
+        base64_string = base64_string.split(",", 1)[1]
+    
+    # Add a check for padding issues (DeepFace images are usually padded with '=')
+    # base64.b64decode requires the input length to be a multiple of 4.
+    padding_needed = len(base64_string) % 4
+    if padding_needed != 0:
+        base64_string += "=" * (4 - padding_needed)
+
+    # Log the state after stripping/padding
+    logger.info(f"[B64] Original Start: {original_start} | Final Length: {len(base64_string)}")
+
+    try:
+        # 2. Decode base64 to bytes (Note: DeepFace doesn't always send canonical Base64)
+        image_bytes = base64.b64decode(base64_string, validate=True) 
+        
+        # 3. Convert bytes to a NumPy array
+        np_arr = np.frombuffer(image_bytes, np.uint8)
+        
+        # 4. Decode the NumPy array into an image (OpenCV format)
+        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        
+        if img is None:
+            logger.error("cv2.imdecode failed, possibly invalid image data.")
+        return img
+    except binascii.Error as e:
+        logger.error(f"[B64 ERROR] Base64 decoding failed: {e}. Check padding/chars.")
+        return None
+    except Exception as e:
+        logger.error(f"[CONV ERROR] Image conversion failed: {e}")
+        return None
 def extract_text_from_docx_bytes(b: bytes) -> str:
     try:
         return docx2txt.process(io.BytesIO(b))
     except Exception:
         return ""
-
+def make_thumbnail_b64(img: np.ndarray, max_w: int = 160) -> str:
+    try:
+        h, w = img.shape[:2]
+        if w > max_w:
+            scale = max_w / float(w)
+            img_small = cv2.resize(img, (int(w * scale), int(h * scale)))
+        else:
+            img_small = img.copy()
+        # convert BGR -> JPEG bytes
+        ok, buf = cv2.imencode(".jpg", img_small, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+        if not ok:
+            return ""
+        return "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode("ascii")
+    except Exception:
+        return ""
 def redact_pii(text: str) -> Dict[str, Any]:
     if not text:
         return {"redacted": "", "redaction_log": []}
@@ -1030,7 +1102,12 @@ class GenerateQuestionRequest(BaseModel):
     token_budget: Optional[int] = DEFAULT_TOKEN_BUDGET
     allow_pii: Optional[bool] = False
     options: Optional[Dict[str,Any]] = {}
-
+class FaceVerificationRequest(BaseModel):
+    reference_image: str
+    current_image: str
+class FaceRegisterRequest(BaseModel):
+    sessionId: str
+    image: str  # This is the base64 string    
 class ScoreAnswerRequest(BaseModel):
     request_id: str
     session_id: str
@@ -1136,7 +1213,94 @@ def generate_question(req: GenerateQuestionRequest):
         "parsed": parsed,
         "redaction_log": redaction_log
     }
+@app.post("/interview/register-face")
+async def register_face(request: FaceRegisterRequest):
+    """
+    Decode, validate, detect face, create embedding, and store it for the session.
+    Returns 400 if image invalid / no face detected so frontend won't proceed.
+    """
+    try:
+        if not request.image:
+            raise HTTPException(status_code=400, detail="No image provided")
 
+        # 1) decode base64 into OpenCV image
+        img = decode_base64_image(request.image)
+        if img is None:
+            raise HTTPException(status_code=400, detail="Image decoding failed. Check Base64/data URL format.")
+
+        # 2) quick quality checks (brightness + contrast/variance)
+        try:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            mean, stddev = cv2.meanStdDev(gray)
+            mean_val = float(mean[0][0])
+            stddev_val = float(stddev[0][0])
+        except Exception as e:
+            logger.warning("Image quality check failed to compute stats: %s", e)
+            mean_val, stddev_val = 0.0, 0.0
+
+        if mean_val < 16:
+            raise HTTPException(status_code=400, detail=f"Captured image too dark (mean={mean_val:.1f}). Improve lighting.")
+        if mean_val > 250:
+            raise HTTPException(status_code=400, detail=f"Captured image too bright (mean={mean_val:.1f}). Avoid bright backlight.")
+        if stddev_val < 6:
+            raise HTTPException(status_code=400, detail=f"Captured image low-contrast or blurry (stddev={stddev_val:.1f}). Please hold still and ensure face is focused.")
+
+        # 3) attempt to extract an embedding via DeepFace (enforce_detection => raises if no face)
+        try:
+            # DeepFace.represent returns a list of embeddings when given an image array
+            # We force enforce_detection=True so it raises if a face isn't found.
+            rep = DeepFace.represent(img_path=img, model_name="VGG-Face", detector_backend="mtcnn", enforce_detection=True)
+            # The representation can be returned in different formats depending on deepface version.
+            # Normalize to a plain list of floats
+            embedding = None
+            if isinstance(rep, list) and len(rep) > 0:
+                # rep might be a list of dicts or list of vectors
+                first = rep[0]
+                if isinstance(first, dict) and "embedding" in first:
+                    embedding = list(map(float, first["embedding"]))
+                elif isinstance(first, (list, tuple, np.ndarray)):
+                    embedding = [float(x) for x in first]
+                else:
+                    # best-effort fallback
+                    embedding = [float(x) for x in np.array(first).reshape(-1).tolist()]
+            elif isinstance(rep, (np.ndarray, list, tuple)):
+                # fallback convert
+                embedding = [float(x) for x in np.array(rep).reshape(-1).tolist()]
+
+            if not embedding or len(embedding) < 50:
+                # embedding length check - VGG-Face embeddings are large (~2622 in some builds) but we just sanity-check
+                logger.warning("Unexpected embedding form/length from DeepFace: len=%s", None if embedding is None else len(embedding))
+                raise HTTPException(status_code=500, detail="Failed to extract face embedding (unexpected format).")
+        except ValueError as e:
+            # Typical DeepFace message when no face detected
+            logger.warning("DeepFace enforce_detection error during register_face: %s", e)
+            raise HTTPException(status_code=400, detail="No face detected in reference image. Please align your face and try again.")
+        except Exception as e:
+            logger.exception("Unexpected DeepFace error during register_face")
+            raise HTTPException(status_code=500, detail=f"Face processing failed: {str(e)}")
+
+        # 4) store embedding + small diagnostic thumbnail in memory (persist to DB in prod)
+        try:
+            thumb_b64 = make_thumbnail_b64(img)
+            FACE_DB[request.sessionId] = {
+                "embedding": embedding,
+                "thumbnail": thumb_b64,
+                "created": time.time(),
+                "mean_brightness": mean_val,
+                "stddev": stddev_val
+            }
+            logger.info("Registered face for session=%s; embedding_len=%d mean=%.1f std=%.1f", request.sessionId, len(embedding), mean_val, stddev_val)
+        except Exception as e:
+            logger.exception("Failed to store face registration")
+            raise HTTPException(status_code=500, detail="Server failed to store face registration.")
+
+        # 5) Respond success (frontend should require resp.ok before proceeding)
+        return {"status": "registered", "message": "Face identity saved", "sessionId": request.sessionId}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unexpected error in register_face")
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 @app.post("/score_answer")
 def score_answer(req: ScoreAnswerRequest):
     """Score answer with multi-dimensional evaluation and bluff detection"""
@@ -1419,6 +1583,87 @@ def root():
         ]
     }
 
+
+from scipy.spatial.distance import cosine # <--- ADD THIS IMPORT
+
+@app.post("/verify_face")
+def verify_face(req: FaceVerificationRequest):
+    """
+    Manual Verification: 
+    1. Generates embedding for current frame.
+    2. Compares it mathematically to the stored reference.
+    3. Handles "No Face" gracefully without 500 Errors.
+    """
+    
+    # 1. Decode Images
+    img1 = decode_base64_image(req.reference_image) # Registration Image
+    img2 = decode_base64_image(req.current_image)   # Webcam Frame
+    
+    if img1 is None or img2 is None:
+        return JSONResponse(status_code=400, content={"verified": False, "error": "Image decode failed"})
+
+    try:
+        # 2. Get Embedding for Reference (Should be cached in reality, but calculating here for safety)
+        # Note: In a real app, you'd fetch 'rep1' from your database (FACE_DB) instead of calculating it every time.
+        objs1 = DeepFace.represent(
+            img_path=img1,
+            model_name="VGG-Face",
+            detector_backend="mtcnn",
+            enforce_detection=True
+        )
+        embedding1 = objs1[0]["embedding"]
+
+        # 3. Get Embedding for Webcam (The critical part)
+        try:
+            objs2 = DeepFace.represent(
+                img_path=img2,
+                model_name="VGG-Face",
+                detector_backend="mtcnn",
+                enforce_detection=True 
+            )
+            embedding2 = objs2[0]["embedding"]
+            
+        except ValueError as e:
+            # THIS catches "No Face Detected" cleanly
+            logger.warning(f"No face found in webcam frame: {str(e)}")
+            return JSONResponse(
+                status_code=400, 
+                content={
+                    "verified": False, 
+                    "error": "No face detected in frame. Adjust lighting.",
+                    "violation_type": "no_face_detected"
+                }
+            )
+
+        # 4. Calculate Distance Manually
+        # Cosine Distance = 1 - Cosine Similarity
+        distance = cosine(embedding1, embedding2)
+        
+        logger.info(f" Calculated Distance: {distance:.4f} (Threshold: {STRICT_DISTANCE_THRESHOLD})")
+
+        # 5. Compare against Threshold
+        if distance <= STRICT_DISTANCE_THRESHOLD:
+            return {
+                "verified": True,
+                "distance": distance,
+                "threshold": STRICT_DISTANCE_THRESHOLD,
+                "model": "VGG-Face"
+            }
+        else:
+            return JSONResponse(
+                status_code=400, 
+                content={
+                    "verified": False,
+                    "distance": distance,
+                    "threshold": STRICT_DISTANCE_THRESHOLD,
+                    "error": "Face mismatch (Unauthorized User)",
+                    "violation_type": "face_mismatch"
+                }
+            )
+
+    except Exception as e:
+        logger.error(f"System Error in verification: {e}")
+        return JSONResponse(status_code=500, content={"verified": False, "error": str(e)})
 @app.get("/health")
 def health():
     return {"status": "healthy", "model": GROQ_MODEL}

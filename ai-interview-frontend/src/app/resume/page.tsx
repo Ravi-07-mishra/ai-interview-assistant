@@ -75,7 +75,7 @@ export default function ResumeUploader(props: ResumeUploaderProps) {
 
   const handleAuthCheck = () => {
     if (!token) {
-      router.push("/auth/login");
+      router.push("/Auth/login");
       return false;
     }
     return true;

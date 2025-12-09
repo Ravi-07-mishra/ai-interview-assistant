@@ -43,7 +43,7 @@ export function AuthProvider({ children }: any) {
     setToken(data.token);
     setUser(data.user);
 
-    router.push("/dashboard");
+    router.push("/interview");
   }
 
   // -----------------
@@ -65,7 +65,7 @@ export function AuthProvider({ children }: any) {
     setToken(data.token);
     setUser(data.user);
 
-    router.push("/dashboard");
+    router.push("/interview");
   }
 
   // -----------------
@@ -78,7 +78,7 @@ export function AuthProvider({ children }: any) {
     setToken(null);
     setUser(null);
 
-    router.push("/auth/login");
+    router.push("/Auth/login");
   }
 
   return (
