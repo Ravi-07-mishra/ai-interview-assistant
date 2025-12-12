@@ -16,6 +16,7 @@ export type InterviewQuestion = {
   red_flags?: string[];
   action_type?: string;
   confidence?: number;
+  // keep index signature so we can attach raw / coding_challenge etc.
   [k: string]: any;
 };
 
@@ -56,17 +57,17 @@ export function useInterview() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [stage, setStage] = useState<"idle" | "uploading" | "running" | "done">("idle");
   const [currentQuestion, setCurrentQuestion] = useState<InterviewQuestion | null>(null);
-  
+
   // Store feedback and performance metrics
   const [lastFeedback, setLastFeedback] = useState<string | null>(null);
   const [performanceMetrics, setPerformanceMetrics] = useState<PerformanceMetrics | null>(null);
 
-  const [history, setHistory] = useState<Array<{ 
-    q: InterviewQuestion; 
-    a?: any; 
-    result?: InterviewAnswerResult 
+  const [history, setHistory] = useState<Array<{
+    q: InterviewQuestion;
+    a?: any;
+    result?: InterviewAnswerResult;
   }>>([]);
-  
+
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [resumeParsed, setResumeParsed] = useState<any | null>(null);
@@ -148,29 +149,40 @@ export function useInterview() {
     setError(null);
     setLastFeedback(null);
     setPerformanceMetrics(null);
-if (existingSessionId && existingQuestionData) {
-        console.log("Hydrating interview state from existing session:", existingSessionId);
-        setSessionId(existingSessionId);
-        
-        // Normalize the question data passed from the Page
-        const backendId = existingQuestionData.qaId || existingQuestionData.questionId;
-        const normalizedQuestion: InterviewQuestion = {
-            questionId: backendId || `q_${Date.now()}`,
-            questionText: existingQuestionData.question || existingQuestionData.questionText || "",
-            target_project: existingQuestionData.target_project,
-            technology_focus: existingQuestionData.technology_focus,
-            expectedAnswerType: existingQuestionData.expected_answer_type || existingQuestionData.expectedAnswerType || "medium",
-            difficulty: existingQuestionData.difficulty || "medium",
-            ideal_outline: existingQuestionData.ideal_answer_outline || existingQuestionData.ideal_outline || "",
-            red_flags: existingQuestionData.red_flags || [],
-            confidence: existingQuestionData.confidence
-        };
 
-        setCurrentQuestion(normalizedQuestion);
-        setStage("running");
-        setLoading(false);
-        return; // EXIT EARLY - Do not fetch again
+    // HYDRATION BRANCH: if caller provided sessionId + first question (page-level start)
+    if (existingSessionId && existingQuestionData) {
+      console.log("Hydrating interview state from existing session:", existingSessionId);
+      console.log("🔥 startInterview (hydration): existingQuestionData:", existingQuestionData);
+
+      setSessionId(existingSessionId);
+
+      // Normalize the question data passed from the Page
+      const backendId = existingQuestionData.qaId || existingQuestionData.questionId;
+      const normalizedQuestion: InterviewQuestion = {
+        questionId: backendId || `q_${Date.now()}`,
+        questionText: existingQuestionData.question || existingQuestionData.questionText || "",
+        target_project: existingQuestionData.target_project,
+        technology_focus: existingQuestionData.technology_focus,
+        expectedAnswerType: existingQuestionData.expected_answer_type || existingQuestionData.expectedAnswerType || "medium",
+        difficulty: existingQuestionData.difficulty || "medium",
+        ideal_outline: existingQuestionData.ideal_answer_outline || existingQuestionData.ideal_outline || "",
+        red_flags: existingQuestionData.red_flags || [],
+        confidence: existingQuestionData.confidence
+      };
+
+      // Preserve full backend payload so nested fields (like coding_challenge/test_cases) are available to the UI
+      setCurrentQuestion({
+        ...normalizedQuestion,
+        raw: existingQuestionData,
+        coding_challenge: existingQuestionData.coding_challenge || existingQuestionData.challenge || existingQuestionData
+      });
+
+      setStage("running");
+      setLoading(false);
+      return; // EXIT EARLY - Do not fetch again
     }
+
     if (!token) {
       setError("Please log in to start an interview.");
       return;
@@ -180,7 +192,7 @@ if (existingSessionId && existingQuestionData) {
       setError("Please upload your resume first.");
       return;
     }
-    
+
     setLoading(true);
     try {
       const payload: any = {
@@ -197,41 +209,49 @@ if (existingSessionId && existingQuestionData) {
         body: JSON.stringify(payload),
       });
       const body = await res.json();
-      
+
       if (!res.ok) {
         throw new Error(body?.message || body?.error || JSON.stringify(body) || "Failed to start interview");
       }
 
       setSessionId(body.sessionId || body.session_id || null);
-      
+
       // Handle different response formats
       const questionData = body.firstQuestion || body.question || body.data?.question || body.parsed;
-      
+
+      // Debug: show raw question data returned from server
+      console.log("🔥 startInterview: raw questionData:", questionData);
+
       if (questionData) {
         // FIX: Prioritize 'qaId' from backend, fall back to 'questionId'
-        const backendId = questionData.qaId || questionData.questionId; 
+        const backendId = questionData.qaId || questionData.questionId;
 
         const normalizedQuestion: InterviewQuestion = {
           questionId: backendId || `q_${Date.now()}`, // Fallback only if backend fails
           questionText: questionData.question || questionData.questionText || "",
           target_project: questionData.target_project,
           technology_focus: questionData.technology_focus,
-          expectedAnswerType: questionData.expected_answer_type || questionData.expectedAnswerType || "medium",
+          expectedAnswerType: question_data_or_default(questionData),
           difficulty: questionData.difficulty || "medium",
           ideal_outline: questionData.ideal_answer_outline || questionData.ideal_outline || "",
           red_flags: questionData.red_flags || [],
           confidence: questionData.confidence
         };
-        
-        setCurrentQuestion(normalizedQuestion);
+
+        // Preserve raw/coding_challenge so UI can access nested fields like test_cases/starter_code
+        setCurrentQuestion({
+          ...normalizedQuestion,
+          raw: questionData,
+          coding_challenge: questionData.coding_challenge || questionData.challenge || questionData
+        });
         setStage("running");
       } else {
         setStage("idle");
       }
-      
+
       setHistory([]);
       setFinalDecision(null);
-      
+
     } catch (err: any) {
       setError(err.message || String(err));
     } finally {
@@ -239,59 +259,67 @@ if (existingSessionId && existingQuestionData) {
     }
   }, [resumeParsed, resumeFileUrl, token, getAuthHeaders]);
 
-  const submitAnswer = useCallback(
-    async (candidateAnswer: string) => {
-      setError(null);
-      setLastFeedback(null);
+  // Helper used above to get expectedAnswerType with safe fallback
+  function question_data_or_default(q: any) {
+    return q.expected_answer_type || q.expectedAnswerType || "medium";
+  }
 
-      if (!token) {
-        setError("Please log in to submit an answer.");
-        return null;
+const submitAnswer = useCallback(
+  async (candidateAnswerOrPayload: any, questionIdArg?: string) => {
+    setError(null);
+    setLastFeedback(null);
+
+    if (!token) { setError("Please log in to submit an answer."); return null; }
+    if (!sessionId || !currentQuestion) { setError("Session not initialized or no active question"); return null; }
+
+    setLoading(true);
+    try {
+      // Normalize incoming arg
+      let candidateAnswer: string;
+      let code_execution_result = null;
+      if (typeof candidateAnswerOrPayload === "string") {
+        candidateAnswer = candidateAnswerOrPayload;
+      } else {
+        // payload object from page
+        candidateAnswer = candidateAnswerOrPayload.answer || candidateAnswerOrPayload.candidateAnswer || "";
+        code_execution_result = candidateAnswerOrPayload.code_execution_result ?? null;
       }
 
-      if (!sessionId || !currentQuestion) {
-        setError("Session not initialized or no active question");
-        return null;
-      }
-      
-      setLoading(true);
-      try {
-        const conv = buildConversationFromHistory();
-        conv.push({ role: "assistant", text: currentQuestion.questionText });
-        conv.push({ role: "user", text: candidateAnswer });
+      const conv = buildConversationFromHistory();
+      conv.push({ role: "assistant", text: currentQuestion.questionText });
+      conv.push({ role: "user", text: candidateAnswer });
 
-        const questionHistory = buildQuestionHistory();
+      const questionHistory = buildQuestionHistory();
 
-        // FIX: Ensure we send the correct ID to the backend
-        const payload = {
-          sessionId,
-          qaId: currentQuestion.questionId, // This must match the backend's UUID
-          questionId: currentQuestion.questionId,
-          questionText: currentQuestion.questionText,
-          ideal_outline: currentQuestion.ideal_outline || currentQuestion.ideal_answer_outline || "",
-          candidateAnswer,
-          candidate_answer: candidateAnswer,
-          resume_summary: resumeParsed?.summary || "",
-          retrieved_chunks: [],
-          conversation: conv,
-          question_history: questionHistory,
-          allow_pii: false,
-        };
+      const payload = {
+        sessionId,
+        qaId: currentQuestion.questionId,
+        questionId: currentQuestion.questionId,
+        questionText: currentQuestion.questionText,
+        ideal_outline: currentQuestion.ideal_outline || currentQuestion.ideal_answer_outline || "",
+        candidateAnswer,
+        candidate_answer: candidateAnswer,
+        resume_summary: resumeParsed?.summary || "",
+        retrieved_chunks: [],
+        conversation: conv,
+        question_history: questionHistory,
+        allow_pii: false,
+        // include code execution result if provided
+        code_execution_result,
+      };
 
-        const res = await fetch(`${API}/interview/answer`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", ...getAuthHeaders() },
-          body: JSON.stringify(payload),
-        });
-        const body = await res.json();
-        
-        if (!res.ok) {
-          throw new Error(body?.message || body?.error || JSON.stringify(body) || "Answer submit failed");
-        }
+      const res = await fetch(`${API}/interview/answer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+        body: JSON.stringify(payload),
+      });
+
+      const body = await res.json();
+      if (!res.ok) throw new Error(body?.message || body?.error || JSON.stringify(body) || "Answer submit failed");
 
         // Parse result with multiple fallback paths
         const rawResult = body.result || body.validated || body;
-        
+
         const result: InterviewAnswerResult = {
           score: rawResult.overall_score || rawResult.score,
           overall_score: rawResult.overall_score || rawResult.score,
@@ -334,15 +362,18 @@ if (existingSessionId && existingQuestionData) {
         } else {
           // Get next question
           const nextQuestionData = body.nextQuestion || body.next_question || body.parsed;
-          
+
+          // Debug: show raw next question (if any)
+          console.log("🔥 submitAnswer: raw nextQuestionData:", nextQuestionData);
+
           if (nextQuestionData) {
             // FIX: Prioritize 'qaId' for the next question as well
             const backendId = nextQuestionData.qaId || nextQuestionData.questionId;
 
             const normalizedNext: InterviewQuestion = {
               questionId: backendId || `q_${Date.now()}`,
-              questionText: nextQuestionData.question || nextQuestionData.questionText || 
-                            nextQuestionData.followup_question || nextQuestionData.follow_up_question || "",
+              questionText: nextQuestionData.question || nextQuestionData.questionText ||
+                nextQuestionData.followup_question || nextQuestionData.follow_up_question || "",
               target_project: nextQuestionData.target_project,
               technology_focus: nextQuestionData.technology_focus,
               expectedAnswerType: nextQuestionData.expected_answer_type || nextQuestionData.expectedAnswerType || "medium",
@@ -351,18 +382,23 @@ if (existingSessionId && existingQuestionData) {
               red_flags: nextQuestionData.red_flags || [],
               confidence: nextQuestionData.confidence
             };
-            
-            setCurrentQuestion(normalizedNext);
+
+            // Preserve raw payload so UI can access nested challenge/testcases
+            setCurrentQuestion({
+              ...normalizedNext,
+              raw: nextQuestionData,
+              coding_challenge: nextQuestionData.coding_challenge || nextQuestionData.challenge || nextQuestionData
+            });
             setStage("running");
           } else {
-            // No next question but not ended - might need to request one
+            // No next question but not ended - treat as done
             setCurrentQuestion(null);
             setStage("done");
           }
         }
 
         return result;
-        
+
       } catch (err: any) {
         setError(err.message || String(err));
         return null;
@@ -375,7 +411,7 @@ if (existingSessionId && existingQuestionData) {
 
   const endInterview = useCallback(async (reason?: string, markRejected = false) => {
     setError(null);
-    
+
     // best-effort: report violation/event before ending if reason present
     if (reason) {
       try {
@@ -391,20 +427,20 @@ if (existingSessionId && existingQuestionData) {
       setCurrentQuestion(null);
       return;
     }
-    
+
     if (!sessionId) {
       setStage("done");
       setCurrentQuestion(null);
       return;
     }
-    
+
     try {
       const res = await fetch(`${API}/interview/end`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...getAuthHeaders() },
         body: JSON.stringify({ sessionId, reason: reason ?? null, terminated_by_violation: !!markRejected }),
       });
-      
+
       const body = await res.json().catch(() => ({}));
       if (!res.ok) {
         console.warn("endInterview error:", body);

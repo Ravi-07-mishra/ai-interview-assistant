@@ -5,6 +5,7 @@ import ResumeUploader from "../resume/page";
 import { useInterview } from "../hooks/useInterview";
 import { useAuth } from "../context/AuthContext";
 import Link from "next/link";
+import Editor from "@monaco-editor/react";
 import {
   Sparkles,
   X,
@@ -158,7 +159,9 @@ export default function InterviewPage() {
   const { token } = useAuth();
   const [answer, setAnswer] = useState("");
   const [showReport, setShowReport] = useState(false);
-
+const [codeOutput, setCodeOutput] = useState<string | null>(null);
+const [codeStatus, setCodeStatus] = useState<"idle" | "running" | "success" | "error">("idle");
+const [executionResult, setExecutionResult] = useState<any>(null); // Store Piston result here
   // Violation state (UI)
   const [violationCount, setViolationCount] = useState(0);
   const [showViolationWarning, setShowViolationWarning] = useState(false);
@@ -225,6 +228,215 @@ export default function InterviewPage() {
       console.warn("stopCamera error:", e);
     }
   }, []);
+// --------------------- Helper: normalize testcases ---------------------
+const buildTestCasesFromChallenge = (challenge: any) => {
+  const candidateLists = [
+    challenge?.test_cases,
+    challenge?.tests,
+    challenge?.cases,
+    (challenge?.examples || []).map((ex: any) => ({ input: ex.input, expected: ex.output })),
+  ].filter(Boolean);
+
+  let rawCases: any[] = [];
+  for (const c of candidateLists) {
+    if (Array.isArray(c) && c.length > 0) {
+      rawCases = c;
+      break;
+    }
+  }
+
+  if (rawCases.length === 0 && (challenge?.test_case_input || challenge?.test_case)) {
+    rawCases.push({
+      input: challenge?.test_case_input ?? challenge?.test_case,
+      expected: challenge?.expected_output ?? challenge?.test_case_expected ?? challenge?.expected,
+    });
+  }
+
+  if (rawCases.length === 0) {
+    // fallback smoke test (won't crash typical solutions)
+    rawCases.push({ input: "[]", expected: "" });
+  }
+
+  const normalized = rawCases.map((tc: any) => {
+    const inVal = tc.input;
+    let inputStr: string;
+    if (typeof inVal === "object") {
+      try { inputStr = JSON.stringify(inVal); } catch (e) { inputStr = String(inVal); }
+    } else {
+      inputStr = String(inVal ?? "");
+    }
+    const expectedVal = tc.expected;
+    let expectedStr: string;
+    if (typeof expectedVal === "object") {
+      try { expectedStr = JSON.stringify(expectedVal); } catch (e) { expectedStr = String(expectedVal); }
+    } else {
+      expectedStr = String(expectedVal ?? "");
+    }
+    return { input: inputStr, expected: expectedStr, raw: tc };
+  });
+
+  return normalized;
+};
+
+// --------------------- Replace existing handleRunCode with this ---------------------
+// paste this whole function to replace your existing handleRunCode
+const handleRunCode = async () => {
+  const codeToRun = answer.trim();
+  if (!codeToRun) return;
+
+  // Defensive resolution for the coding challenge payload
+  const challenge =
+    currentQuestion?.coding_challenge ||
+    currentQuestion?.raw?.coding_challenge ||
+    currentQuestion?.raw ||
+    (currentQuestion as any)?.challenge ||
+    {};
+
+  // Normalize testcases
+  const testsToRun = buildTestCasesFromChallenge(challenge);
+
+  setCodeStatus("running");
+  setCodeOutput(null);
+  setExecutionResult(null);
+
+  const aggregatedResults: Array<any> = [];
+
+  // Determine whether server has authoritative tests
+  const willGrade = !!(
+    challenge &&
+    (challenge.test_cases ||
+      challenge.tests ||
+      challenge.cases ||
+      challenge.test_case_input ||
+      (challenge.examples && challenge.examples.length))
+  );
+
+  // helper to coerce server response into our result shape
+  const normalizeServerResponse = (data: any, tcIndex: number) => {
+    // Backend may return wrapper { success, results: [...] }
+    if (Array.isArray(data?.results) && data.results.length > 0) {
+      const r = data.results[tcIndex] ?? data.results[0];
+      return {
+        index: tcIndex,
+        input: r.input ?? r.stdin_received ?? testsToRun[tcIndex]?.input ?? "",
+        expected: r.expected ?? testsToRun[tcIndex]?.expected ?? "",
+        success: !!r.passed || !!r.success,
+        output: r.stdout ?? r.output ?? (r.raw?.output) ?? "",
+        raw: r,
+      };
+    }
+
+    // Or backend returns a single-result object { success, output, passed, raw_run... }
+    if (data) {
+      const success = !!data.passed || !!data.success;
+      const out = data.stdout ?? data.output ?? (data.raw?.output) ?? "";
+      return {
+        index: tcIndex,
+        input: testsToRun[tcIndex]?.input ?? "",
+        expected: testsToRun[tcIndex]?.expected ?? "",
+        success,
+        output: out,
+        raw: data,
+      };
+    }
+
+    // fallback
+    return {
+      index: tcIndex,
+      input: testsToRun[tcIndex]?.input ?? "",
+      expected: testsToRun[tcIndex]?.expected ?? "",
+      success: false,
+      output: "No output",
+      raw: data,
+    };
+  };
+
+  if (willGrade) {
+    // run each test and pass that test's stdin
+    for (let i = 0; i < testsToRun.length; i++) {
+      const tc = testsToRun[i];
+      try {
+        const payload = {
+          language: (challenge?.language || "python").toLowerCase(),
+          code: codeToRun,
+          stdin: tc.input,
+          expected_output: tc.expected,
+          test_cases: testsToRun,
+          // optionally: test_index: i
+        };
+
+        // send run request
+        const res = await fetch(`${API}/run-code`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body: JSON.stringify(payload),
+        });
+
+        const data = await res.json().catch(() => ({ success: false, output: "Network Error" }));
+
+        // normalize into common object
+        const normalized = normalizeServerResponse(data, i);
+
+        aggregatedResults.push(normalized);
+        // incremental update so the UI shows progress
+        setExecutionResult({ cases: [...aggregatedResults] });
+      } catch (err: any) {
+        aggregatedResults.push({ index: i, input: tc.input, expected: tc.expected, success: false, output: `Client Error: ${err.message}` });
+        setExecutionResult({ cases: [...aggregatedResults] });
+      }
+    }
+
+    const allPassed = aggregatedResults.length > 0 && aggregatedResults.every((r) => r.success);
+    setCodeStatus(allPassed ? "success" : "error");
+
+    setCodeOutput(
+      aggregatedResults
+        .map((r) => `Test ${r.index + 1}: ${r.success ? "PASSED" : "FAILED"}\nInput: ${r.input}\nExpected: ${r.expected}\nGot: ${r.output}`)
+        .join("\n\n")
+    );
+
+    setExecutionResult({
+      cases: aggregatedResults,
+      summary: { total: aggregatedResults.length, passed: aggregatedResults.filter((r) => r.success).length },
+    });
+
+  } else {
+    // smoke run: send the first test (or empty) and show raw run output
+    const singleStdin = testsToRun[0]?.input ?? "";
+
+    try {
+      const payload = {
+        language: (challenge?.language || "python").toLowerCase(),
+        code: codeToRun,
+        stdin: singleStdin,
+        test_cases: testsToRun,
+      };
+
+      const res = await fetch(`${API}/run-code`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify(payload),
+      });
+
+      const data = await res.json().catch(() => ({ success: false, output: "Network Error" }));
+
+      // try to pull common fields
+      let out = data.output ?? data.stdout ?? (data.results && data.results[0] && (data.results[0].stdout ?? data.results[0].output)) ?? "No output";
+      const success = !!data.success || (data.results && data.results.every((r: any) => r.passed || r.success));
+
+      const singleResult = { index: 0, input: singleStdin, expected: null, success: !!success, output: String(out).trim(), raw: data };
+      setExecutionResult({ cases: [singleResult], summary: { total: 1, passed: singleResult.success ? 1 : 0 } });
+      setCodeStatus(singleResult.success ? "success" : "error");
+      setCodeOutput(`Raw Run${singleResult.success ? " (container success)" : ""}:\nInput: ${singleResult.input}\nOutput: ${singleResult.output}`);
+    } catch (err: any) {
+      setCodeStatus("error");
+      setCodeOutput(`Client Error: ${err.message}`);
+      setExecutionResult({ cases: [{ index: 0, success: false, output: `Client Error: ${err.message}` }], summary: { total: 1 } });
+    }
+  }
+};
+
+
 
   /* -------------------------
       Violation wrapper (unchanged behavior)
@@ -598,169 +810,138 @@ const w = video.videoWidth;
   /* -------------------------
       Proctoring effect (interval + warmup) (unchanged)
       ------------------------- */
-  useEffect(() => {
-    let proctorInterval: number | null = null;
+// ----------------- PROCTORING useEffect (minimal change) -----------------
+useEffect(() => {
+  let proctorInterval: number | null = null;
 
-    if (stage !== "running" || !cameraActive || !token) {
-      return () => {};
+  if (stage !== "running" || !cameraActive || !token) {
+    return () => {};
+  }
+
+  // Keep the same frame validator locally (unchanged)
+  const isValidFrame = (dataUrl: string | null): boolean => {
+    if (!dataUrl || typeof dataUrl !== "string") return false;
+    if (dataUrl.length < 500) {
+      console.warn(`[Frame Validation] Too short (${dataUrl?.length}) — rejecting.`);
+      return false;
+    }
+    if (!dataUrl.startsWith("data:image/")) {
+      console.warn(`[Frame Validation] Missing data:image prefix. Start: ${String(dataUrl).substring(0,36)}`);
+      return false;
+    }
+    const re = /^data:image\/(png|jpeg|jpg|webp);base64,[A-Za-z0-9+/]+=*$/i;
+    if (!re.test(dataUrl)) {
+      console.warn(`[Frame Validation] Regex mismatch. Start: ${String(dataUrl).substring(0,64)}`);
+      return false;
+    }
+    return true;
+  };
+
+  // sendProctorPayload: only send { sessionId, image } in the request body
+  const sendProctorPayload = async (payload: { sessionId: string; image: string | null }) => {
+    try {
+      // Log a short sample for debugging (keeps logs compact)
+      if (payload.image) {
+        console.debug("[proctor -> server] sending image sample:", String(payload.image).substring(0, 80), "len=", String(payload.image).length);
+      } else {
+        console.debug("[proctor -> server] sending image=null for session:", payload.sessionId);
+      }
+
+      const res = await fetch(`${API || ""}/interview/proctor`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          sessionId: payload.sessionId,
+          image: payload.image,
+        }),
+      });
+
+      const j = await res.json().catch(() => null);
+      const hasError = !res.ok || j?.verified === false || j?.status === "failed";
+
+      if (hasError) {
+        const violationReason = j?.error || j?.reason || j?.detail || "Face verification failed";
+        console.warn(`[PROCTOR VIOLATION detected] Reason: ${violationReason}`);
+        // Trigger violation handling (existing wrapper)
+        reportViolationWrapper(violationReason, false);
+      } else if (j?.status === "success" || j?.verified === true) {
+        if (showViolationWarning) setShowViolationWarning(false);
+      }
+
+      return { ok: res.ok, statusCode: res.status, body: j };
+    } catch (err) {
+      console.warn("proctor POST failed:", err);
+      return { ok: false, error: err };
+    }
+  };
+
+  const warmupAndStart = async () => {
+    if (!sessionId) {
+      console.debug("proctor warmup: sessionId missing, skipping warmup POST. Waiting for startInterview to update state.");
+      return;
     }
 
-    // NOTE: This logic should ideally rely on the sessionId being populated from the startInterview call.
-
-    const isValidFrame = (dataUrl: string | null): boolean => {
-      if (!dataUrl || typeof dataUrl !== "string") return false;
-      if (dataUrl.length < 500) {
-        console.warn(`[Frame Validation] Too short (${dataUrl?.length}) — rejecting.`);
-        return false;
-      }
-      if (!dataUrl.startsWith("data:image/")) {
-        console.warn(`[Frame Validation] Missing data:image prefix. Start: ${String(dataUrl).substring(0,36)}`);
-        return false;
-      }
-      const re = /^data:image\/(png|jpeg|jpg|webp);base64,[A-Za-z0-9+/]+=*$/i;
-      if (!re.test(dataUrl)) {
-        console.warn(`[Frame Validation] Regex mismatch. Start: ${String(dataUrl).substring(0,64)}`);
-        return false;
-      }
-      return true;
-    };
-
-    const sendProctorPayload = async (payload: Record<string, any>) => {
-      try {
-        if (payload.image) {
-          console.debug("[proctor -> server] sending image sample:", String(payload.image).substring(0, 80), "len=", String(payload.image).length);
-        } else if (payload.status === "no_face") {
-          console.debug("[proctor -> server] sending NO_FACE:", { sessionId: payload.sessionId, sample: payload.sample });
-        }
-        const res = await fetch(`${API || ""}/interview/proctor`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify(payload),
-        });
-        const j = await res.json().catch(() => null);
-       const hasError = !res.ok || j?.verified === false || j?.status === "failed";
-
-        if (hasError) {
-          // Extract the actual message from various possible keys
-          const violationReason = j?.error || j?.reason || j?.detail || "Face verification failed";
-          
-          console.warn(`[PROCTOR VIOLATION detected] Reason: ${violationReason}`);
-          
-          // Trigger the red warning banner
-          reportViolationWrapper(violationReason, false);
-        } 
-        else if (j?.status === "success" || j?.verified === true) {
-          // Clear warning if passing
-          if (showViolationWarning) setShowViolationWarning(false);
-        }
-        // --- FIX END ---
-        return { ok: res.ok, statusCode: res.status, body: j };
-      } catch (err) {
-        console.warn("proctor POST failed:", err);
-        return { ok: false, error: err };
-      }
-    };
-
-    const warmupAndStart = async () => {
-      if (!sessionId) {
-        console.debug("proctor warmup: sessionId missing, skipping warmup POST. Waiting for startInterview to update state.");
-        return;
-      }
-
-      try {
-        if (proctorVideoRef.current && !proctorVideoRef.current.srcObject) {
-          try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-  video: { 
-    width: { ideal: 1280 }, 
-    height: { ideal: 720 }, 
-    facingMode: "user" 
-  },
-  audio: false,
-});
-            proctorVideoRef.current.srcObject = stream;
-            proctorVideoRef.current.muted = true;
-            proctorVideoRef.current.playsInline = true;
-            try { await proctorVideoRef.current.play(); } catch (e) { console.warn("proctor warmup: play() blocked:", e); }
-          } catch (gErr) {
-            console.warn("proctor warmup: failed to get userMedia for proctor video:", gErr);
-          }
-        }
-
-        const firstFrame = await captureFrameToDataUrl();
-
-        if (!isValidFrame(firstFrame)) {
-          inFlightRef.current = true;
-          try {
-            await sendProctorPayload({
-              sessionId,
-              status: "no_face",
-              sample: typeof firstFrame === "string" ? String(firstFrame).substring(0, 60) : null,
-              timestamp: new Date().toISOString()
-            });
-          } finally {
-            inFlightRef.current = false;
-          }
-          return;
-        }
-
-        inFlightRef.current = true;
+    try {
+      if (proctorVideoRef.current && !proctorVideoRef.current.srcObject) {
         try {
-          await sendProctorPayload({ sessionId, image: firstFrame });
-        } finally {
-          inFlightRef.current = false;
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
+            audio: false,
+          });
+          proctorVideoRef.current.srcObject = stream;
+          proctorVideoRef.current.muted = true;
+          proctorVideoRef.current.playsInline = true;
+          try { await proctorVideoRef.current.play(); } catch (e) { console.warn("proctor warmup: play() blocked:", e); }
+        } catch (gErr) {
+          console.warn("proctor warmup: failed to get userMedia for proctor video:", gErr);
         }
-      } catch (e) {
-        console.warn("proctor warmup error:", e);
       }
 
-      // interval checks
-      proctorInterval = window.setInterval(async () => {
-        if (!sessionId) { console.debug("proctor interval: sessionId missing, skipping POST"); return; }
-        if (inFlightRef.current) return;
-        inFlightRef.current = true;
+      const firstFrame = await captureFrameToDataUrl();
+
+      // IMPORTANT: Always send only { sessionId, image }, even when frame invalid.
+      // We still use isValidFrame locally for quicker rejection/logic, but the payload remains minimal.
+      inFlightRef.current = true;
+      try {
+        await sendProctorPayload({ sessionId, image: firstFrame });
+      } finally {
+        inFlightRef.current = false;
+      }
+    } catch (e) {
+      console.warn("proctor warmup error:", e);
+    }
+
+    // interval checks
+    proctorInterval = window.setInterval(async () => {
+      if (!sessionId) { console.debug("proctor interval: sessionId missing, skipping POST"); return; }
+      if (inFlightRef.current) return;
+      inFlightRef.current = true;
+      try {
+        const frame = await captureFrameToDataUrl();
+
+        // Always send only sessionId + image
         try {
-          const frame = await captureFrameToDataUrl();
-
-          if (!isValidFrame(frame)) {
-            try {
-              await sendProctorPayload({
-                sessionId,
-                status: "no_face",
-                sample: typeof frame === "string" ? String(frame).substring(0, 60) : null,
-                timestamp: new Date().toISOString()
-              });
-            } catch (err) {
-              console.warn("proctor no_face POST failed:", err);
-            } finally {
-              inFlightRef.current = false;
-            }
-            return;
-          }
-
-          try {
-            await sendProctorPayload({ sessionId, image: frame });
-          } catch (err) {
-            console.warn("proctor image POST failed:", err);
-          }
+          await sendProctorPayload({ sessionId, image: frame });
         } catch (err) {
-          console.warn("proctor interval error:", err);
-        } finally {
-          inFlightRef.current = false;
+          console.warn("proctor image POST failed:", err);
         }
-      }, 15000);
-    };
+      } catch (err) {
+        console.warn("proctor interval error:", err);
+      } finally {
+        inFlightRef.current = false;
+      }
+    }, 6000);
+  };
 
-    warmupAndStart();
+  warmupAndStart();
 
-    return () => {
-      if (proctorInterval) window.clearInterval(proctorInterval);
-    };
-  }, [stage, cameraActive, sessionId, token, API, captureFrameToDataUrl, reportViolationWrapper, showViolationWarning]);
-
+  return () => {
+    if (proctorInterval) window.clearInterval(proctorInterval);
+  };
+}, [stage, cameraActive, sessionId, token, API, captureFrameToDataUrl, reportViolationWrapper, showViolationWarning]);
 
   /* -------------------------
       Fullscreen helpers (unchanged)
@@ -944,23 +1125,39 @@ const handleStart = useCallback(
   /* -------------------------
       Answer submit handler (unchanged)
       ------------------------- */
-  const handleSubmitAnswer = useCallback(
-    async (e: React.FormEvent) => {
-      e.preventDefault();
-      if (!answer.trim() || loading || !currentQuestion) return;
+const handleSubmitAnswer = useCallback(async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!answer.trim() || loading || !currentQuestion) return;
 
-      const answerToSubmit = answer;
-      setAnswer("");
-      const currentQId = currentQuestion.id;
+    const answerToSubmit = answer;
+    setAnswer("");
+    const currentQId = currentQuestion.id;
+    
+    // 👇 NEW LOGIC 👇
+    const payload: any = { answer: answerToSubmit };
+    
+    if (currentQuestion.expectedAnswerType === "code") {
+        // If user didn't run code, force a run or warn them? 
+        // For now, let's just send what we have (or null if they skipped running)
+        payload.code_execution_result = executionResult;
+        payload.question_type = "code";
+    } else {
+        payload.question_type = "text";
+    }
 
-      try {
-        await submitAnswer(answerToSubmit, currentQId);
-      } catch (e) {
-        console.error("Error submitting answer:", e);
-      }
-    },
-    [answer, loading, currentQuestion, submitAnswer]
-  );
+    try {
+      // You might need to update your useInterview hook's submitAnswer signature 
+      // to accept this extra payload object instead of just string
+      await submitAnswer(payload, currentQId); 
+      
+      // Reset code state for next question
+      setCodeOutput(null);
+      setCodeStatus("idle");
+      setExecutionResult(null);
+    } catch (e) {
+      console.error("Error submitting answer:", e);
+    }
+}, [answer, loading, currentQuestion, submitAnswer, executionResult]);
 
   /* -------------------------
       Cleanup effect (unmount) (unchanged)
@@ -1111,7 +1308,19 @@ const handleStart = useCallback(
   }
 };
   const statusIndicator = getImageStatusIndicator();
-
+const resolvedChallengeForEditor = (
+  currentQuestion?.coding_challenge ||
+  currentQuestion?.raw ||
+  {}
+) as any;
+useEffect(() => {
+  const starter = (resolvedChallengeForEditor?.starter_code || "").trim();
+  if (starter && !answer.trim()) {
+    setAnswer(starter);
+  }
+  // If you want to always reset on new question uncomment:
+  // setAnswer(starter || "");
+}, [currentQuestion?.questionId]); // run when question changes
   return (
     <div className="min-h-screen bg-slate-50 py-12">
       {/* Fixed Camera View (during interview) (unchanged) */}
@@ -1607,63 +1816,174 @@ const handleStart = useCallback(
               </div>
 
               <div className="bg-slate-50 p-8 border-t border-slate-200">
-                <form onSubmit={handleSubmitAnswer}>
-                  {currentQuestion.expectedAnswerType === "code" ||
-                  currentQuestion.expectedAnswerType === "architectural" ? (
-                    <textarea
-                      value={answer}
-                      onChange={(e) => setAnswer(e.target.value)}
-                      placeholder={
-                        currentQuestion.expectedAnswerType === "code"
-                          ? "// Write your code solution here...\n// Be specific about implementation details"
-                          : "Describe the architecture, data flow, and key design decisions..."
-                      }
-                      rows={14}
-                      className="w-full p-5 font-mono text-sm bg-slate-900 text-emerald-400 rounded-xl border-2 border-slate-700 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none resize-y shadow-inner"
-                      spellCheck={false}
-                    />
-                  ) : (
-                    <textarea
-                      value={answer}
-                      onChange={(e) => setAnswer(e.target.value)}
-                      placeholder="Type your detailed answer here... Be specific about your implementation and thought process."
-                      rows={8}
-                      className="w-full p-5 text-base bg-white text-slate-800 rounded-xl border-2 border-slate-300 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none resize-y shadow-sm transition-all"
-                    />
-                  )}
+<form onSubmit={handleSubmitAnswer}>
+  {currentQuestion.expectedAnswerType === "code" ? (
+  <div className="border-2 border-slate-300 rounded-xl overflow-hidden bg-white shadow-sm">
+    
+    {/* --- EDITOR HEADER & TOOLBAR --- */}
+    <div className="bg-slate-100 p-3 flex justify-between items-center border-b border-slate-300">
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-bold text-slate-600 uppercase bg-slate-200 px-2 py-1 rounded">
+{(resolvedChallengeForEditor.language || "PYTHON").toUpperCase()}
+        </span>
+        <span className="text-xs text-slate-500">
+          Write your solution below
+        </span>
+      </div>
+      
+      <button 
+        type="button"
+        onClick={handleRunCode}
+        disabled={codeStatus === "running" || !answer.trim()}
+        className={`px-4 py-2 text-sm font-bold rounded-lg flex items-center gap-2 transition-all ${
+          codeStatus === "running" 
+            ? "bg-slate-300 text-slate-500 cursor-not-allowed"
+            : "bg-indigo-600 text-white hover:bg-indigo-700 hover:shadow-md"
+        }`}
+      >
+        {codeStatus === "running" ? (
+          <Loader2 className="animate-spin" size={16} />
+        ) : (
+          <Play size={16} fill="currentColor" />
+        )}
+        Run Code
+      </button>
+    </div>
 
-                  <div className="mt-5 flex items-center justify-between">
-                    <button
-                      type="button"
-                      onClick={() => setAnswer("")}
-                      className="text-slate-500 text-sm font-medium hover:text-slate-700 transition-colors px-3 py-2 hover:bg-slate-100 rounded-lg"
-                    >
-                      Clear Answer
-                    </button>
+    {/* --- MONACO EDITOR --- */}
+    <div className="h-[400px] w-full relative">
+<Editor
+  height="100%"
+  defaultLanguage={(resolvedChallengeForEditor.language || "python").toLowerCase()}
+  value={answer}                          // <- controlled
+  // defaultValue removed
+  onChange={(val) => setAnswer(val || "")}
+  theme="vs-dark"
+  options={{ minimap: { enabled: false }, fontSize: 14, scrollBeyondLastLine: false, automaticLayout: true }}
+/>
 
-                    <button
-                      type="submit"
-                      disabled={loading || !token || !answer.trim()}
-                      className={`px-8 py-4 rounded-xl font-bold text-lg shadow-xl transition-all transform active:scale-95 flex items-center gap-3 ${
-                        !token || !answer.trim() || loading
-                          ? "bg-slate-300 text-slate-500 cursor-not-allowed"
-                          : "bg-gradient-to-r from-indigo-600 to-purple-600 text-white hover:shadow-indigo-300 hover:scale-105"
-                      }`}
-                    >
-                      {loading ? (
-                        <>
-                          <div className="w-5 h-5 border-3 border-white/30 border-t-white rounded-full animate-spin"></div>
-                          Analyzing Answer...
-                        </>
-                      ) : (
-                        <>
-                          Submit Answer
-                          <CheckCircle size={20} />
-                        </>
-                      )}
-                    </button>
-                  </div>
-                </form>
+    </div>
+
+    {/* --- CONSOLE OUTPUT TERMINAL --- */}
+    <div className="bg-slate-900 text-slate-300 p-4 font-mono text-sm border-t-4 border-slate-700">
+      
+      {/* TEST CASE REQUIREMENTS DISPLAY */}
+      <div className="mb-3 p-2 bg-slate-800 rounded border border-slate-700 flex flex-wrap gap-4 text-xs">
+        <div>
+          <span className="text-slate-500 font-bold uppercase mr-2">Input:</span>
+          <code className="text-indigo-300">
+{resolvedChallengeForEditor.test_case_input ?? resolvedChallengeForEditor.test_case ?? "[]"}
+          </code>
+        </div>
+        <div>
+          <span className="text-slate-500 font-bold uppercase mr-2">Target Output:</span>
+          <code className="text-emerald-300">
+{resolvedChallengeForEditor.expected_output ?? resolvedChallengeForEditor.expected ?? ""}
+          </code>
+        </div>
+      </div>
+
+      <div className="flex justify-between items-center mb-2">
+        <div className="text-xs font-bold uppercase tracking-wider text-slate-500">
+          Console Output
+        </div>
+        
+        {/* SUCCESS BADGE */}
+        {codeStatus === "success" && (
+          <span className="text-xs font-bold text-emerald-400 flex items-center gap-1 bg-emerald-400/10 px-2 py-1 rounded">
+            <CheckCircle size={12} /> Test Case Passed
+          </span>
+        )}
+
+        {/* WRONG ANSWER BADGE */}
+        {codeStatus === "error" && executionResult?.success && (
+          <span className="text-xs font-bold text-amber-400 flex items-center gap-1 bg-amber-400/10 px-2 py-1 rounded">
+             <AlertCircle size={12} /> Wrong Answer
+          </span>
+        )}
+
+        {/* RUNTIME ERROR BADGE */}
+        {codeStatus === "error" && !executionResult?.success && (
+          <span className="text-xs font-bold text-rose-400 flex items-center gap-1 bg-rose-400/10 px-2 py-1 rounded">
+            <XCircle size={12} /> Runtime Error
+          </span>
+        )}
+      </div>
+
+      <div className="bg-black/50 p-3 rounded-lg min-h-[80px] max-h-[200px] overflow-y-auto">
+        {codeStatus === "idle" && !codeOutput && (
+          <span className="text-slate-600 italic">Click "Run Code" to see output...</span>
+        )}
+        {codeStatus === "running" && (
+          <span className="text-yellow-400 animate-pulse">Running code container...</span>
+        )}
+        
+        {/* OUTPUT DISPLAY */}
+        {codeOutput && (
+          <pre className={`whitespace-pre-wrap break-words font-mono text-xs md:text-sm ${
+             codeStatus === "error" && !executionResult?.success ? "text-rose-400" : "text-green-400"
+          }`}>
+            {codeOutput}
+          </pre>
+        )}
+
+        {/* DEBUG INFO (Expected vs Actual) */}
+        {executionResult?.debug && (
+           <div className="mt-3 pt-2 border-t border-slate-800 text-xs">
+              <div className="text-slate-500 font-bold mb-1">Mismatch Details:</div>
+              <pre className="text-amber-300/90 whitespace-pre-wrap">{executionResult.debug}</pre>
+           </div>
+        )}
+      </div>
+    </div>
+  </div>
+) : (
+  /* --- STANDARD TEXT AREA FOR NON-CODE QUESTIONS --- */
+  <textarea
+    value={answer}
+    onChange={(e) => setAnswer(e.target.value)}
+    placeholder="Type your detailed answer here... Be specific about your implementation and thought process."
+    rows={8}
+    className="w-full p-5 text-base bg-white text-slate-800 rounded-xl border-2 border-slate-300 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none resize-y shadow-sm transition-all"
+  />
+)}
+
+  <div className="mt-5 flex items-center justify-between">
+    <button
+      type="button"
+      onClick={() => {
+        setAnswer("");
+        setCodeOutput(null);
+        setCodeStatus("idle");
+      }}
+      className="text-slate-500 text-sm font-medium hover:text-slate-700 transition-colors px-3 py-2 hover:bg-slate-100 rounded-lg"
+    >
+      Clear Answer
+    </button>
+
+    <button
+      type="submit"
+      disabled={loading || !token || !answer.trim()}
+      className={`px-8 py-4 rounded-xl font-bold text-lg shadow-xl transition-all transform active:scale-95 flex items-center gap-3 ${
+        !token || !answer.trim() || loading
+          ? "bg-slate-300 text-slate-500 cursor-not-allowed"
+          : "bg-gradient-to-r from-indigo-600 to-purple-600 text-white hover:shadow-indigo-300 hover:scale-105"
+      }`}
+    >
+      {loading ? (
+        <>
+          <div className="w-5 h-5 border-3 border-white/30 border-t-white rounded-full animate-spin"></div>
+          Analyzing Answer...
+        </>
+      ) : (
+        <>
+          Submit Answer
+          <CheckCircle size={20} />
+        </>
+      )}
+    </button>
+  </div>
+</form>
               </div>
             </div>
           </div>

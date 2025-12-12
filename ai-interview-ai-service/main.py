@@ -5,12 +5,21 @@
 #  - Advanced bluff detection and gray-area scoring
 #  - Aggressive early termination for poor candidates
 #  - Multi-dimensional scoring with confidence tracking
+import os
+import sys
 
+# --- 1. CRITICAL: OMP FIX MUST BE FIRST ---
+# This prevents the "OMP: Error #15" crash when using DeepFace + YOLO
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from groq import Groq
+from typing import Tuple
+import requests
+import math
 from dotenv import load_dotenv
+from ultralytics import YOLO
 from deepface import DeepFace
 import cv2
 from fastapi.responses import JSONResponse
@@ -19,6 +28,7 @@ import base64
 import os, io, json, re, logging
 from typing import Dict
 import time
+
 FACE_DB: Dict[str, Dict[str, Any]] = {}  # sessionId -> {embedding: [...], thumbnail_b64: str, created: ts}
 
 import pdfplumber, docx2txt, requests
@@ -31,27 +41,34 @@ if not GROQ_API_KEY:
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")  # Using most capable model
 MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "14000"))
 DEFAULT_TOKEN_BUDGET = int(os.getenv("DEFAULT_TOKEN_BUDGET", "5000"))
-
+PISTON_API_URL = "https://emkc.org/api/v2/piston/execute"
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 app = FastAPI(title="Enhanced AI Interview Service")
-STRICT_DISTANCE_THRESHOLD = 0.55
+STRICT_DISTANCE_THRESHOLD = 0.65
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai-service")
 print("⏳ Loading VGG-Face model... please wait...")
 DeepFace.build_model("VGG-Face")
-print("✅ Model loaded!")
+print("⏳ Loading YOLOv8 model (for phone detection)...")
+object_model = YOLO("yolov8s.pt")
+print("✅ All Models loaded!")
 # ==========================================
 # CORE CONFIGURATION
 # ==========================================
 
 TERMINATION_RULES = {
-    "instant_fail_threshold": 0.20,   # Catastrophic failure
-    "consecutive_fail_count": 2,      # Two fails in a row = reject (remains valid for efficiency)
+    "instant_fail_threshold": 0.20,
+    "consecutive_fail_count": 2,
     "consecutive_fail_threshold": 0.45,
     "excellence_threshold": 0.85,
-    "min_confidence_to_end": 0.85,    # NEW: Model must be 85% sure to stop naturally
-    "max_questions_soft_limit": 12,   # Expanded significantly, just to prevent infinite loops
+    "excellence_count": 3,
+    
+    # 👇 ADD THIS LINE (Fixes the 500 Crash) 👇
+    "max_questions": 15,
+    
+    "min_confidence_to_end": 0.85,
+    "max_questions_soft_limit": 12,
     "gray_zone_min": 0.40,
     "gray_zone_max": 0.75,
 }
@@ -174,7 +191,36 @@ def redact_pii(text: str) -> Dict[str, Any]:
         text = text.replace(m, "[REDACTED_EMAIL]")
     text = PHONE_RE.sub("[REDACTED_PHONE]", text)
     return {"redacted": text, "redaction_log": log}
-
+def scan_frame_for_violations(img_array: np.ndarray) -> Dict[str, Any]:
+    """
+    Scans for BOTH prohibited items and multiple people using YOLOv8.
+    """
+    # Run inference
+    results = object_model(img_array, verbose=False, conf=0.3)
+    
+    detected_items = []
+    person_count = 0
+    
+    # YOLO COCO Class IDs: 0 = Person, 67 = Cell Phone
+    PROHIBITED_CLASSES = {67: "cell phone"} 
+    
+    for r in results:
+        for box in r.boxes:
+            cls_id = int(box.cls[0])
+            
+            # Check for People
+            if cls_id == 0:
+                person_count += 1
+            
+            # Check for Objects
+            if cls_id in PROHIBITED_CLASSES:
+                item_name = PROHIBITED_CLASSES[cls_id]
+                detected_items.append(item_name)
+                
+    return {
+        "person_count": person_count,
+        "prohibited_items": list(set(detected_items))
+    }         
 def extract_json_from_text(s: str) -> Optional[dict]:
     if not s:
         return None
@@ -471,171 +517,244 @@ def extract_technical_projects(resume: str) -> List[Dict[str, str]]:
         projects.append(current_project)
     
     return projects[:5]  # Return top 5 projects
+def enforce_test_cases_for_challenge(parsed: dict, resp_raw: str, original_prompt: str, max_attempts: int = 3):
+    """
+    Ensure parsed (which is a dict) that contains a coding_challenge ends up with:
+      coding_challenge.test_cases -> list of >=2 {"input": "<json-string>", "expected": "<string>"}
+    If repair succeeds, returns the updated 'challenge' dict.
+    If fails after attempts, raises HTTPException(status_code=422, detail={...})
+    """
+    # Defensive checks
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=500, detail="internal: parsed must be dict for repair")
+
+    challenge = parsed.get("coding_challenge") or {}
+    # quick normalization: ensure legacy fields are strings if present
+    if "test_case_input" in challenge and not isinstance(challenge["test_case_input"], str):
+        try:
+            challenge["test_case_input"] = json.dumps(challenge["test_case_input"])
+        except:
+            challenge["test_case_input"] = str(challenge["test_case_input"])
+    if "expected_output" in challenge and not isinstance(challenge["expected_output"], str):
+        try:
+            challenge["expected_output"] = json.dumps(challenge["expected_output"])
+        except:
+            challenge["expected_output"] = str(challenge["expected_output"])
+
+    # helper to validate normalized list
+    def is_valid_tc_list(tc_list):
+        if not isinstance(tc_list, list) or len(tc_list) < 2:
+            return False
+        for tc in tc_list:
+            if not isinstance(tc, dict) or "input" not in tc or "expected" not in tc:
+                return False
+            if not isinstance(tc["input"], str) or not isinstance(tc["expected"], str):
+                return False
+        return True
+
+    # If already good, return
+    if is_valid_tc_list(challenge.get("test_cases", [])):
+        # ensure legacy fields reflect first case
+        first = challenge["test_cases"][0]
+        challenge["test_case_input"] = first["input"]
+        challenge["expected_output"] = first["expected"]
+        parsed["coding_challenge"] = challenge
+        return challenge
+
+    # Build a *strict* repair prompt with original prompt + raw model output + parsed
+    repair_prompt_template = """
+ERROR: A coding question was generated but the required 'test_cases' array (>=2 entries) is missing or malformed.
+
+You will be given:
+1) The original human-readable generation PROMPT (below).
+2) The original LLM RAW output (below).
+3) The original parsed JSON object (below).
+
+Return ONLY a single JSON object with one key "test_cases". The value MUST be an array of at least 2 test case objects. Each test case object must be exactly:
+{ "input": "<valid JSON string>", "expected": "<exact expected output as string>" }
+
+Rules (must follow exactly):
+- Do not return any keys other than "test_cases".
+- Do not add commentary or explanation.
+- Inputs must be valid JSON strings (e.g., arrays like "[1,2,3]", strings like "\"abc\"", numbers like "5").
+- If expected result is None, use "null". If boolean, use "true"/"false".
+- Make tests relevant and consistent with the problem statement; include 2 different cases (e.g., typical and edge).
+
+--- ORIGINAL PROMPT:
+{orig_prompt}
+
+--- ORIGINAL LLM RAW:
+{llm_raw}
+
+--- ORIGINAL PARSED (truncated):
+{parsed_json}
+""".strip()
+
+    repair_raws = []
+    for attempt in range(1, max_attempts + 1):
+        repair_prompt = repair_prompt_template.format(
+            orig_prompt=safe_truncate(original_prompt or "", 6000),
+            llm_raw=safe_truncate(resp_raw or "", 4000),
+            parsed_json=safe_truncate(json.dumps(parsed, default=str), 2000)
+        )
+        try:
+            repair_resp = groq_call(repair_prompt, temperature=0.0, max_tokens=500)
+        except Exception as e:
+            repair_raws.append(f"exception:{e}")
+            logger.warning("Repair groq_call exception attempt %d: %s", attempt, e)
+            continue
+
+        if not repair_resp.get("ok"):
+            repair_raws.append(repair_resp.get("raw") or repair_resp.get("error") or "no_raw")
+            continue
+
+        repair_raw = repair_resp.get("raw", "")
+        repair_raws.append(repair_raw[:4000])
+
+        candidate = extract_json_from_text(repair_raw)
+        if not candidate or not isinstance(candidate, dict):
+            logger.info("Repair attempt %d returned non-JSON or unparsable text.", attempt)
+            continue
+
+        tc_list = candidate.get("test_cases")
+        if not tc_list or not isinstance(tc_list, list) or len(tc_list) < 2:
+            logger.info("Repair attempt %d returned test_cases but invalid length/format.", attempt)
+            continue
+
+        # Normalize each entry -> strings
+        normalized = []
+        malformed = False
+        for tc in tc_list:
+            if not isinstance(tc, dict) or "input" not in tc or "expected" not in tc:
+                malformed = True
+                break
+            inp = tc["input"]
+            exp = tc["expected"]
+            if not isinstance(inp, str):
+                try:
+                    inp = json.dumps(inp)
+                except:
+                    inp = str(inp)
+            if not isinstance(exp, str):
+                try:
+                    exp = json.dumps(exp)
+                except:
+                    exp = str(exp)
+            normalized.append({"input": inp, "expected": exp})
+
+        if malformed or len(normalized) < 2:
+            logger.info("Repair attempt %d returned malformed test_cases.", attempt)
+            continue
+
+        # success
+        challenge["test_cases"] = normalized
+        first = normalized[0]
+        challenge["test_case_input"] = first["input"]
+        challenge["expected_output"] = first["expected"]
+        parsed["coding_challenge"] = challenge
+        parsed["_auto_repaired_test_cases"] = True
+        parsed["confidence"] = min(parsed.get("confidence", 0.6), 0.6)
+        logger.info("Repair succeeded on attempt %d (added %d tests).", attempt, len(normalized))
+        return challenge
+
+    # If we reach here, all attempts failed -> return structured 422 (so frontend can prompt regen)
+    detail = {
+        "error": "model_failed_to_provide_test_cases",
+        "message": "LLM failed to return required test_cases after repair attempts.",
+        "repair_raws": repair_raws[:3],
+        "original_llm_raw": (resp_raw or "")[:3000]
+    }
+    logger.error("Test-case repair failed. Samples: %s", repair_raws[:2])
+    raise HTTPException(status_code=422, detail=detail)
 
 def build_generate_question_prompt(context: dict, mode: str = "first") -> str:
     """
-    Generate DEEP TECHNICAL questions that probe actual implementation knowledge.
-    Uses 'Contextual Continuity' to ensure the interview flows logically based on performance.
+    Generate a strict prompt that asks the model to produce a single JSON object
+    containing a code question and exactly 3 test cases.
+
+    IMPORTANT:
+    - The JSON schema below contains an EMPTY 'test_cases' array. The model MUST
+      generate 3 test cases and fill that array. Do NOT copy any example values
+      that appear in the prompt.
+    - The model must output EXACTLY one JSON object and NOTHING ELSE (no markdown,
+      no comments, no explanatory text).
     """
     resume = context.get("resume", "")
-    chunks = context.get("chunks", [])
-    conv = context.get("conv", [])
-    history = context.get("history", [])
-    
-    # Extract projects for targeted questioning
-    projects = extract_technical_projects(resume)
-    
-    # Build context
-    chunks_text = "\n".join([
-        f"[Source {c['doc_id']}:{c['chunk_id']}] {c.get('snippet','')[:400]}"
-        for c in chunks[:4]
-    ])
-    
-    conv_text = "\n".join([
-        f"{m['role']}: {m['text'][:250]}"
-        for m in conv[-4:]
-    ])
-    
-    # Analyze what's been asked to avoid repetition
-    asked_topics = set()
+    chunks = context.get("chunks", []) or []
+    history = context.get("history", []) or []
+
+    chunks_text = "\n".join([f"- {c.get('snippet','')[:400]}" for c in chunks[:3]])
+    last_q_context = ""
     if history:
-        for h in history:
-            q = h.get("question", "").lower()
-            for tech in ['python', 'java', 'sql', 'api', 'algorithm', 'data structure', 'system design', 'aws', 'docker']:
-                if tech in q:
-                    asked_topics.add(tech)
+        last = history[-1]
+        last_q_context = f"PREVIOUS Q: {last.get('question', '')[:150]} (Score: {last.get('score', 0)})"
 
-    projects_text = ""
-    if projects:
-        projects_text = "IDENTIFIED TECHNICAL PROJECTS:\n"
-        for i, p in enumerate(projects[:3], 1):
-            projects_text += f"{i}. {p['title']}\n   Technologies: {', '.join(p['technologies']) or 'Not specified'}\n"
-
-    # ==========================================
-    # LOGIC: EXTRACT LAST INTERACTION DETAILS
-    # ==========================================
-    last_interaction_context = ""
-    prev_score = 0.0
-    
-    if history:
-        last_entry = history[-1]
-        try:
-            prev_score = float(last_entry.get("score", 0.0))
-        except:
-            prev_score = 0.0
-            
-        last_interaction_context = f"""
-LAST INTERACTION DATA:
-- Previous Question: "{last_entry.get('question', 'N/A')}"
-- Candidate Answer: "{last_entry.get('answer', 'N/A')[:500]}"
-- Score Received: {prev_score}
-"""
-
-    # ==========================================
-    # MODE 1: FIRST QUESTION
-    # ==========================================
-    if mode == "first" or not history:
-        system = """You are a HARDCORE Technical Interviewer at a top tech company. Your mission: Expose resume fluff.
-
-BANNED QUESTIONS (never ask these):
-- "Tell me about yourself"
-- "What are your strengths/weaknesses"
-- "Why do you want this role"
-- Any generic behavioral question
-
-REQUIRED QUESTION TYPES:
-1. **Implementation Deep-Dive**: "In [specific project], how exactly did you implement [specific feature]? Walk me through the core logic."
-2. **Trade-off Analysis**: "Why did you choose [technology X] over [alternative Y]? What were the performance implications?"
-3. **Debugging Scenario**: "What was the hardest bug you encountered in [project]? How did you diagnose it?"
-
-Your questions MUST:
-- Reference a SPECIFIC project/technology from their resume
-- Require implementation-level knowledge to answer
-- Be impossible to answer with generic preparation"""
-
-        schema = '''{
-  "question": "string (detailed, project-specific question)",
-  "target_project": "string (which resume project this targets)",
-  "technology_focus": "string (specific tech being tested)",
-  "expected_answer_type": "medium|code|architectural",
-  "difficulty": "hard|expert",
-  "ideal_answer_outline": "string (what a strong answer covers)",
-  "red_flags": ["list of signs the candidate is bluffing"],
+    # JSON skeleton that must be filled by the model (test_cases is empty here)
+    schema = '''
+{
+  "question": "string (a short programming prompt derived from the resume/context)",
+  "type": "code",
+  "expected_answer_type": "code",
+  "target_project": "string (which project from resume this maps to, or 'general')",
+  "difficulty": "easy|medium|hard",
+  "coding_challenge": {
+      "language": "python",
+      "function_signature": "string (e.g. def solve(data): )",
+      "starter_code": "string (short starter code; may be empty)",
+      "test_cases": []
+  },
+  "ideal_answer_outline": "string (brief steps of solution)",
   "confidence": 0.0-1.0
-}'''
+}
+'''.strip()
 
-        prompt = f"""SYSTEM: {system}
+    # Helpful examples for style — THE MODEL MUST NOT COPY THESE VALUES.
+    # They are shown only to demonstrate format and should be treated as examples.
+    examples = '''
+EXAMPLES (DO NOT COPY — for format only):
+[
+  {"input": "[1, 2, 3]", "expected": "6"},
+  {"input": "[]", "expected": "0"},
+  {"input": "[5, -1, 2]", "expected": "6"}
+]
+'''.strip()
 
-CANDIDATE RESUME:
-```
-{resume[:1500]}
-```
+    prompt = f"""
+SYSTEM: You are a deterministic Question Generation Engine. You MUST output EXACTLY one valid JSON object and NOTHING ELSE (no commentary, no markdown). Follow instructions precisely.
 
-{projects_text}
+CRITICAL INSTRUCTIONS (READ CAREFULLY):
+1) Output MUST be valid JSON parsable by json.loads().
+2) Output MUST follow the exact top-level schema shown below and MUST include "type": "code".
+3) Under "coding_challenge", the "test_cases" array MUST contain exactly 3 test-case objects.
+   Each test-case object MUST be of the form:
+     {{ "input": "<valid JSON string>", "expected": "<expected output as string>" }}
+   - Examples of valid JSON string inputs: "[1,2,3]", "\"abc\"", "5"
+   - If expected output is null, use the string "null". Booleans must be "true"/"false".
+4) DO NOT copy or echo any concrete values shown in this prompt template or the examples section.
+   You MUST GENERATE NEW question text and NEW test cases based on the resume/context.
+5) Inputs and expected values MUST be strings (i.e., quoted). Use json.dumps-style strings for objects/arrays.
+6) Do NOT include any extra keys beyond the schema. Do NOT include comments or explanatory text.
+7) Prefer problems that are solvable in a short Python function, and keep difficulty consistent with the resume's seniority (use 'easy' for junior, 'medium' for mid-level, 'hard' for senior).
+8) If the resume/context indicates a specific domain (e.g., "web scraper", "trading bot"), generate a relevant problem tied to that domain.
 
-CONTEXT DOCUMENTS:
+INPUT CONTEXT:
+Resume Summary:
+{resume[:1200]}
+
+Technical Docs (RAG):
 {chunks_text}
 
-INSTRUCTION:
-1. Pick the MOST IMPRESSIVE or COMPLEX project from the resume.
-2. Identify a specific technical claim (algorithm, architecture, optimization).
-3. Ask a question that ONLY someone who actually implemented it could answer.
-4. Output strict JSON:
+Interview History:
+{last_q_context}
+
+REQUIRED JSON SCHEMA (you MUST fill this object and ONLY this object):
 {schema}
+
+FORMAT EXAMPLES FOR TEST CASE SHAPE (EXAMPLES ONLY — DO NOT COPY):
+{examples}
+
+END.
 """
-
-    # ==========================================
-    # MODE 2: FOLLOW-UP (CONTEXTUAL CONTINUITY)
-    # ==========================================
-    else:
-        system = """You are a Dynamic Technical Interviewer. You adapt your questioning based on the candidate's previous performance.
-
-RULES FOR NEXT QUESTION (Contextual Continuity):
-1. **IF PREV SCORE < 0.5 (REMEDIAL)**:
-   - The candidate failed the previous question. 
-   - Ask a SIMPLER, fundamental question on the SAME topic.
-   - Goal: Check if they lack deep knowledge or just misunderstood the complex question.
-   
-2. **IF PREV SCORE 0.5 - 0.79 (DEEP DIVE)**:
-   - The candidate gave a surface-level or partial answer.
-   - DRILL DEEPER into the exact same topic.
-   - Ask for code-level specifics, specific libraries used, or how they handled a specific edge case mentioned in their answer.
-   
-3. **IF PREV SCORE >= 0.8 (NEW CHALLENGE)**:
-   - The candidate mastered the last topic.
-   - SWITCH TOPICS completely. Pick a different project or skill from the resume.
-   - Do NOT ask about: {asked_topics_list}
-
-GENERAL RULES:
-- Never say "Great answer". Just ask the next question.
-- Keep questions technical and implementation-focused.
-"""
-
-        schema = '''{
-  "question": "string",
-  "strategy_used": "remedial|deep_dive|new_topic",
-  "target_project": "string",
-  "technology_focus": "string",
-  "difficulty": "medium|hard|expert",
-  "ideal_answer_outline": "string",
-  "red_flags": ["list"],
-  "confidence": 0.0-1.0
-}'''
-
-        prompt = f"""SYSTEM: {system}
-
-RESUME PROJECTS:
-{projects_text}
-
-ALREADY DISCUSSED TOPICS: {list(asked_topics)}
-
-{last_interaction_context}
-
-INSTRUCTION:
-Based on the Previous Score ({prev_score}), generate the next logical question using the strategy rules above.
-Output JSON: {schema}
-"""
-    
     return prompt.strip()
 
 # ==========================================
@@ -645,10 +764,17 @@ Output JSON: {schema}
 def build_score_prompt(question_text: str, ideal_outline: str, candidate_answer: str, context: dict = None) -> str:
     """
     STRICT MULTI-DIMENSIONAL SCORING with advanced bluff detection.
+    Now supports DUAL MODES: 
+    1. Text Analysis (Concept depth, bluff detection)
+    2. Code Analysis (Execution success, syntax, efficiency)
     """
     context = context or {}
     resume = context.get("resume", "")
     chunks = context.get("chunks", [])
+    
+    # NEW: Extract question type and execution results
+    question_type = context.get("question_type", "text") 
+    exec_result = context.get("code_execution_result", {})
     
     chunks_text = ""
     if chunks:
@@ -663,7 +789,52 @@ def build_score_prompt(question_text: str, ideal_outline: str, candidate_answer:
         for name, info in SCORING_DIMENSIONS.items()
     ])
     
-    system = f"""You are an EXPERT Technical Assessor specializing in detecting resume fraud and technical incompetence.
+    # =========================================================
+    # LOGIC BRANCH: CODE vs TEXT
+    # =========================================================
+    
+    if question_type == "code":
+        # --- CODE SCORING MODE ---
+        passed = exec_result.get("passed", False)
+        output_log = exec_result.get("output", "No output captured")
+        error_type = exec_result.get("error", "None")
+
+        system = f"""You are a Senior Code Reviewer.
+        
+        CONTEXT: The candidate wrote code to solve a specific problem.
+        
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        ⚠️ EXECUTION STATUS: {'✅ PASSED' if passed else '❌ FAILED'}
+        ⚠️ ERROR TYPE: {error_type}
+        
+        EXECUTION LOG (Stdout/Stderr):
+        ```
+        {output_log[:800]}
+        ```
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        SCORING RULES FOR CODE:
+        1. **IF FAILED (passed=False)**: 
+           - **MAX SCORE: 0.5**. Do not score higher even if the logic looks "okay".
+           - If it's a minor syntax error (missing colon), score ~0.4.
+           - If logic is completely wrong or runtime error, score < 0.3.
+           
+        2. **IF PASSED (passed=True)**:
+           - **BASE SCORE: 0.7**.
+           - **Bonus (+0.1 - 0.3)**: Efficient algorithms (Big O), clean variable naming, handling edge cases, pythonic style.
+           - **Penalty (-0.1 - 0.2)**: "Spaghetti code", hardcoded values, bad variable names (e.g., 'x', 'y'), redundant logic.
+
+        3. **BLUFF DETECTION IN CODE**:
+           - Did they just `print("expected output")` to cheat the test? (Automatic 0.0)
+           - Is the code obviously copied (comments don't match logic)?
+           
+        SCORING DIMENSIONS:
+        {dimensions_text}
+        """
+
+    else:
+        # --- TEXT SCORING MODE (Your Original Logic) ---
+        system = f"""You are an EXPERT Technical Assessor specializing in detecting resume fraud and technical incompetence.
 
 SCORING DIMENSIONS:
 {dimensions_text}
@@ -709,7 +880,7 @@ CRITICAL BLUFF DETECTORS:
 4. **Buzzword Salad**: Using terms without connecting them logically
 5. **No Specifics**: Can't name files, functions, algorithms, or metrics"""
 
-    # UPDATED SCHEMA: Added mentor_tip
+    # Shared Schema
     schema = '''{
   "overall_score": 0.0-1.0,
   "dimension_scores": {
@@ -720,7 +891,7 @@ CRITICAL BLUFF DETECTORS:
   },
   "confidence": 0.0-1.0,
   "verdict": "fail|weak|acceptable|strong|exceptional",
-  "rationale": "string (specific evidence for score)",
+  "rationale": "string (specific evidence for score, citing execution status if code)",
   "red_flags_detected": ["list of bluff indicators found"],
   "missing_elements": ["what a strong answer would have included"],
   "follow_up_probe": "string (question to clarify gray areas)" or null,
@@ -753,7 +924,7 @@ REFERENCE MATERIALS:
 {chunks_text}
 
 INSTRUCTION:
-1. Evaluate each dimension independently
+1. Evaluate based on the specific rules (Text vs Code).
 2. Calculate weighted overall score
 3. Identify specific red flags (vague language, deflection, incorrect usage)
 4. Be HARSH on generic answers - most candidates exaggerate
@@ -835,6 +1006,187 @@ Score: {score} ({verdict})
     }}
     """
     return prompt.strip()
+def run_code_in_sandbox(language: str, code: str, stdin: str = "") -> Dict[str, Any]:
+    """
+    Executes code safely using the Piston Public API (or compatible runner).
+    Returns a dict with detailed fields for debugging:
+      {
+        "success": bool,
+        "output": "stdout (trimmed) or combined stdout/stderr",
+        "error_type": "API Error|Compilation Error|Runtime Error|Network Error|Config Error",
+        "status_code": int|None,
+        "raw": raw_response_object_or_text,
+        "run_stage": run_stage_dict_or_none,
+        "compile_stage": compile_stage_dict_or_none
+      }
+    """
+    # Map simple names to Piston's specific language IDs or aliases
+    lang_map = {
+        "python": {"language": "python", "version": "*"},
+        "javascript": {"language": "javascript", "version": "*"},
+        "node": {"language": "javascript", "version": "*"},
+        "java": {"language": "java", "version": "*"},
+        "cpp": {"language": "c++", "version": "*"},
+        "c": {"language": "c", "version": "*"},
+        "go": {"language": "go", "version": "*"},
+    }
+
+    config = lang_map.get(language.lower())
+    if not config:
+        return {
+            "success": False,
+            "output": f"Language '{language}' not supported. Try: python, javascript, java, cpp.",
+            "error_type": "Config Error",
+            "status_code": None,
+            "raw": None,
+            "run_stage": None,
+            "compile_stage": None
+        }
+
+    payload = {
+        "language": config["language"],
+        "version": config["version"],
+        "files": [{"content": code}],
+        "stdin": stdin or "",
+        # Piston fields - keep some safety margins
+        "run_timeout": 10000,     # ms (10s) - adjust if you need faster/longer
+        "compile_timeout": 20000  # ms (20s)
+    }
+
+    max_attempts = 3
+    delay = 0.5
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.post(PISTON_API_URL, json=payload, timeout=30)
+        except Exception as e:
+            logger.warning("Piston request attempt %d failed: %s", attempt, e)
+            last_exc = e
+            time.sleep(delay)
+            delay *= 2
+            continue
+
+        status = getattr(resp, "status_code", None)
+        raw_text = None
+        try:
+            raw = resp.json()
+            raw_text = raw
+        except Exception:
+            # not JSON
+            raw_text = resp.text if hasattr(resp, "text") else str(resp)
+
+        # Non-200 -> bubble with debug
+        if status != 200:
+            logger.error("Piston API returned status %s: %s", status, raw_text)
+            return {
+                "success": False,
+                "output": "Sandbox API Unavailable",
+                "error_type": "API Error",
+                "status_code": status,
+                "raw": raw_text,
+                "run_stage": None,
+                "compile_stage": None
+            }
+
+        # At this point we have a 200 and raw (maybe dict)
+        data = raw if isinstance(raw_text, dict) else None
+
+        # Defensive extraction of run/compile stages across different Piston-like shapes
+        run_stage = None
+        compile_stage = None
+        # Typical format: {"run": {...}, "compile": {...}}
+        if isinstance(data, dict):
+            run_stage = data.get("run") or data.get("execution") or data.get("result") or {}
+            compile_stage = data.get("compile") or data.get("compile_result") or {}
+        else:
+            # If data isn't a dict (rare), return raw text
+            return {
+                "success": False,
+                "output": raw_text if isinstance(raw_text, str) else str(raw_text),
+                "error_type": "API Error",
+                "status_code": status,
+                "raw": raw_text,
+                "run_stage": None,
+                "compile_stage": None
+            }
+
+        # Normalize run_stage/compile_stage to dicts
+        run_stage = run_stage or {}
+        compile_stage = compile_stage or {}
+
+        # If compile stage indicates compilation error
+        comp_code = compile_stage.get("code") if isinstance(compile_stage, dict) else None
+        if comp_code is not None and comp_code != 0:
+            out = (compile_stage.get("stderr") or compile_stage.get("stdout") or "").strip()
+            return {
+                "success": False,
+                "output": out,
+                "error_type": "Compilation Error",
+                "status_code": status,
+                "raw": data,
+                "run_stage": run_stage,
+                "compile_stage": compile_stage
+            }
+
+        # If run stage indicates runtime error (non-zero exit code)
+        run_code = run_stage.get("code") if isinstance(run_stage, dict) else None
+        stdout = run_stage.get("stdout") if isinstance(run_stage, dict) else None
+        stderr = run_stage.get("stderr") if isinstance(run_stage, dict) else None
+
+        # prefer combined stderr if non-empty and run failed
+        if run_code is not None and run_code != 0:
+            combined = ""
+            if stderr:
+                combined = stderr.strip()
+            elif stdout:
+                combined = stdout.strip()
+            else:
+                combined = f"Non-zero exit code: {run_code}"
+            return {
+                "success": False,
+                "output": combined,
+                "error_type": "Runtime Error",
+                "status_code": status,
+                "raw": data,
+                "run_stage": run_stage,
+                "compile_stage": compile_stage
+            }
+
+        # Success path: prefer stdout then fallback to run_stage 'output' or 'message'
+        out_text = ""
+        if stdout is not None and str(stdout).strip() != "":
+            out_text = str(stdout).strip()
+        else:
+            # some runners use other keys
+            possible = []
+            if isinstance(run_stage, dict):
+                for k in ("output", "message", "result", "stdout"):
+                    v = run_stage.get(k)
+                    if v:
+                        possible.append(str(v).strip())
+            out_text = possible[0] if possible else ""
+
+        return {
+            "success": True,
+            "output": out_text,
+            "error_type": None,
+            "status_code": status,
+            "raw": data,
+            "run_stage": run_stage,
+            "compile_stage": compile_stage
+        }
+
+    # If we exhausted attempts
+    logger.error("Piston execution failed after %d attempts: %s", max_attempts, last_exc)
+    return {
+        "success": False,
+        "output": str(last_exc) if last_exc else "Unknown network error",
+        "error_type": "Network Error",
+        "status_code": None,
+        "raw": None,
+        "run_stage": None,
+        "compile_stage": None
+    }
 
 def call_decision(context: dict, temperature: float = 0.0) -> Dict[str, Any]:
     """Make hiring decision with performance-based termination"""
@@ -1097,17 +1449,21 @@ class GenerateQuestionRequest(BaseModel):
     mode: Optional[str] = "first"
     resume_summary: Optional[str] = ""
     retrieved_chunks: Optional[List[Dict[str,Any]]] = []
-    conversation: Optional[List[Dict[str,str]]] = []
+    # 👇 CHANGE: str -> Any (Fixes 422 error if conversation has numbers/nulls)
+    conversation: Optional[List[Dict[str,Any]]] = [] 
     question_history: Optional[List[Dict[str,Any]]] = []
     token_budget: Optional[int] = DEFAULT_TOKEN_BUDGET
     allow_pii: Optional[bool] = False
     options: Optional[Dict[str,Any]] = {}
+
 class FaceVerificationRequest(BaseModel):
-    reference_image: str
+    session_id: str
     current_image: str
+
 class FaceRegisterRequest(BaseModel):
     sessionId: str
-    image: str  # This is the base64 string    
+    image: str    
+
 class ScoreAnswerRequest(BaseModel):
     request_id: str
     session_id: str
@@ -1121,6 +1477,16 @@ class ScoreAnswerRequest(BaseModel):
     token_budget: Optional[int] = DEFAULT_TOKEN_BUDGET
     allow_pii: Optional[bool] = False
     options: Optional[Dict[str,Any]] = {}
+    
+    # Coding fields
+    question_type: Optional[str] = "text" 
+    code_execution_result: Optional[Dict[str, Any]] = None 
+
+class CodeSubmissionRequest(BaseModel):
+    language: str           
+    code: str               
+    stdin: Optional[str] = "" 
+    expected_output: Optional[str] = None 
 
 class ProbeRequest(BaseModel):
     request_id: str
@@ -1131,7 +1497,8 @@ class ProbeRequest(BaseModel):
     prev_answer: str
     resume_summary: Optional[str] = ""
     retrieved_chunks: Optional[List[Dict[str,Any]]] = []
-    conversation: Optional[List[Dict[str,str]]] = []
+    # 👇 CHANGE: str -> Any
+    conversation: Optional[List[Dict[str,Any]]] = [] 
     token_budget: Optional[int] = DEFAULT_TOKEN_BUDGET
     allow_pii: Optional[bool] = False
     options: Optional[Dict[str,Any]] = {}
@@ -1141,78 +1508,311 @@ class DecisionRequest(BaseModel):
     session_id: str
     user_id: str
     resume_summary: Optional[str] = ""
-    conversation: Optional[List[Dict[str,str]]] = []
+    # 👇 CHANGE: str -> Any
+    conversation: Optional[List[Dict[str,Any]]] = [] 
     question_history: List[Dict[str,Any]]
     retrieved_chunks: Optional[List[Dict[str,Any]]] = []
     token_budget: Optional[int] = DEFAULT_TOKEN_BUDGET
     allow_pii: Optional[bool] = False
     accept_model_final: Optional[bool] = True
-
 # ==========================================
 # API ENDPOINTS
 # ==========================================
 
+# --- ADD THIS HELPER FUNCTION ABOVE generate_question ---
+def generate_missing_test_cases(question_text: str, starter_code: str) -> List[Dict[str, str]]:
+    """
+    Dedicated repair function. If the main prompt fails to generate tests,
+    this focused prompt forces the AI to create them based on the question.
+    """
+    prompt = f"""
+SYSTEM: You are a QA Engineer.
+TASK: Generate 3 strict JSON test cases for this coding problem.
+
+PROBLEM:
+{question_text}
+
+CODE STUB:
+{starter_code}
+
+OUTPUT FORMAT:
+Return ONLY a raw JSON list of objects. No markdown.
+[
+  {{"input": "valid_input_string", "expected": "valid_output_string"}},
+  {{"input": "edge_case_input", "expected": "edge_case_output"}}
+]
+"""
+    try:
+        # Fast, low-temp call
+        resp = groq_call(prompt, temperature=0.0, max_tokens=300)
+        cases = extract_json_from_text(resp.get("raw", ""))
+        
+        valid = []
+        if isinstance(cases, list):
+            for c in cases:
+                if isinstance(c, dict) and "input" in c and "expected" in c:
+                    valid.append({
+                        "input": str(c["input"]), 
+                        "expected": str(c["expected"])
+                    })
+        return valid
+    except:
+        return []
+
+# --- REPLACE THE MAIN ENDPOINT ---
 @app.post("/generate_question")
 def generate_question(req: GenerateQuestionRequest):
-    """Generate deep technical question targeting resume claims"""
     payload = req.dict()
-    
-    # PII redaction
-    redaction_log = []
-    if not payload.get("allow_pii") and payload.get("resume_summary"):
-        r = redact_pii(payload["resume_summary"])
-        payload["resume_summary"] = r["redacted"]
-        redaction_log = r["redaction_log"]
-    
     enforced = enforce_budget(payload)
-    
-    # Add history to context
     enforced["history"] = payload.get("question_history", [])
-    
+
+    # Prepare prompt once (deterministic)
     prompt = build_generate_question_prompt(enforced, mode=payload.get("mode", "first"))
-    
-    options = payload.get("options", {})
-    temperature = float(options.get("temperature", 0.1))  # Slight randomness for variety
-    max_tokens = int(options.get("max_response_tokens", 800))
-    
-    if len(prompt) > MAX_PROMPT_CHARS:
-        raise HTTPException(status_code=400, detail="prompt_too_large")
-    
-    resp = groq_call(prompt, temperature=temperature, max_tokens=max_tokens)
-    
-    if not resp.get("ok"):
-        raise HTTPException(status_code=502, detail=f"groq_error: {resp.get('error')}")
-    
-    parsed = extract_json_from_text(resp["raw"])
-    
-    # Fallback question if parsing failed
-    if not parsed or not isinstance(parsed, dict):
-        resume = enforced.get("resume", "")
-        skills = []
-        for skill in ['Python', 'JavaScript', 'Java', 'SQL', 'React', 'Node.js', 'AWS', 'Docker']:
-            if skill.lower() in resume.lower():
-                skills.append(skill)
-        
-        target_skill = skills[0] if skills else "your most complex project"
-        
-        parsed = {
-            "question": f"Tell me about the most technically challenging aspect of {target_skill} in your experience. What specific problem did you solve, and how did you approach it?",
-            "target_project": "General",
-            "technology_focus": target_skill,
-            "expected_answer_type": "medium",
-            "difficulty": "hard",
-            "ideal_answer_outline": "Should describe: specific technical challenge, approach taken, implementation details, trade-offs considered, outcome achieved",
-            "red_flags": ["vague descriptions", "no specific implementation details", "team did it without personal contribution"],
-            "confidence": 0.4
-        }
-    
+
+    # Build ordered list of models to try
+    tried_models = []
+    default_model = os.getenv("GROQ_MODEL", GROQ_MODEL)
+    tried_models.append(default_model)
+    alt_models_env = os.getenv("ALT_GROQ_MODELS", "")
+    if alt_models_env:
+        for m in [m.strip() for m in alt_models_env.split(",") if m.strip()]:
+            if m not in tried_models:
+                tried_models.append(m)
+
+    generation_attempts = []
+    parsed = None
+    chosen_raw = None
+    chosen_model = None
+
+    try:
+        for model_name in tried_models:
+            logger.info("generate_question: trying model '%s' for request_id=%s", model_name, payload.get("request_id"))
+            try:
+                resp = groq_call(prompt, model=model_name, temperature=0.0, max_tokens=1200)
+            except Exception as e:
+                logger.exception("groq_call failed for model %s: %s", model_name, e)
+                generation_attempts.append({"model": model_name, "raw": None, "error": str(e)})
+                continue
+
+            raw = resp.get("raw", "") if isinstance(resp, dict) else str(resp)
+            generation_attempts.append({"model": model_name, "raw": raw})
+
+            candidate = extract_json_from_text(raw)
+            if not candidate or not isinstance(candidate, dict):
+                logger.info("Model '%s' returned unparsable or non-dict JSON; continuing.", model_name)
+                continue
+
+            # Validate it's a code question with >=3 properly shaped test cases
+            if candidate.get("type") != "code":
+                logger.info("Model '%s' returned non-code type; continuing.", model_name)
+                continue
+
+            cc = candidate.get("coding_challenge") or {}
+            tcs = cc.get("test_cases")
+            def valid_tc_list(tc_list):
+                if not isinstance(tc_list, list) or len(tc_list) < 3:
+                    return False
+                for tc in tc_list:
+                    if not isinstance(tc, dict):
+                        return False
+                    if "input" not in tc or "expected" not in tc:
+                        return False
+                    if not isinstance(tc["input"], str) or not isinstance(tc["expected"], str):
+                        return False
+                return True
+
+            if valid_tc_list(tcs):
+                # success
+                parsed = candidate
+                chosen_raw = raw
+                chosen_model = model_name
+                logger.info("Model '%s' produced valid test_cases for request_id=%s", model_name, payload.get("request_id"))
+                break
+            else:
+                logger.info("Model '%s' produced invalid or insufficient test_cases; continuing.", model_name)
+
+        # If no model produced a valid parsed result, fail loudly with debugging info
+        if parsed is None:
+            logger.error("All attempted models failed to produce valid test_cases for request_id=%s", payload.get("request_id"))
+            raise HTTPException(status_code=502, detail={
+                "error": "model_failed_to_provide_test_cases",
+                "message": "None of the attempted models returned a coding challenge with >=3 valid test_cases.",
+                "attempts": generation_attempts
+            })
+
+    except HTTPException:
+        # Re-raise HTTPException so FastAPI handles properly
+        raise
+    except Exception as e:
+        logger.exception("Unexpected generation error: %s", e)
+        raise HTTPException(status_code=500, detail="AI generation failed")
+
+    # At this point 'parsed' is valid and contains coding_challenge.test_cases >= 3
+    # Optionally, enforce legacy fields for frontend compatibility
+    try:
+        challenge = parsed.get("coding_challenge") or {}
+        tcs = challenge.get("test_cases", [])
+        if isinstance(tcs, list) and len(tcs) >= 1:
+            challenge["test_case_input"] = tcs[0]["input"]
+            challenge["expected_output"] = tcs[0]["expected"]
+        if "language" not in challenge:
+            challenge["language"] = "python"
+        if "starter_code" not in challenge:
+            challenge["starter_code"] = "def solve(x):\n    pass"
+        parsed["coding_challenge"] = challenge
+    except Exception:
+        logger.warning("Failed to normalize legacy coding_challenge fields; continuing with parsed result.")
+
     return {
         "request_id": payload["request_id"],
-        "prompt_text": prompt if options.get("return_prompt") else None,
-        "llm_raw": resp["raw"],
+        "llm_raw": chosen_raw,
         "parsed": parsed,
-        "redaction_log": redaction_log
+        "redaction_log": []
     }
+
+@app.post("/run_code")
+def run_code(req: CodeSubmissionRequest):
+    final_code = req.code
+
+    # ---------------------------------------------------------
+    # 1. ROBUST DRIVER (Reads from Sys.Stdin)
+    # ---------------------------------------------------------
+    # Inject driver if Python and file looks like a library (has a def
+    # but no "__main__" execution block). Avoid relying on "print(" check.
+    if req.language.lower() == "python" and "def " in final_code and "if __name__" not in final_code:
+
+        # Regex to find the function name
+        target_func = "solve"
+        match = re.search(r"def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", final_code)
+        if match:
+            target_func = match.group(1)
+
+        # Universal driver: safe parsing + fallback call strategies
+        driver = f'''
+import sys, json, traceback
+
+def _parse_input(raw):
+    raw = raw.strip()
+    if raw == "":
+        return None
+    # Try JSON first
+    try:
+        return json.loads(raw)
+    except:
+        pass
+    # If looks like CSV without brackets: "1, 2, 3"
+    if ',' in raw and '[' not in raw and raw.count('"') % 2 == 0:
+        parts = [p.strip() for p in raw.split(',')]
+        # Try convert to ints/floats, otherwise keep strings
+        out = []
+        for p in parts:
+            if p == "":
+                continue
+            try:
+                out.append(int(p))
+                continue
+            except:
+                pass
+            try:
+                out.append(float(p))
+                continue
+            except:
+                pass
+            # strip quotes if present
+            if len(p) >= 2 and ((p[0] == p[-1] == '"') or (p[0] == p[-1] == "'")):
+                out.append(p[1:-1])
+            else:
+                out.append(p)
+        return out
+    # Fallback: raw string (strip wrapping quotes if present)
+    if len(raw) >= 2 and ((raw[0] == raw[-1] == '"') or (raw[0] == raw[-1] == "'")):
+        return raw[1:-1]
+    return raw
+
+if __name__ == "__main__":
+    try:
+        raw_input = sys.stdin.read()
+        input_data = _parse_input(raw_input)
+
+        # Try calling with one argument, fallback to zero-arg if TypeError
+        result = None
+        try:
+            result = {target_func}(input_data)
+        except TypeError:
+            try:
+                result = {target_func}()
+            except Exception as e:
+                # re-raise to be caught below
+                raise
+
+        # Print result in JSON-friendly form
+        if result is None:
+            print("null")
+        else:
+            try:
+                print(json.dumps(result))
+            except TypeError:
+                # Objects not JSON serializable -> fallback to str()
+                print(json.dumps(str(result)))
+    except Exception as e:
+        # Provide structured driver error for debugging
+        tb = traceback.format_exc()
+        print("DRIVER_ERROR")
+        print(json.dumps({{"error": str(e), "traceback": tb}}))
+'''
+        final_code = final_code + "\n\n" + driver
+
+    # ---------------------------------------------------------
+    # 2. EXECUTION (Pass stdin normally)
+    # ---------------------------------------------------------
+    run_result = run_code_in_sandbox(req.language, final_code, req.stdin)
+
+    # Build base response (include lots of debug info)
+    response = {
+        "success": run_result.get("success", False),
+        "output": str(run_result.get("output", "") or "").strip(),
+        "error": run_result.get("error_type"),
+        "passed": False,
+        "stdin_received": req.stdin or "",
+        "raw_run": run_result,   # full raw sandbox response for troubleshooting
+        "debug": None
+    }
+
+    # ---------------------------------------------------------
+    # 3. ROBUST GRADING
+    # ---------------------------------------------------------
+    if req.expected_output and run_result.get("success"):
+        actual = response["output"]
+        expected = str(req.expected_output).strip()
+
+        # Exact match
+        if actual == expected:
+            response["passed"] = True
+        else:
+            # Try JSON decode both sides (handles spacing, ordering for arrays/objects)
+            try:
+                actual_json = json.loads(actual) if actual not in ("None", "") else None
+            except:
+                actual_json = None
+            try:
+                expected_json = json.loads(expected) if expected not in ("None", "") else None
+            except:
+                expected_json = None
+
+            if actual_json is not None and expected_json is not None:
+                if actual_json == expected_json:
+                    response["passed"] = True
+
+        if not response["passed"]:
+            response["debug"] = f"Expected: {expected} | Got: {actual}"
+            logger.info(f"❌ TEST FAILED: {response['debug']}")
+
+    # If sandbox failed, include its message in debug for easier triage
+    if not run_result.get("success"):
+        response["debug"] = response.get("debug") or run_result.get("output") or run_result.get("error_type")
+
+    return response
+
 @app.post("/interview/register-face")
 async def register_face(request: FaceRegisterRequest):
     """
@@ -1317,7 +1917,9 @@ def score_answer(req: ScoreAnswerRequest):
     
     context = {
         "resume": enforced.get("resume", ""),
-        "chunks": enforced.get("chunks", [])
+        "chunks": enforced.get("chunks", []),
+        "question_type": payload.get("question_type", "text"),          # <--- ADDED
+        "code_execution_result": payload.get("code_execution_result")   # <--- ADDED
     }
     
     prompt = build_score_prompt(
@@ -1589,82 +2191,113 @@ from scipy.spatial.distance import cosine # <--- ADD THIS IMPORT
 @app.post("/verify_face")
 def verify_face(req: FaceVerificationRequest):
     """
-    Manual Verification: 
-    1. Generates embedding for current frame.
-    2. Compares it mathematically to the stored reference.
-    3. Handles "No Face" gracefully without 500 Errors.
+    MTCNN Verification:
+    - Uses 'mtcnn' backend: A 3-stage deep learning detector.
+    - Stage 3 explicitly verifies facial landmarks, so notebooks/books are rejected.
+    - More reliable than OpenCV, faster than RetinaFace.
     """
-    
-    # 1. Decode Images
-    img1 = decode_base64_image(req.reference_image) # Registration Image
-    img2 = decode_base64_image(req.current_image)   # Webcam Frame
-    
-    if img1 is None or img2 is None:
+    # 1. Validate Session
+    if req.session_id not in FACE_DB:
+        return JSONResponse(status_code=400, content={"verified": False, "error": "Session not found."})
+
+    reference_embedding = FACE_DB[req.session_id]["embedding"]
+
+    # 2. Decode image
+    img2 = decode_base64_image(req.current_image)
+    if img2 is None:
         return JSONResponse(status_code=400, content={"verified": False, "error": "Image decode failed"})
 
+    # =========================================================================
+    # CHECK 1: COUNT FACES with MTCNN
+    # =========================================================================
+    # MTCNN is very strict. It requires eyes/nose/mouth to confirm a face.
     try:
-        # 2. Get Embedding for Reference (Should be cached in reality, but calculating here for safety)
-        # Note: In a real app, you'd fetch 'rep1' from your database (FACE_DB) instead of calculating it every time.
-        objs1 = DeepFace.represent(
-            img_path=img1,
+        face_objs = DeepFace.extract_faces(
+            img_path=img2,
+            detector_backend="mtcnn",   # <--- SWAPPED TO MTCNN
+            enforce_detection=False,    # Don't crash if 0 faces
+            align=True
+        )
+        
+        # MTCNN confidence scores are usually very reliable.
+        # We filter out anything below 0.8 to be safe against shadows.
+        valid_faces = [f for f in face_objs if f.get('confidence', 0) > 0.80]
+        face_count = len(valid_faces)
+        
+    except Exception as e:
+        logger.error(f"MTCNN error: {e}")
+        # If MTCNN fails (e.g. image too small), we default to 0 to be safe
+        face_count = 0
+
+    # =========================================================================
+    # CHECK 2: PROHIBITED OBJECTS (YOLO Only)
+    # =========================================================================
+    detected_items = []
+    try:
+        # We ONLY use YOLO for phones, not for counting people/faces
+        results = object_model(img2, verbose=False, conf=0.40)
+        PROHIBITED_CLASSES = {67: "cell phone"} 
+        
+        for r in results:
+            for box in r.boxes:
+                cls_id = int(box.cls[0])
+                if cls_id in PROHIBITED_CLASSES:
+                    detected_items.append(PROHIBITED_CLASSES[cls_id])
+                    
+    except Exception as e:
+        logger.warning(f"Object detection skipped: {e}")
+
+    # =========================================================================
+    # DECISION LOGIC
+    # =========================================================================
+    
+    # 1. Check Multiple People
+    if face_count > 1:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "verified": False,
+                "violation_type": "multiple_people",
+                "error": "Multiple people detected",
+                "person_count": face_count,
+                "details": f"MTCNN detected {face_count} distinct faces."
+            }
+        )
+    
+    # 2. Check Objects
+    if detected_items:
+        return JSONResponse(status_code=400, content={"verified": False, "violation_type": "prohibited_object", "objects": detected_items, "error": "Prohibited object detected"})
+
+    # 3. Check No Face
+    if face_count == 0:
+         return JSONResponse(status_code=400, content={"verified": False, "error": "No face detected", "violation_type": "no_face_detected"})
+
+    # =========================================================================
+    # CHECK 3: IDENTITY MATCH (VGG-Face via MTCNN)
+    # =========================================================================
+    try:
+        # We use the same backend to ensure alignment consistency
+        # We assume the valid face found above is the one we want to check
+        embedding_objs = DeepFace.represent(
+            img_path=img2,
             model_name="VGG-Face",
             detector_backend="mtcnn",
             enforce_detection=True
         )
-        embedding1 = objs1[0]["embedding"]
-
-        # 3. Get Embedding for Webcam (The critical part)
-        try:
-            objs2 = DeepFace.represent(
-                img_path=img2,
-                model_name="VGG-Face",
-                detector_backend="mtcnn",
-                enforce_detection=True 
-            )
-            embedding2 = objs2[0]["embedding"]
-            
-        except ValueError as e:
-            # THIS catches "No Face Detected" cleanly
-            logger.warning(f"No face found in webcam frame: {str(e)}")
-            return JSONResponse(
-                status_code=400, 
-                content={
-                    "verified": False, 
-                    "error": "No face detected in frame. Adjust lighting.",
-                    "violation_type": "no_face_detected"
-                }
-            )
-
-        # 4. Calculate Distance Manually
-        # Cosine Distance = 1 - Cosine Similarity
-        distance = cosine(embedding1, embedding2)
         
-        logger.info(f" Calculated Distance: {distance:.4f} (Threshold: {STRICT_DISTANCE_THRESHOLD})")
-
-        # 5. Compare against Threshold
+        # Take the most confident face (DeepFace usually sorts by size/confidence)
+        current_embedding = embedding_objs[0]["embedding"]
+        
+        distance = cosine(reference_embedding, current_embedding)
+        
         if distance <= STRICT_DISTANCE_THRESHOLD:
-            return {
-                "verified": True,
-                "distance": distance,
-                "threshold": STRICT_DISTANCE_THRESHOLD,
-                "model": "VGG-Face"
-            }
+            return {"verified": True, "distance": distance}
         else:
-            return JSONResponse(
-                status_code=400, 
-                content={
-                    "verified": False,
-                    "distance": distance,
-                    "threshold": STRICT_DISTANCE_THRESHOLD,
-                    "error": "Face mismatch (Unauthorized User)",
-                    "violation_type": "face_mismatch"
-                }
-            )
+            return JSONResponse(status_code=400, content={"verified": False, "distance": distance, "error": "Face mismatch", "violation_type": "face_mismatch"})
 
     except Exception as e:
-        logger.error(f"System Error in verification: {e}")
-        return JSONResponse(status_code=500, content={"verified": False, "error": str(e)})
-@app.get("/health")
+        # If verify fails despite finding a face earlier, it's usually an alignment edge case
+        return JSONResponse(status_code=500, content={"verified": False, "error": f"Identity check failed: {str(e)}"})
 def health():
     return {"status": "healthy", "model": GROQ_MODEL}
 
