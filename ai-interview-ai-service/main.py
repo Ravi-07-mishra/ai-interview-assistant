@@ -12,9 +12,14 @@ import sys
 # This prevents the "OMP: Error #15" crash when using DeepFace + YOLO
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from pydantic import BaseModel
-from typing import Optional, Dict, Any, List
+from pydantic import BaseModel, ConfigDict
+from typing import Any, Dict, List, Optional
+
 from groq import Groq
+from google import genai
+from google.genai import types
+from openai import OpenAI
+
 from typing import Tuple
 import requests
 import math
@@ -29,33 +34,70 @@ import os, io, json, re, logging
 from typing import Dict
 import time
 
+
 FACE_DB: Dict[str, Dict[str, Any]] = {}  # sessionId -> {embedding: [...], thumbnail_b64: str, created: ts}
 
 import pdfplumber, docx2txt, requests
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ai-service")
 
 load_dotenv()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    raise RuntimeError("GROQ_API_KEY not set in environment")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+if not OPENROUTER_API_KEY:
+    raise RuntimeError("OPENROUTER_API_KEY not set")
+    
+openrouter_client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY,
+)
 
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if GROQ_API_KEY:
+    groq_client = Groq(api_key=GROQ_API_KEY)
+else:
+    logger.warning("GROQ_API_KEY not set. Groq-based parsing will fail.")
+    groq_client = None
+# 2. Google GenAI (Specific for Resume Parsing - Optional but FREE)
+# If you don't have this key, the resume parser will fallback to OpenRouter
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+try:
+    google_client = genai.Client(api_key=GOOGLE_API_KEY) if GOOGLE_API_KEY else None
+except:
+    google_client = None
+    
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")  # Using most capable model
 MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "14000"))
 DEFAULT_TOKEN_BUDGET = int(os.getenv("DEFAULT_TOKEN_BUDGET", "5000"))
 PISTON_API_URL = "https://emkc.org/api/v2/piston/execute"
-groq_client = Groq(api_key=GROQ_API_KEY)
 
 app = FastAPI(title="Enhanced AI Interview Service")
 STRICT_DISTANCE_THRESHOLD = 0.65
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("ai-service")
 print("⏳ Loading VGG-Face model... please wait...")
 DeepFace.build_model("VGG-Face")
 print("⏳ Loading YOLOv8 model (for phone detection)...")
 object_model = YOLO("yolov8s.pt")
 print("✅ All Models loaded!")
+RESUME_PARSER_CHAIN = [
+    {"provider": "groq", "model": "llama-3.3-70b-versatile"},
+    {"provider": "groq", "model": "mixtral-8x7b-32768"}
+]
+
 # ==========================================
 # CORE CONFIGURATION
 # ==========================================
+
+# USE THE NEW ALIVE MODEL (1.5 is dead)
+INTERVIEW_MODELS = [
+    # Primary: Fast, reliable, great instruction following
+    "meta-llama/llama-3.3-70b-instruct",
+    
+    # Specialist: Excellent at coding/logic (use for generate_question)
+    "qwen/qwen-2.5-coder-32b-instruct",
+    
+    # Reasoner: Good for scoring/decisions (DeepSeek R1 Distill)
+    "deepseek/deepseek-r1-distill-llama-70b",
+]
+
 
 TERMINATION_RULES = {
     "instant_fail_threshold": 0.20,
@@ -65,12 +107,46 @@ TERMINATION_RULES = {
     "excellence_count": 3,
     
     # 👇 ADD THIS LINE (Fixes the 500 Crash) 👇
-    "max_questions": 15,
+    "max_questions": 10,
     
     "min_confidence_to_end": 0.85,
-    "max_questions_soft_limit": 12,
+    "max_questions_soft_limit": 9,
     "gray_zone_min": 0.40,
     "gray_zone_max": 0.75,
+}
+# ==========================================
+# 🛑 EMERGENCY FALLBACK QUESTIONS (PREVENTS CRASHES)
+# ==========================================
+FALLBACK_QUESTIONS = {
+    "coding_challenge": {
+        "question": "Write a Python function to check if a string is a valid palindrome, considering only alphanumeric characters and ignoring case.",
+        "type": "coding_challenge",
+        "coding_challenge": {
+            "language": "python",
+            "starter_code": "def is_palindrome(s):\n    pass",
+            "test_cases": [
+                {"input": "\"A man, a plan, a canal: Panama\"", "expected": "true"},
+                {"input": "\"race a car\"", "expected": "false"}
+            ]
+        }
+    },
+    "project_discussion": {
+        "question": "Can you walk me through the most challenging bug you encountered in your recent project? How did you debug and resolve it?",
+        "type": "project_discussion"
+    },
+    "conceptual": {
+        "question": "Explain the difference between a process and a thread in an operating system. When would you choose one over the other?",
+        "type": "conceptual"
+    }
+}
+INTERVIEW_MODE = {
+    "role": "campus_recruiter",
+    "target_level": "intern_or_fresher",  # intern | fresher | experienced
+    "focus": [
+        "resume_projects",
+        "core_cs_fundamentals",
+        "practical_implementation"
+    ]
 }
 
 SCORING_DIMENSIONS = {
@@ -91,6 +167,10 @@ SCORING_DIMENSIONS = {
         "description": "Ability to articulate complex ideas clearly"
     }
 }
+# ALLOWED_GROQ_MODELS = [
+#    "llama-3.3-70b-versatile"
+
+# ]
 
 # ==========================================
 # UTILITIES
@@ -182,6 +262,160 @@ def make_thumbnail_b64(img: np.ndarray, max_w: int = 160) -> str:
         return "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode("ascii")
     except Exception:
         return ""
+# ================= SMART PROJECT INTELLIGENCE =================
+
+def normalize_text(text: str) -> str:
+    return re.sub(r'[^a-z0-9 ]', '', text.lower()).strip()
+
+def compute_similarity(text1: str, text2: str) -> float:
+    """Jaccard similarity for semantic deduplication"""
+    w1 = set(normalize_text(text1).split())
+    w2 = set(normalize_text(text2).split())
+    if not w1 or not w2:
+        return 0.0
+    return len(w1 & w2) / len(w1 | w2)
+def get_diverse_question_hint(history: List[Dict[str, Any]], required_type: str) -> str:
+    """
+    Generates STRICT constraints to prevent topic repetition.
+    Extracts key technical terms from recent questions and FORBIDS them.
+    """
+    if not history:
+        return "STARTING INTERVIEW: Scan the resume. Identify the MOST COMPLEX project or skill listed and start there."
+    
+    # Extract significant words from the last 6 questions (increased from 5)
+    recent_words = set()
+    recent_questions_text = []
+    
+    for h in history[-6:]:
+        q = h.get("question", "").lower()
+        recent_questions_text.append(q[:100])  # Store for full-text check
+        
+        # Capture key technical terms (words > 4 chars, excluding common words)
+        words = re.findall(r'\b[a-z]{5,}\b', q)
+        
+        # Filter out generic interview words
+        stopwords = {'would', 'could', 'should', 'please', 'explain', 'describe', 
+                     'implement', 'create', 'write', 'function', 'method', 'class'}
+        technical_words = [w for w in words if w not in stopwords]
+        recent_words.update(technical_words[:15])  # Increased from 8
+    
+    # Extract specific topics/technologies mentioned
+    tech_patterns = [
+        r'\b(python|java|javascript|react|node|sql|aws|docker|kubernetes)\b',
+        r'\b(machine learning|deep learning|neural network|nlp|cnn|lstm)\b',
+        r'\b(api|rest|graphql|microservices|database|optimization)\b',
+        r'\b(algorithm|data structure|sorting|searching|dynamic programming)\b'
+    ]
+    
+    mentioned_techs = set()
+    combined_history = " ".join(recent_questions_text)
+    for pattern in tech_patterns:
+        matches = re.findall(pattern, combined_history)
+        mentioned_techs.update(matches)
+    
+    # Build negative constraints (what NOT to ask about)
+    forbidden_list = list(recent_words)[:12] + list(mentioned_techs)[:8]
+    
+    hint = f"\n⛔ ABSOLUTE PROHIBITION - DO NOT ASK ABOUT:\n"
+    hint += f"   Topics: {', '.join(forbidden_list)}\n"
+    hint += f"   Context: These were ALREADY covered in previous questions.\n"
+    
+    # Add positive constraints based on question type
+    if required_type == "project_discussion":
+        hint += "\n🎯 MANDATORY REQUIREMENTS:\n"
+        hint += "   1. Pick a DIFFERENT project than previously discussed\n"
+        hint += "   2. Focus on a SPECIFIC feature, metric, or technical decision\n"
+        hint += "   3. Ask 'HOW did you implement X?' not 'What is X?'\n"
+        hint += "   4. Reference exact tools/frameworks from the resume\n"
+    
+    elif required_type == "coding_challenge":
+        hint += "\n🎯 MANDATORY REQUIREMENTS:\n"
+        hint += "   1. Create a problem using a DIFFERENT algorithm/data structure\n"
+        hint += "   2. Avoid problems similar to what was already asked\n"
+        hint += "   3. Focus on: Arrays, Strings, HashMaps, Trees, or Graphs\n"
+        hint += "   4. Make it solvable in 10-15 minutes\n"
+    
+    elif required_type == "conceptual":
+        hint += "\n🎯 MANDATORY REQUIREMENTS:\n"
+        hint += "   1. Ask about a DIFFERENT technical concept\n"
+        hint += "   2. Focus on trade-offs or architecture decisions\n"
+        hint += "   3. Relate to their resume but use NEW terminology\n"
+    
+    return hint
+  
+def is_repetitive_question(new_q: str, history: List[Dict[str, Any]]) -> bool:
+    """🔧 IMPROVED: Better repetition detection with multiple checks"""
+    if not new_q or not history:
+        return False
+
+    new_norm = normalize_text(new_q)
+    new_words = set(new_norm.split())
+    
+    # Check last 8 questions (increased from 6)
+    for h in history[-8:]:
+        prev = h.get("question", "")
+        prev_norm = normalize_text(prev)
+        prev_words = set(prev_norm.split())
+
+        # Exact match
+        if new_norm == prev_norm:
+            logger.warning(f"Exact match detected: '{new_q[:50]}...'")
+            return True
+
+        # High semantic overlap (lowered threshold from 0.70 to 0.65)
+        similarity = compute_similarity(new_q, prev)
+        if similarity > 0.65:
+            logger.warning(f"High similarity ({similarity:.2f}): '{new_q[:50]}...'")
+            return True
+        
+        # Check if >70% of key words are shared (new check)
+        if len(new_words) > 0 and len(new_words & prev_words) / len(new_words) > 0.70:
+            logger.warning(f"Word overlap detected: '{new_q[:50]}...'")
+            return True
+
+    return False
+
+def extract_question_topics(question: str) -> set:
+    """Extract key technical topics from a question for comparison"""
+    q_lower = question.lower()
+    
+    # Technical terms to extract
+    tech_terms = set()
+    
+    # Programming languages
+    langs = ['python', 'java', 'javascript', 'typescript', 'c++', 'go', 'rust']
+    for lang in langs:
+        if lang in q_lower:
+            tech_terms.add(lang)
+    
+    # Frameworks/Libraries
+    frameworks = ['react', 'angular', 'vue', 'django', 'flask', 'spring', 'express', 'fastapi']
+    for fw in frameworks:
+        if fw in q_lower:
+            tech_terms.add(fw)
+    
+    # Concepts
+    concepts = ['api', 'database', 'optimization', 'algorithm', 'data structure', 
+                'machine learning', 'neural network', 'microservices', 'docker', 'kubernetes']
+    for concept in concepts:
+        if concept in q_lower:
+            tech_terms.add(concept.replace(' ', '_'))
+    
+    # Algorithm types
+    algos = ['sorting', 'searching', 'tree', 'graph', 'array', 'string', 'hash', 'dynamic programming']
+    for algo in algos:
+        if algo in q_lower:
+            tech_terms.add(algo)
+    
+    return tech_terms
+def normalize_project_name(name: str) -> str:
+    if not name:
+        return ""
+    name = name.lower()
+    name = re.sub(r'[^a-z0-9 ]', '', name)
+    name = re.sub(r'\s+', ' ', name).strip()
+    return name
+    
 def redact_pii(text: str) -> Dict[str, Any]:
     if not text:
         return {"redacted": "", "redaction_log": []}
@@ -220,7 +454,26 @@ def scan_frame_for_violations(img_array: np.ndarray) -> Dict[str, Any]:
     return {
         "person_count": person_count,
         "prohibited_items": list(set(detected_items))
-    }         
+    } 
+def calculate_resume_coverage(projects: List[Dict], history: List[Dict]) -> Dict[str, Any]:
+    coverage = {p["project_id"]: False for p in projects}
+
+    for h in history:
+        pid = h.get("target_project")
+
+        if pid and pid in coverage:
+            coverage[pid] = True
+
+    return {
+        "total": len(coverage),
+        "covered": sum(coverage.values()),
+        "uncovered_projects": [
+            p["title"] for p in projects if not coverage[p["project_id"]]
+        ]
+    }
+
+
+        
 def extract_json_from_text(s: str) -> Optional[dict]:
     if not s:
         return None
@@ -287,32 +540,84 @@ def enforce_budget(payload: dict) -> dict:
         "conv": conv,
         "question": question
     }
+def normalize_overall_score(validated: dict, history: List[Dict[str, Any]]) -> float:
+    """
+    Stabilizes scoring across interview.
+    - Penalizes repeated weakness
+    - Rewards fast improvement
+    - Prevents noisy LLM jumps
+    """
+    score = validated.get("overall_score")
+    if score is None:
+        return 0.0
 
-def groq_call(prompt_text: str, model: Optional[str]=None, temperature: float=0.0, max_tokens: int=800) -> Dict[str, Any]:
-    """Robust Groq API call with error handling"""
-    model_name = model or GROQ_MODEL
-    try:
-        resp = groq_client.chat.completions.create(
-            model=model_name,
-            messages=[{"role":"user", "content": prompt_text}],
-            temperature=temperature,
-            max_tokens=max_tokens
-        )
-        
-        content = ""
-        if hasattr(resp, "choices") and len(resp.choices) > 0:
-            choice = resp.choices[0]
-            if hasattr(choice, "message") and hasattr(choice.message, "content"):
-                content = choice.message.content or ""
-            else:
-                content = str(choice)
-        else:
-            content = str(resp)
-            
-        return {"raw": content, "ok": True}
-    except Exception as e:
-        logger.exception("groq_call failed")
-        return {"raw": None, "ok": False, "error": str(e)}
+    score = float(score)
+
+    # Penalize repeated weak answers
+    recent = history[-3:]
+    weak_count = sum(1 for h in recent if h.get("score", 1) < 0.4)
+    if weak_count >= 2:
+        score -= 0.10
+
+    # Reward learning curve
+    if history:
+        prev = history[-1].get("score")
+        if prev is not None and score > prev + 0.20:
+            score += 0.05
+
+    # Penalize low confidence mismatch
+    confidence = validated.get("confidence", 0.5)
+    if confidence < 0.35:
+        score -= 0.05
+
+    return max(0.0, min(1.0, score))
+def derive_verdict_from_score(score: float) -> str:
+    """
+    Calibrated grading scale for technical interviews.
+    Previous scale was too harsh (0.85+ for Strong).
+    """
+    if score < 0.35:
+        return "fail"
+    if score < 0.55:
+        return "weak"
+    if score < 0.75:
+        return "acceptable" # 55% - 74% is passing for an Intern
+    if score < 0.90:
+        return "strong"     # 75% - 89% is Strong
+    return "exceptional"    # 90%+ is Exceptional
+
+def llm_call(prompt: str, temperature=0.3, max_tokens=1200) -> dict:
+    """
+    Robust LLM caller that cycles through the INTERVIEW_MODELS list.
+    """
+    for model in INTERVIEW_MODELS:
+        try:
+            resp = openrouter_client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                extra_headers={
+                    "HTTP-Referer": "http://localhost",
+                    "X-Title": "ai-interview-assistant"
+                }
+            )
+
+            raw = resp.choices[0].message.content
+            if raw:
+                return {
+                    "ok": True,
+                    "raw": raw,
+                    "model_used": model
+                }
+
+        except Exception as e:
+            logger.warning(f"Model {model} failed: {e}")
+            # Continue to next model in list
+
+    # If we reach here, all models failed
+    return {"ok": False, "error": "all_models_failed"}
+
 
 # ==========================================
 # PERFORMANCE ANALYTICS
@@ -406,75 +711,118 @@ def calculate_performance_metrics(history: List[Dict]) -> Dict[str, Any]:
 
 def check_termination_rules(history: List[Dict]) -> Optional[Dict[str, Any]]:
     """
-    DYNAMIC TERMINATION LOGIC:
-    - Ends immediately on Catastrophic Failure or Consecutive Fails (Efficiency).
-    - Ends immediately on Proven Excellence (Saturation).
-    - Otherwise, allows the LLM to decide when to stop until the Safety Limit is reached.
+    BALANCED termination logic for campus / fresher interviews.
+    Avoids early over-rejection while preventing endless interviews.
     """
-    if not history:
-        return None
-    
+    if not history or len(history) < 2:
+        return None  # Need at least 2 questions
+
     metrics = calculate_performance_metrics(history)
     rules = TERMINATION_RULES
-    
-    # RULE 1: Instant Fail - Catastrophic Answer
-    # We keep this because a score < 0.2 means they don't know their own resume.
-    if metrics["last_score"] is not None and metrics["last_score"] < rules["instant_fail_threshold"]:
+
+    qn = metrics["question_count"]
+    avg = metrics["average_score"]
+    last = metrics["last_score"]
+
+    # --------------------------------------------------
+    # RULE 1: Catastrophic Failure (Immediate Reject)
+    # --------------------------------------------------
+    # Candidate clearly doesn't know their own resume
+    if last is not None and last < rules["instant_fail_threshold"]:
         return {
             "ended": True,
             "verdict": "reject",
-            "confidence": 0.98,
-            "reason": f"Catastrophic answer detected (score: {metrics['last_score']:.2f}). Candidate lacks fundamental understanding.",
+            "confidence": 0.95,
+            "reason": f"Catastrophic failure (score {last:.2f}). Candidate lacks basic understanding.",
             "recommended_role": None,
             "trigger": "instant_fail"
         }
-    
-    # RULE 2: Consecutive Failures
-    # We keep this for efficiency. 2 fails in a row usually guarantees a rejection.
+
+    # --------------------------------------------------
+    # RULE 2: Consecutive Failures (Efficiency Reject)
+    # --------------------------------------------------
     if metrics["consecutive_fails"] >= rules["consecutive_fail_count"]:
         return {
             "ended": True,
             "verdict": "reject",
-            "confidence": 0.95,
-            "reason": f"Failed {metrics['consecutive_fails']} consecutive technical questions. Technical competence not established.",
+            "confidence": 0.90,
+            "reason": f"Failed {metrics['consecutive_fails']} consecutive questions.",
             "recommended_role": None,
             "trigger": "consecutive_fails"
         }
-    
-    # RULE 3: Consistent Excellence (Saturation)
-    # If they ace 3 hard questions, we stop early to save time (Hire).
-    if (metrics["question_count"] >= rules["excellence_count"] and 
-        metrics["average_score"] > rules["excellence_threshold"] and
-        metrics["consecutive_wins"] >= 2):
+
+    # --------------------------------------------------
+    # RULE 3: Clear Excellence (Early Hire)
+    # --------------------------------------------------
+    if (
+        qn >= 6 and
+        avg >= rules["excellence_threshold"] and
+        metrics["consecutive_wins"] >= 3
+    ):
         return {
             "ended": True,
-            "verdict": "hire",
+            "verdict": "hisre",
             "confidence": 0.95,
-            "reason": f"Candidate demonstrated consistent expert-level knowledge over {metrics['question_count']} questions.",
-            "recommended_role": "Senior Engineer",
-            "trigger": "excellence"
+            "reason": f"Consistent excellence across {qn} questions.",
+            "recommended_role": "SDE-1 / Entry-Level",
+            "trigger": "proven_excellence"
         }
-    
-    # RULE 4: Safety Net (Soft Limit)
-    # Replaces the old "Max Questions" rule. This is just to prevent infinite loops.
-    # The Model is expected to stop naturally BEFORE this point.
-    soft_limit = rules.get("max_questions_soft_limit", 12)
-    if metrics["question_count"] >= soft_limit:
-        # If we reach here, the model was indecisive for too long. Force a decision.
-        verdict = "hire" if metrics["average_score"] >= 0.65 else "reject"
+
+    # --------------------------------------------------
+    # RULE 4: Chronic Weakness (Fair Reject)
+    # --------------------------------------------------
+    if qn >= 5:
+        weak_answers = sum(1 for h in history if h.get("score", 1) < 0.45)
+        weak_ratio = weak_answers / qn
+
+        if weak_ratio >= 0.70:
+            return {
+                "ended": True,
+                "verdict": "reject",
+                "confidence": 0.88,
+                "reason": f"Below minimum bar in {weak_answers}/{qn} questions.",
+                "recommended_role": None,
+                "trigger": "chronic_underperformance"
+            }
+
+    # --------------------------------------------------
+    # RULE 5: Gray-Zone Timeout (Make a Call)
+    # --------------------------------------------------
+    if qn >= 7:
+        gray_answers = sum(
+            1 for h in history
+            if rules["gray_zone_min"] <= h.get("score", 0) <= rules["gray_zone_max"]
+        )
+
+        if gray_answers >= 4:
+            verdict = "hire" if avg >= 0.58 else "reject"
+            return {
+                "ended": True,
+                "verdict": verdict,
+                "confidence": 0.70,
+                "reason": (
+                    f"Prolonged gray-zone performance. "
+                    f"Final decision based on average score {avg:.2f}."
+                ),
+                "recommended_role": "Intern" if verdict == "hire" else None,
+                "trigger": "gray_zone_timeout"
+            }
+
+    # --------------------------------------------------
+    # RULE 6: Hard Safety Limit (Never Infinite)
+    # --------------------------------------------------
+    if qn >= rules.get("max_questions", 12):
+        verdict = "hire" if avg >= 0.60 else "reject"
         return {
             "ended": True,
             "verdict": verdict,
             "confidence": 0.80,
-            "reason": f"Interview reached safety limit of {soft_limit} questions. Final decision forced based on average.",
-            "recommended_role": "Mid-Level Engineer" if verdict == "hire" else None,
-            "trigger": "safety_limit"
+            "reason": "Interview reached maximum allowed questions.",
+            "recommended_role": "Entry-Level" if verdict == "hire" else None,
+            "trigger": "max_questions"
         }
-    
-    # If no hard rules are met, return None.
-    # This passes control to 'call_decision', allowing the AI to decide 
-    # if it needs more information or if it's ready to stop.
-    return None
+
+    return None  # Continue interview
 
 # ==========================================
 # QUESTION GENERATION
@@ -495,9 +843,10 @@ def extract_technical_projects(resume: str) -> List[Dict[str, str]]:
         if any(keyword in line_lower for keyword in ['project', 'built', 'developed', 'created', 'implemented']):
             if current_project:
                 projects.append(current_project)
-            
+            title = line.strip()[:100]
             current_project = {
-                "title": line.strip()[:100],
+                "title": title,
+                "project_id": normalize_project_name(title),
                 "description": "",
                 "technologies": []
             }
@@ -517,6 +866,158 @@ def extract_technical_projects(resume: str) -> List[Dict[str, str]]:
         projects.append(current_project)
     
     return projects[:5]  # Return top 5 projects
+def classify_project_domain(text: str) -> str:
+    DOMAIN_SIGNALS = {
+        'ml_ai': ['machine learning', 'neural network', 'nlp', 'vision'],
+        'web_dev': ['api', 'frontend', 'backend', 'rest', 'graphql'],
+        'data_engineering': ['etl', 'pipeline', 'spark', 'airflow'],
+        'devops': ['docker', 'kubernetes', 'ci/cd', 'terraform'],
+        'mobile': ['android', 'ios', 'flutter'],
+    }
+
+    text = text.lower()
+    scores = {k: sum(kw in text for kw in v) for k, v in DOMAIN_SIGNALS.items()}
+    return max(scores, key=scores.get) if max(scores.values()) > 0 else "general"
+
+
+def extract_action_keywords(text: str) -> List[str]:
+    ACTIONS = [
+        'implemented', 'developed', 'built', 'designed',
+        'optimized', 'scaled', 'deployed', 'debugged'
+    ]
+    t = text.lower()
+    return [a for a in ACTIONS if a in t]
+
+
+def calculate_project_complexity(project: Dict) -> float:
+    score = 0.0
+    score += min(len(project.get("technologies", [])) / 10, 0.4)
+    score += min(len(project.get("description", "").split()) / 120, 0.3)
+    score += min(len(project.get("keywords", [])) / 8, 0.3)
+    return round(min(score, 1.0), 2)
+def validate_and_fix_test_cases(
+    test_cases: List[Dict[str, str]],
+    reference_code: str,
+    language: str = "python"
+) -> List[Dict[str, str]]:
+    """🔧 IMPROVED: Better stub detection and validation"""
+    
+    # Check if reference_code is just a stub
+    is_stub = (
+        not reference_code or
+        reference_code.strip() == "" or
+        len(reference_code.strip().split('\n')) <= 3 or
+        reference_code.strip().endswith("pass") or
+        "pass" in reference_code and "def" in reference_code and reference_code.count('\n') <= 5
+    )
+    
+    if is_stub:
+        logger.warning("Reference code is a stub, trusting LLM test cases")
+        # Return original test cases but ensure they're properly formatted
+        fixed = []
+        for tc in test_cases:
+            inp = str(tc.get("input", ""))
+            exp = str(tc.get("expected", ""))
+            if inp or exp:  # At least one must be present
+                fixed.append({"input": inp, "expected": exp})
+        return fixed[:3]  # Max 3 test cases
+
+    # If we have real reference code, validate by execution
+    fixed = []
+    for tc in test_cases:
+        inp = tc.get("input", "")
+        expected_from_llm = tc.get("expected", "")
+
+        result = run_code_in_sandbox(
+            language=language,
+            code=reference_code,
+            stdin=inp
+        )
+
+        if not result.get("success"):
+            logger.warning(f"Test case execution failed for input '{inp}': {result.get('error_type')}")
+            # Keep the LLM's expected output if execution failed
+            fixed.append({
+                "input": inp,
+                "expected": expected_from_llm
+            })
+            continue
+
+        # Use execution output as ground truth
+        stdout = str(result.get("output", "")).strip()
+        fixed.append({
+            "input": inp,
+            "expected": stdout
+        })
+
+    return fixed[:3] 
+
+def extract_projects_smart(resume_text: str) -> List[Dict[str, Any]]:
+    """
+    GENERALIZED project extraction – works for ANY resume format
+    """
+    projects = []
+    lines = resume_text.split('\n')
+    current = None
+
+    PROJECT_INDICATORS = [
+        r'\b(project|assignment|thesis|capstone)\b',
+        r'\b(built|developed|created|implemented|designed|engineered)\b',
+        r'\b(worked on|contributed to|led)\b'
+    ]
+
+    TECH_PATTERNS = {
+        'languages': r'\b(python|java|javascript|c\+\+|go|rust|kotlin|swift|r)\b',
+        'frameworks': r'\b(react|angular|vue|django|flask|spring|fastapi)\b',
+        'databases': r'\b(sql|mysql|postgresql|mongodb|redis)\b',
+        'cloud': r'\b(aws|azure|gcp|docker|kubernetes)\b',
+        'ml_ai': r'\b(tensorflow|pytorch|scikit-learn|nlp|cnn|rnn)\b',
+    }
+
+    for line in lines:
+        l = line.strip()
+        ll = l.lower()
+
+        if len(l) < 10:
+            continue
+
+        is_project = any(re.search(p, ll) for p in PROJECT_INDICATORS)
+
+        if is_project:
+            if current and current["description"]:
+                projects.append(current)
+
+            current = {
+                "title": l[:150],
+                "project_id": normalize_project_name(l),
+                "description": "",
+                "technologies": [],
+                "domain": "general",
+                "complexity_score": 0.0,
+                "keywords": []
+            }
+        elif current:
+            current["description"] += " " + l
+
+    if current and current["description"]:
+        projects.append(current)
+
+    # Post processing
+    for p in projects:
+        desc = p["description"].lower()
+
+        for _, pattern in TECH_PATTERNS.items():
+            p["technologies"].extend(re.findall(pattern, desc, re.I))
+
+        p["technologies"] = list(set(p["technologies"]))[:10]
+        p["domain"] = classify_project_domain(p["description"])
+        p["keywords"] = extract_action_keywords(p["description"])
+        p["complexity_score"] = calculate_project_complexity(p)
+
+    return sorted(projects, key=lambda x: x["complexity_score"], reverse=True)[:6]
+
+
+
 def enforce_test_cases_for_challenge(parsed: dict, resp_raw: str, original_prompt: str, max_attempts: int = 3):
     """
     Ensure parsed (which is a dict) that contains a coding_challenge ends up with:
@@ -598,10 +1099,10 @@ Rules (must follow exactly):
             parsed_json=safe_truncate(json.dumps(parsed, default=str), 2000)
         )
         try:
-            repair_resp = groq_call(repair_prompt, temperature=0.0, max_tokens=500)
+            repair_resp = llm_call(repair_prompt, temperature=0.0, max_tokens=500)
         except Exception as e:
             repair_raws.append(f"exception:{e}")
-            logger.warning("Repair groq_call exception attempt %d: %s", attempt, e)
+            logger.warning("Repair llm_call exception attempt %d: %s", attempt, e)
             continue
 
         if not repair_resp.get("ok"):
@@ -667,93 +1168,199 @@ Rules (must follow exactly):
     logger.error("Test-case repair failed. Samples: %s", repair_raws[:2])
     raise HTTPException(status_code=422, detail=detail)
 
-def build_generate_question_prompt(context: dict, mode: str = "first") -> str:
-    """
-    Generate a strict prompt that asks the model to produce a single JSON object
-    containing a code question and exactly 3 test cases.
+import random
 
-    IMPORTANT:
-    - The JSON schema below contains an EMPTY 'test_cases' array. The model MUST
-      generate 3 test cases and fill that array. Do NOT copy any example values
-      that appear in the prompt.
-    - The model must output EXACTLY one JSON object and NOTHING ELSE (no markdown,
-      no comments, no explanatory text).
-    """
+def build_generate_question_prompt(
+    context: dict,
+    mode: str = "first",
+    required_type: str = "coding_challenge",
+    state=None
+) -> str:
     resume = context.get("resume", "")
-    chunks = context.get("chunks", []) or []
     history = context.get("history", []) or []
+    
+    # 1. Build STRICT history context
+    recent_q_text = "\n".join([
+        f"Q{i+1}: {h.get('question','')[:120]}" 
+        for i, h in enumerate(history[-6:])
+    ])
+    
+    diversity_hint = get_diverse_question_hint(history, required_type)
+    difficulty_level = state.difficulty_level if state else "medium"
 
-    chunks_text = "\n".join([f"- {c.get('snippet','')[:400]}" for c in chunks[:3]])
-    last_q_context = ""
-    if history:
-        last = history[-1]
-        last_q_context = f"PREVIOUS Q: {last.get('question', '')[:150]} (Score: {last.get('score', 0)})"
+    # 2. Smart Project Selection
+    projects = extract_projects_smart(resume)
+    history_blob = " ".join([h.get("question", "").lower() for h in history])
+    covered_projects = state.covered_projects if state else set()
 
-    # JSON skeleton that must be filled by the model (test_cases is empty here)
-    schema = '''
-{
-  "question": "string (a short programming prompt derived from the resume/context)",
-  "type": "code",
-  "expected_answer_type": "code",
-  "target_project": "string (which project from resume this maps to, or 'general')",
-  "difficulty": "easy|medium|hard",
-  "coding_challenge": {
-      "language": "python",
-      "function_signature": "string (e.g. def solve(data): )",
-      "starter_code": "string (short starter code; may be empty)",
-      "test_cases": []
-  },
-  "ideal_answer_outline": "string (brief steps of solution)",
-  "confidence": 0.0-1.0
-}
-'''.strip()
+    available_projects = [
+        p for p in projects 
+        if p["project_id"] not in covered_projects 
+        and p["title"].lower()[:15] not in history_blob
+    ]
+    
+    target_project = None
+    if required_type == "project_discussion":
+        if available_projects:
+            target_project = random.choice(available_projects)
+        elif projects:
+            # Force a different angle on a revisited project
+            target_project = random.choice(projects)
+    
+    # 3. Universal Strategy Controller with Resume Validation
+    project_focus = "" 
+    
+    if required_type == "coding_challenge":
+        # List already-asked algorithm types
+        asked_algos = set()
+        for h in history:
+            q = h.get("question", "").lower()
+            if "array" in q or "list" in q:
+                asked_algos.add("arrays")
+            if "string" in q or "substring" in q:
+                asked_algos.add("strings")
+            if "hash" in q or "map" in q or "dict" in q:
+                asked_algos.add("hashmaps")
+            if "tree" in q or "binary" in q:
+                asked_algos.add("trees")
+            if "graph" in q or "node" in q:
+                asked_algos.add("graphs")
+            if "sort" in q:
+                asked_algos.add("sorting")
+            if "search" in q:
+                asked_algos.add("searching")
+            if "dynamic" in q or "dp" in q:
+                asked_algos.add("dynamic_programming")
+        
+        remaining_algos = ["arrays", "strings", "hashmaps", "trees", "graphs", "sorting", "searching", "dynamic programming", "two pointers", "sliding window"]
+        remaining_algos = [a for a in remaining_algos if a not in asked_algos]
+        
+        project_focus = f"""
+🎯 FOCUS: DATA STRUCTURES & ALGORITHMS (DSA)
+- Ignore resume projects for this turn
+- Algorithm types ALREADY ASKED: {', '.join(asked_algos) if asked_algos else 'None'}
+- **MANDATORY**: Use one of these UNUSED types: {', '.join(remaining_algos[:5]) if remaining_algos else 'any algorithm'}
+- Difficulty: {difficulty_level}
+- Language: Python
+- Create a solvable problem (not just theory)
+- **CRITICAL**: This MUST be a coding problem with test cases, NOT a conceptual question
+"""
+        
+    elif required_type == "experience":
+        # ✅ CHECK: Does resume have work experience?
+        has_experience = any(kw in resume.lower() for kw in ['experience', 'work history', 'employment', 'intern at', 'developer at', 'engineer at', 'worked at'])
+        
+        if not has_experience:
+            # Fallback to skills-based conceptual question
+            project_focus = """
+🎯 FOCUS: Core Technical Skills (No Work Experience Found)
+- Scan the 'Skills' section for their STRONGEST technology
+- Ask an advanced concept question about that skill
+- Example: "Explain how garbage collection works in Java" or "What's the difference between REST and GraphQL?"
+- Focus on trade-offs and real-world applications
+"""
+        else:
+            project_focus = """
+🎯 FOCUS: PROFESSIONAL EXPERIENCE (WORK HISTORY)
+- SCAN the 'Experience' or 'Work History' section
+- Identify a SPECIFIC company and role mentioned
+- Ask about a SPECIFIC responsibility, achievement, or technical decision
+- Example: "At [Company Name], you mentioned [specific task]. What was the technical challenge?"
+- **FORBIDDEN**: Generic questions like "Tell me about your experience"
+"""
 
-    # Helpful examples for style — THE MODEL MUST NOT COPY THESE VALUES.
-    # They are shown only to demonstrate format and should be treated as examples.
-    examples = '''
-EXAMPLES (DO NOT COPY — for format only):
-[
-  {"input": "[1, 2, 3]", "expected": "6"},
-  {"input": "[]", "expected": "0"},
-  {"input": "[5, -1, 2]", "expected": "6"}
-]
-'''.strip()
+    elif required_type == "achievement":
+        # ✅ CHECK: Does resume have achievements?
+        has_achievements = any(kw in resume.lower() for kw in ['achievement', 'award', 'competition', 'hackathon', 'certification', 'rank', 'winner', 'finalist', 'prize'])
+        
+        if not has_achievements:
+            # Fallback to advanced skills question
+            project_focus = """
+🎯 FOCUS: Advanced Technical Concepts (No Achievements Found)
+- Scan the 'Skills' section
+- Ask about system design or architectural trade-offs
+- Example: "When would you use NoSQL vs SQL databases?" or "How would you design a scalable API?"
+- Focus on decision-making and real-world scenarios
+"""
+        else:
+            project_focus = """
+🎯 FOCUS: ACHIEVEMENTS, AWARDS & CERTIFICATIONS
+- SCAN for competitions, hackathons, rankings, certifications
+- Pick the MOST impressive entry
+- Ask about the TECHNICAL challenge solved or skill acquired
+- Example: "What algorithmic approach won you [Competition Name]?" or "How did you apply [Certification skill] in practice?"
+"""
 
+    elif required_type == "project_discussion" and target_project:
+        project_focus = f"""
+🎯 FOCUS: PROJECT DEEP DIVE
+- Target Project: "{target_project['title']}"
+- Tech Stack: {', '.join(target_project.get('technologies', []))}
+- **MANDATORY**: Ask about ONE of these aspects:
+  • A specific bug they encountered and how they debugged it
+  • Why they chose technology X over alternative Y
+  • A performance optimization they made (with numbers/metrics)
+  • A specific architectural decision (e.g., "Why microservices vs monolith?")
+  • A challenging edge case they handled
+  
+- **FORBIDDEN**: Generic questions like "How did you build this?" or "What challenges did you face?"
+- **REQUIRED**: Reference the exact project title in your question
+"""
+    
+    else:
+        project_focus = """
+🎯 FOCUS: Advanced Technical Concepts
+- Scan the 'Skills' section for their STRONGEST technology
+- Ask about an ADVANCED concept in that technology
+- Example: "Explain the event loop in Node.js" or "How does Python's GIL affect multithreading?"
+- Focus on trade-offs, internals, or best practices
+"""
+
+    # 4. Build the final prompt with STRICT enforcement
     prompt = f"""
-SYSTEM: You are a deterministic Question Generation Engine. You MUST output EXACTLY one valid JSON object and NOTHING ELSE (no commentary, no markdown). Follow instructions precisely.
+SYSTEM: You are a STRICT Technical Interviewer. Your goal is to VERIFY the candidate's claimed skills.
 
-CRITICAL INSTRUCTIONS (READ CAREFULLY):
-1) Output MUST be valid JSON parsable by json.loads().
-2) Output MUST follow the exact top-level schema shown below and MUST include "type": "code".
-3) Under "coding_challenge", the "test_cases" array MUST contain exactly 3 test-case objects.
-   Each test-case object MUST be of the form:
-     {{ "input": "<valid JSON string>", "expected": "<expected output as string>" }}
-   - Examples of valid JSON string inputs: "[1,2,3]", "\"abc\"", "5"
-   - If expected output is null, use the string "null". Booleans must be "true"/"false".
-4) DO NOT copy or echo any concrete values shown in this prompt template or the examples section.
-   You MUST GENERATE NEW question text and NEW test cases based on the resume/context.
-5) Inputs and expected values MUST be strings (i.e., quoted). Use json.dumps-style strings for objects/arrays.
-6) Do NOT include any extra keys beyond the schema. Do NOT include comments or explanatory text.
-7) Prefer problems that are solvable in a short Python function, and keep difficulty consistent with the resume's seniority (use 'easy' for junior, 'medium' for mid-level, 'hard' for senior).
-8) If the resume/context indicates a specific domain (e.g., "web scraper", "trading bot"), generate a relevant problem tied to that domain.
+⚠️ CRITICAL RULES (VIOLATING THESE = FAILURE):
+1. **NO REPETITION**: You MUST NOT ask about topics mentioned in previous questions
+2. **BE SPECIFIC**: Quote exact claims from the resume (e.g., "You mentioned 'reduced latency by 40%'...")
+3. **NO HALLUCINATIONS**: Only ask about content present in the resume below
+4. **FORCE DEPTH**: Ask "HOW" and "WHY", not just "WHAT"
+5. **TYPE ENFORCEMENT**: If type is coding_challenge, it MUST be a coding problem with test cases
 
-INPUT CONTEXT:
-Resume Summary:
-{resume[:1200]}
+═══════════════════════════════════════════════════════════════════
+CANDIDATE RESUME:
+{resume[:4000]}
 
-Technical Docs (RAG):
-{chunks_text}
+═══════════════════════════════════════════════════════════════════
+PREVIOUS QUESTIONS (DO NOT REPEAT THESE TOPICS):
+{recent_q_text if recent_q_text else "None - This is the first question"}
 
-Interview History:
-{last_q_context}
+{diversity_hint}
 
-REQUIRED JSON SCHEMA (you MUST fill this object and ONLY this object):
-{schema}
+═══════════════════════════════════════════════════════════════════
+CURRENT QUESTION TYPE: {required_type.upper().replace('_', ' ')}
+DIFFICULTY: {difficulty_level.upper()}
 
-FORMAT EXAMPLES FOR TEST CASE SHAPE (EXAMPLES ONLY — DO NOT COPY):
-{examples}
+{project_focus}
 
-END.
+═══════════════════════════════════════════════════════════════════
+OUTPUT FORMAT (JSON ONLY, NO MARKDOWN):
+{{
+  "question": "The interview question (must be SPECIFIC and DIFFERENT from previous)",
+  "type": "{required_type}",
+  "target_project": "{target_project['project_id'] if target_project else 'general'}",
+  "difficulty": "{difficulty_level}",
+  "coding_challenge": {{  // ONLY include if type is coding_challenge
+      "language": "python",
+      "starter_code": "def function_name(params):\\n    pass",
+      "test_cases": [
+         {{"input": "\\"json_value\\"", "expected": "\\"expected_output\\""}},
+         {{"input": "\\"different_input\\"", "expected": "\\"different_output\\""}}
+      ]
+  }}
+}}
+
+🚨 FINAL CHECK: Re-read the PREVIOUS QUESTIONS section. Is your new question about the SAME topic? If yes, CHANGE IT.
 """
     return prompt.strip()
 
@@ -763,17 +1370,16 @@ END.
 
 def build_score_prompt(question_text: str, ideal_outline: str, candidate_answer: str, context: dict = None) -> str:
     """
-    STRICT MULTI-DIMENSIONAL SCORING with advanced bluff detection.
-    Now supports DUAL MODES: 
-    1. Text Analysis (Concept depth, bluff detection)
-    2. Code Analysis (Execution success, syntax, efficiency)
+    CAMPUS-LEVEL MULTI-DIMENSIONAL SCORING
+    - Designed for Intern / Fresher / Placement interviews
+    - Harsh on bluffing, fair on partial understanding
+    - Supports TEXT and CODE modes
     """
     context = context or {}
     resume = context.get("resume", "")
     chunks = context.get("chunks", [])
     
-    # NEW: Extract question type and execution results
-    question_type = context.get("question_type", "text") 
+    question_type = context.get("question_type", "text")
     exec_result = context.get("code_execution_result", {})
     
     chunks_text = ""
@@ -783,104 +1389,119 @@ def build_score_prompt(question_text: str, ideal_outline: str, candidate_answer:
             for c in chunks[:3]
         ])
     
-    # Assuming SCORING_DIMENSIONS is defined globally as per your previous code context
     dimensions_text = "\n".join([
         f"- **{name}** (weight: {info['weight']}): {info['description']}"
         for name, info in SCORING_DIMENSIONS.items()
     ])
-    
+
     # =========================================================
-    # LOGIC BRANCH: CODE vs TEXT
+    # CODE SCORING (Campus-Friendly)
     # =========================================================
-    
-    if question_type == "code":
-        # --- CODE SCORING MODE ---
+    if question_type == "coding_challenge":
         passed = exec_result.get("passed", False)
         output_log = exec_result.get("output", "No output captured")
         error_type = exec_result.get("error", "None")
 
-        system = f"""You are a Senior Code Reviewer.
-        
-        CONTEXT: The candidate wrote code to solve a specific problem.
-        
-        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        ⚠️ EXECUTION STATUS: {'✅ PASSED' if passed else '❌ FAILED'}
-        ⚠️ ERROR TYPE: {error_type}
-        
-        EXECUTION LOG (Stdout/Stderr):
-        ```
-        {output_log[:800]}
-        ```
-        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        system = f"""
+You are a CAMPUS PLACEMENT CODE EVALUATOR.
 
-        SCORING RULES FOR CODE:
-        1. **IF FAILED (passed=False)**: 
-           - **MAX SCORE: 0.5**. Do not score higher even if the logic looks "okay".
-           - If it's a minor syntax error (missing colon), score ~0.4.
-           - If logic is completely wrong or runtime error, score < 0.3.
-           
-        2. **IF PASSED (passed=True)**:
-           - **BASE SCORE: 0.7**.
-           - **Bonus (+0.1 - 0.3)**: Efficient algorithms (Big O), clean variable naming, handling edge cases, pythonic style.
-           - **Penalty (-0.1 - 0.2)**: "Spaghetti code", hardcoded values, bad variable names (e.g., 'x', 'y'), redundant logic.
+CANDIDATE LEVEL:
+- Student / Fresher / Intern
+- Expect correct logic and clarity, not extreme optimization
 
-        3. **BLUFF DETECTION IN CODE**:
-           - Did they just `print("expected output")` to cheat the test? (Automatic 0.0)
-           - Is the code obviously copied (comments don't match logic)?
-           
-        SCORING DIMENSIONS:
-        {dimensions_text}
-        """
+EXECUTION STATUS:
+- Passed: {passed}
+- Error Type: {error_type}
 
-    else:
-        # --- TEXT SCORING MODE (Your Original Logic) ---
-        system = f"""You are an EXPERT Technical Assessor specializing in detecting resume fraud and technical incompetence.
+EXECUTION LOG:
+{output_log[:800]}
+
+CODE SCORING RULES (IMPORTANT):
+1. IF TESTS FAILED:
+   - MAX SCORE = 0.5
+   - Minor syntax / edge-case miss → 0.35-0.45
+   - Logical misunderstanding → < 0.3
+
+2. IF TESTS PASSED:
+   - BASE SCORE = 0.65
+   - +0.1 to +0.25 for:
+     • clean logic
+     • readable variable names
+     • handling edge cases
+     • correct use of data structures
+   - Do NOT expect optimal Big-O unless resume claims it
+
+3. STRICT CHEATING CHECK:
+   - Hardcoded outputs → score = 0.0
+   - Printing expected values → score = 0.0
 
 SCORING DIMENSIONS:
 {dimensions_text}
 
-SCORING RULES:
+CAMPUS CONTEXT:
+- Partial but honest attempts > perfect but copied solutions
+- Penalize bluffing more than lack of knowledge
+"""
+
+    # =========================================================
+    # TEXT SCORING (Campus Recruiter Mode)
+    # =========================================================
+    else:
+        system = f"""
+You are a CAMPUS RECRUITER evaluating a technical answer for INTERNSHIP / PLACEMENT.
+
+CANDIDATE CONTEXT:
+- Student or fresher
+- Answer should match what they claim in their resume
+- Expect understanding, not expert depth
+
+SCORING DIMENSIONS:
+{dimensions_text}
+
+SCORING GUIDELINES:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-**FAIL (0.0 - 0.3)**: One or more of:
-  • Answer is completely off-topic or nonsensical
-  • Uses buzzwords incorrectly (e.g., "used machine learning" but can't explain gradient descent)
-  • Admits "I don't remember" or "I wasn't the main person" for their OWN resume project
-  • Gives textbook definition when asked for implementation details
-  • Contradicts basic computer science principles
+FAIL (0.0-0.3):
+• Completely incorrect or irrelevant
+• Clearly bluffing about own resume project
+• Uses buzzwords without understanding
+• Cannot explain own implementation at all
 
-**WEAK (0.3 - 0.5)**: 
-  • Generic answer that could come from a blog post
-  • Mentions correct concepts but can't explain "why" or "how"
-  • Avoids the specific question and talks about something easier
-  • No evidence of hands-on implementation
+WEAK (0.3-0.5):
+• Generic explanation
+• Knows terms but not flow
+• Avoids specifics
+• Sounds memorized
 
-**ACCEPTABLE (0.5 - 0.7)**:
-  • Demonstrates basic understanding
-  • Mentions specific technologies correctly
-  • Some implementation details but missing depth
-  • Could have learned this from a tutorial
+ACCEPTABLE (0.5-0.7):
+• Understands core idea
+• Explains basic implementation
+• Minor gaps are OK
+• Typical intern-level answer
 
-**STRONG (0.7 - 0.85)**:
-  • Specific implementation details (file structures, class names, algorithms)
-  • Explains trade-offs made during development
-  • Discusses challenges encountered and how they solved them
-  • Clear evidence they actually built it
+STRONG (0.7-0.85):
+• Explains HOW and WHY
+• Mentions challenges faced
+• Talks about trade-offs
+• Clearly built it themselves
 
-**EXCEPTIONAL (0.85 - 1.0)**:
-  • Discusses performance metrics, edge cases, production issues
-  • Compares multiple approaches with specific pros/cons
-  • Shows deep understanding of underlying principles
-  • Could teach others how to implement it
+EXCEPTIONAL (0.85-1.0):
+• Discusses debugging, edge cases, metrics
+• Compares approaches
+• Shows placement-ready confidence
+
+CRITICAL BLUFF SIGNALS:
+- Overuse of “we” instead of “I”
+- Vague phrases: “industry best practices”
+- No file names, functions, or examples
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-CRITICAL BLUFF DETECTORS:
-1. **Vague Language**: "we used industry best practices", "implemented modern solutions"
-2. **Passive Voice**: "it was done", "the system was built" (who built it?)
-3. **Deflection**: Answering a different, easier question
-4. **Buzzword Salad**: Using terms without connecting them logically
-5. **No Specifics**: Can't name files, functions, algorithms, or metrics"""
+CAMPUS EVALUATION RULE:
+Honesty + reasoning > memorized perfection
+"""
 
-    # Shared Schema
+    # =========================================================
+    # OUTPUT SCHEMA (UNCHANGED)
+    # =========================================================
     schema = '''{
   "overall_score": 0.0-1.0,
   "dimension_scores": {
@@ -891,50 +1512,43 @@ CRITICAL BLUFF DETECTORS:
   },
   "confidence": 0.0-1.0,
   "verdict": "fail|weak|acceptable|strong|exceptional",
-  "rationale": "string (specific evidence for score, citing execution status if code)",
-  "red_flags_detected": ["list of bluff indicators found"],
-  "missing_elements": ["what a strong answer would have included"],
-  "follow_up_probe": "string (question to clarify gray areas)" or null,
-  "mentor_tip": "string (constructive advice or specific learning resource based on the gaps in this specific answer)"
+  "rationale": "string",
+  "red_flags_detected": ["list"],
+  "missing_elements": ["list"],
+  "follow_up_probe": "string or null",
+  "mentor_tip": "string"
 }'''
 
-    prompt = f"""SYSTEM: {system}
+    prompt = f"""SYSTEM:
+{system}
 
 QUESTION ASKED:
-```
 {question_text}
-```
 
 IDEAL ANSWER SHOULD COVER:
-```
 {ideal_outline}
-```
 
-CANDIDATE'S ANSWER:
-```
+CANDIDATE ANSWER:
 {candidate_answer[:800]}
-```
 
-RESUME CONTEXT (for verification):
-```
+RESUME CONTEXT:
 {resume[:600]}
-```
 
-REFERENCE MATERIALS:
+REFERENCE MATERIAL:
 {chunks_text}
 
-INSTRUCTION:
-1. Evaluate based on the specific rules (Text vs Code).
-2. Calculate weighted overall score
-3. Identify specific red flags (vague language, deflection, incorrect usage)
-4. Be HARSH on generic answers - most candidates exaggerate
-5. If answer is in gray zone (0.4-0.7), suggest a follow-up probe
-6. Provide a specific MENTOR TIP: Address the specific gap in their logic or depth. What should they read or practice to improve this specific answer?
+INSTRUCTIONS:
+1. Score using campus-level expectations
+2. Penalize bluffing heavily
+3. Be fair to partial but honest answers
+4. Suggest a FOLLOW-UP only if score is 0.4-0.7
+5. Provide a MENTOR TIP suitable for placement prep
 
-Output JSON: {schema}
+OUTPUT JSON:
+{schema}
 """
-    
     return prompt.strip()
+
 
 # ==========================================
 # DECISION ENGINE
@@ -1047,10 +1661,7 @@ def run_code_in_sandbox(language: str, code: str, stdin: str = "") -> Dict[str, 
         "language": config["language"],
         "version": config["version"],
         "files": [{"content": code}],
-        "stdin": stdin or "",
-        # Piston fields - keep some safety margins
-        "run_timeout": 10000,     # ms (10s) - adjust if you need faster/longer
-        "compile_timeout": 20000  # ms (20s)
+        "stdin": stdin or ""# ms (20s)
     }
 
     max_attempts = 3
@@ -1190,14 +1801,39 @@ def run_code_in_sandbox(language: str, code: str, stdin: str = "") -> Dict[str, 
 
 def call_decision(context: dict, temperature: float = 0.0) -> Dict[str, Any]:
     """Make hiring decision with performance-based termination"""
-    # First check hard rules
-    hard_decision = check_termination_rules(context.get("question_history", []))
-    if hard_decision:
-        return {"ok": True, "parsed": hard_decision, "raw": "hard_rule_triggered"}
     
-    # Otherwise, consult the model
+    # 1. First check hard rules (Keep this! It handles catastrophic failure)
+    hard_decision = check_termination_rules(context.get("question_history", []))
+    
+    if hard_decision:
+        hard_decision["ended"] = True
+        return {"ok": True, "parsed": hard_decision, "raw": "hard_rule_triggered"}
+
+    # =========================================================================
+    # 🛡️ SAFETY GUARD: PREVENT PREMATURE MODEL REJECTION (MISSING IN YOUR CODE)
+    # =========================================================================
+    history = context.get("question_history", [])
+    # We need metrics to check the score
+    metrics = calculate_performance_metrics(history) 
+    
+    # RULE: If interview is short (< 3 Qs) and score is okay (> 40%), FORCE CONTINUE.
+    if len(history) < 3 and metrics["average_score"] > 0.40:
+        logger.info(f"🛡️ Safety Guard Triggered: Forcing CONTINUE (Questions={len(history)}, Score={metrics['average_score']:.2f})")
+        return {
+            "ok": True, 
+            "parsed": {
+                "ended": False,
+                "verdict": "maybe",
+                "confidence": 1.0,
+                "reason": "Interview is too short to make a final decision. Continuing to gather more signals."
+            }, 
+            "raw": "safety_guard_triggered"
+        }
+    # =========================================================================
+
+    # 2. Otherwise, consult the model (Normal Flow)
     prompt = build_decision_prompt(context)
-    resp = groq_call(prompt, temperature=temperature, max_tokens=600)
+    resp = llm_call(prompt, temperature=temperature, max_tokens=600)
     
     if not resp.get("ok"):
         return {"ok": False, "parsed": None, "raw": resp.get("error")}
@@ -1205,7 +1841,6 @@ def call_decision(context: dict, temperature: float = 0.0) -> Dict[str, Any]:
     parsed = extract_json_from_text(resp["raw"])
     if not parsed:
         # Fallback decision based on metrics
-        metrics = calculate_performance_metrics(context.get("question_history", []))
         return {
             "ok": True,
             "parsed": {
@@ -1234,7 +1869,6 @@ def call_decision(context: dict, temperature: float = 0.0) -> Dict[str, Any]:
         normalized["ended"] = True
     
     return {"ok": True, "parsed": normalized, "raw": resp["raw"]}
-
 # ==========================================
 # PROBE GENERATION
 # ==========================================
@@ -1301,7 +1935,7 @@ Output JSON: {schema}
 def call_probe(weakness_topic: str, prev_question: str, prev_answer: str, context: dict) -> Dict[str, Any]:
     """Generate probe with fallback"""
     prompt = build_probe_prompt(weakness_topic, prev_question, prev_answer, context)
-    resp = groq_call(prompt, temperature=0.0, max_tokens=500)
+    resp = llm_call(prompt, temperature=0.0, max_tokens=500)
     
     if not resp.get("ok"):
         # Fallback probe
@@ -1327,47 +1961,116 @@ def call_probe(weakness_topic: str, prev_question: str, prev_answer: str, contex
 # ==========================================
 # RESUME PARSING
 # ==========================================
+def build_full_context(parsed: dict) -> str:
+    """
+    Deterministically builds interview context.
+    ZERO summarization.
+    ZERO paraphrasing.
+    """
+    parts = []
 
-def groq_parse_resume(text: str) -> dict:
-    """Enhanced resume parser with AI + regex fallback"""
-    prompt = f"""Extract structured information from this resume. Return ONLY valid JSON:
+    if parsed.get("skills"):
+        parts.append("TECHNICAL SKILLS:\n" + ", ".join(parsed["skills"]))
 
-{{
-  "name": "string|null",
-  "email": "string|null", 
-  "phone": "string|null",
-  "skills": ["list of technical skills"],
-  "experience_years": number|null,
-  "education": [{{"degree": "string", "institution": "string", "year": "string|null"}}],
-  "projects": [{{"title": "string", "technologies": ["list"], "description": "string"}}],
-  "work_experience": [{{"company": "string", "role": "string", "duration": "string", "responsibilities": ["list"]}}],
-  "summary": "string (2-3 sentence overview)"
-}}
-
-Resume:
-```
-{text[:4000]}
-```"""
-
-    try:
-        resp = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=1500
+    for p in parsed.get("projects", []):
+        parts.append(
+            f"\nPROJECT: {p.get('title','')}\n"
+            f"Technologies: {', '.join(p.get('technologies', []))}\n"
+            f"Description: {p.get('description','')}"
         )
-        
-        content = resp.choices[0].message.content if resp.choices else str(resp)
-        parsed = extract_json_from_text(content)
-        
-        if parsed and (parsed.get("name") or parsed.get("email") or parsed.get("skills")):
-            return parsed
-    except Exception as e:
-        logger.warning(f"AI resume parsing failed: {e}")
-    
-    # Fallback to regex extraction
-    logger.info("Using regex fallback for resume parsing")
-    return regex_parse_resume(text)
+
+    for w in parsed.get("work_experience", []):
+        parts.append(
+            f"\nWORK EXPERIENCE: {w.get('role','')} at {w.get('company','')}\n"
+            f"{w.get('description','')}"
+        )
+
+    return "\n".join(parts)
+
+def ai_parse_resume(text: str) -> dict:
+    """
+    Resume parsing using Groq 8B.
+    LLM extracts STRUCTURE ONLY.
+    We build full_context_for_prompt ourselves (NO summarization).
+    """
+    if not text or not text.strip():
+        return regex_parse_resume(text)
+
+    safe_text = text[:50000]
+
+    prompt = f"""
+    You are a Resume Information Extractor.
+
+    Extract structured fields EXACTLY as written.
+    Do NOT summarize.
+    Do NOT paraphrase.
+    Do NOT generalize.
+
+    OUTPUT JSON ONLY:
+    {{
+        "name": "",
+        "email": "",
+        "phone": "",
+        "skills": [],
+        "education": [{{ "degree": "", "institution": "" }}],
+        "projects": [
+            {{
+                "title": "",
+                "technologies": [],
+                "description": ""
+            }}
+        ],
+        "work_experience": [
+            {{
+                "role": "",
+                "company": "",
+                "description": ""
+            }}
+        ]
+    }}
+
+    RESUME TEXT:
+    {safe_text}
+    """
+
+    parsed = None
+
+    # 1️⃣ Groq 8B
+    if groq_client:
+        try:
+            resp = groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=3000,
+                response_format={"type": "json_object"}
+            )
+            raw = resp.choices[0].message.content
+            parsed = extract_json_from_text(raw)
+        except Exception as e:
+            logger.warning(f"Groq parse failed: {e}")
+
+    # 2️⃣ OpenRouter fallback
+    if not parsed:
+        try:
+            resp = openrouter_client.chat.completions.create(
+                model="meta-llama/llama-3.3-70b-instruct",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=4000
+            )
+            parsed = extract_json_from_text(resp.choices[0].message.content)
+        except Exception as e:
+            logger.warning(f"OpenRouter fallback failed: {e}")
+
+    if not parsed:
+        return regex_parse_resume(text)
+
+    # 🔥 BUILD FULL CONTEXT YOURSELF (NO AI)
+    parsed["full_context_for_prompt"] = build_full_context(parsed)
+
+    return parsed
+
 
 def regex_parse_resume(text: str) -> dict:
     """Robust regex-based resume parser"""
@@ -1456,6 +2159,228 @@ class GenerateQuestionRequest(BaseModel):
     allow_pii: Optional[bool] = False
     options: Optional[Dict[str,Any]] = {}
 
+QUESTION_TYPE_WEIGHTS = {
+    "conceptual": 0.40,
+    "project_discussion": 0.30,
+    "coding_challenge": 0.30
+}
+def infer_type_from_question(q: str) -> str:
+    q = q.lower()
+    if any(x in q for x in ["write a function", "implement", "code", "algorithm"]):
+        return "coding_challenge"
+    if any(x in q for x in ["at ", "intern", "worked", "company"]):
+        return "experience"
+    if "project" in q:
+        return "project_discussion"
+    if any(x in q for x in ["ranked", "award", "competition", "finalist"]):
+        return "achievement"
+    return "conceptual"
+
+
+
+class InterviewState:
+    """
+    Stateless Interview Manager.
+    Re-calculates interview coverage from history on every request.
+
+    Guarantees coverage of:
+    - Projects
+    - Experience (if present)
+    - Achievements (if present)
+    - DSA / Coding Challenges (minimum 2)
+    """
+
+    def __init__(self, resume_text: str):
+        self.resume_text = resume_text
+
+        # Extract projects once from resume
+        self.projects = extract_projects_smart(resume_text)
+
+        # Coverage trackers
+        self.covered_projects: set[str] = set()
+        self.history: List[Dict[str, Any]] = []
+        self.visited_topics: set[str] = set()
+
+        # Difficulty control
+        self.difficulty_level = "medium"
+        self.recent_scores: List[float] = []
+
+        # Resume signals
+        self.has_work_experience = any(
+            kw in resume_text.lower()
+            for kw in [
+                "experience",
+                "work history",
+                "employment",
+                "intern at",
+                "developer at",
+                "engineer at",
+                "worked at",
+            ]
+        )
+        self.has_achievements = any(
+            kw in resume_text.lower() 
+            for kw in ['achievement', 'award', 'competition', 'hackathon', 'certification', 'rank', 'winner', 'finalist', 'prize']
+        )
+        # Section counters (hydrated every request)
+        self.section_counts = {
+            "experience": 0,
+            "projects": 0,
+            "achievements": 0,
+            "dsa": 0,
+            "conceptual": 0,
+        }
+
+    # =====================================================
+    # 🔁 STATE HYDRATION (SOURCE OF TRUTH)
+    # =====================================================
+    def hydrate_from_history(self, history: List[Dict[str, Any]]):
+        """
+        Rebuilds ALL state from frontend-provided history.
+        This makes the service stateless & restart-safe.
+        """
+
+        self.history = history or []
+        self.covered_projects.clear()
+        self.recent_scores.clear()
+
+        # Reset counters
+        for k in self.section_counts:
+            self.section_counts[k] = 0
+
+        scores: List[float] = []
+
+        for h in self.history:
+            q_type = h.get("type")
+            if not q_type:
+                continue  
+
+            # ---- section counts ----
+            if q_type == "coding_challenge":
+                self.section_counts["dsa"] += 1
+            elif q_type == "project_discussion":
+                self.section_counts["projects"] += 1
+            elif q_type == "experience":
+                self.section_counts["experience"] += 1
+            elif q_type == "achievement":
+                self.section_counts["achievements"] += 1
+            else:
+                self.section_counts["conceptual"] += 1
+
+            # ---- project coverage ----
+            target = h.get("target_project")
+            if isinstance(target, str) and target != "general":
+                self.covered_projects.add(target)
+
+           
+
+            # ---- difficulty tracking ----
+            s = h.get("score")
+            if s is not None:
+                try:
+                    scores.append(float(s))
+                except Exception:
+                    pass
+
+        # ---- adaptive difficulty ----
+        self.recent_scores = scores
+        if scores:
+            avg = sum(scores[-3:]) / len(scores[-3:])
+            if avg > 0.8:
+                self.difficulty_level = "hard"
+            elif avg < 0.4:
+                self.difficulty_level = "easy"
+            else:
+                self.difficulty_level = "medium"
+
+    # =====================================================
+    # 🎯 CORE ROUTING LOGIC (GUARANTEED FLOW)
+    # =====================================================
+    def next_question_type(self) -> str:
+        """
+        Determines the NEXT question type.
+        This function is deterministic and enforces curriculum coverage.
+        """
+
+        total_q = len(self.history)
+        if self.section_counts["dsa"] == 0 and len(self.history) >= 2:
+            return "coding_challenge"
+
+        dsa = self.section_counts["dsa"]
+        proj = self.section_counts["projects"]
+        exp = self.section_counts["experience"]
+        ach = self.section_counts["achievements"]
+
+        uncovered_projects = [
+            p for p in self.projects
+            if p["project_id"] not in self.covered_projects
+        ]
+
+        # -------------------------------------------------
+        # ROUND-BASED GUARANTEES (Q1–Q5)
+        # -------------------------------------------------
+        if total_q == 0:
+            return "project_discussion"            # Q1
+
+        if total_q == 1:
+            return "experience" if self.has_work_experience else "conceptual"
+
+        if total_q == 2:
+            return "coding_challenge"              # DSA-1
+
+        if total_q == 3:
+            return "project_discussion" if uncovered_projects else "conceptual"
+
+        if total_q == 4:
+            return "coding_challenge"              # DSA-2 (hard guarantee)
+        if total_q == 5:
+            if self.has_achievements and self.section_counts["achievements"] == 0:
+                return "achievement"
+            # If no achievements, or already asked, fallback to project/conceptual
+            return "project_discussion" if uncovered_projects else "conceptual"
+        # -------------------------------------------------
+        # DYNAMIC PHASE (Q6+)
+        # -------------------------------------------------
+
+        # 1️⃣ HARD GUARANTEE: minimum 2 DSA
+        if dsa < 2:
+            return "coding_challenge"
+
+        # 2️⃣ Cover remaining projects (cap at 3)
+        if uncovered_projects and proj < 3:
+            return "project_discussion"
+
+        # 3️⃣ Force experience exactly once
+        if self.has_work_experience and exp == 0:
+            return "experience"
+
+        # 4️⃣ Force achievements exactly once
+        if ach < 1:
+            return "achievement"
+
+        # 5️⃣ Optional third DSA for long interviews
+        if total_q >= 7 and dsa < 3:
+            return "coding_challenge"
+
+        # 6️⃣ Safe fallback
+        return "conceptual"
+
+    # =====================================================
+    # 🧩 HELPERS
+    # =====================================================
+    def record_question(self, *_args, **_kwargs):
+        """
+        Deprecated.
+        State is rebuilt from history via hydrate_from_history.
+        """
+        pass
+
+    def is_question_too_similar(self, new_question: str) -> bool:
+        return is_repetitive_question(new_question, self.history)
+
+INTERVIEW_STATE: Dict[str, InterviewState] = {}
+
+    
 class FaceVerificationRequest(BaseModel):
     session_id: str
     current_image: str
@@ -1482,11 +2407,15 @@ class ScoreAnswerRequest(BaseModel):
     question_type: Optional[str] = "text" 
     code_execution_result: Optional[Dict[str, Any]] = None 
 
+# Update this class in main.py
 class CodeSubmissionRequest(BaseModel):
-    language: str           
-    code: str               
-    stdin: Optional[str] = "" 
-    expected_output: Optional[str] = None 
+    model_config = ConfigDict(extra="allow")  # 🔥 CRITICAL
+
+    language: str
+    code: str
+    stdin: Optional[Any] = ""                 # 🔥 must be Any
+    expected_output: Optional[Any] = None     # 🔥 must be Any
+    test_cases: Optional[List[Dict[str, Any]]] = []  # 🔥 Any, not str
 
 class ProbeRequest(BaseModel):
     request_id: str
@@ -1544,7 +2473,7 @@ Return ONLY a raw JSON list of objects. No markdown.
 """
     try:
         # Fast, low-temp call
-        resp = groq_call(prompt, temperature=0.0, max_tokens=300)
+        resp = llm_call(prompt, temperature=0.0, max_tokens=300)
         cases = extract_json_from_text(resp.get("raw", ""))
         
         valid = []
@@ -1558,261 +2487,360 @@ Return ONLY a raw JSON list of objects. No markdown.
         return valid
     except:
         return []
-
+def get_interview_state(session_id: str, resume: str) -> InterviewState:
+    """
+    Returns existing InterviewState for session
+    or initializes it from resume text.
+    """
+    if session_id not in INTERVIEW_STATE:
+        INTERVIEW_STATE[session_id] = InterviewState(resume)
+    return INTERVIEW_STATE[session_id]
 # --- REPLACE THE MAIN ENDPOINT ---
+
 @app.post("/generate_question")
 def generate_question(req: GenerateQuestionRequest):
     payload = req.dict()
+
+    # =====================================================
+    # 1. CONTEXT + STATE HYDRATION
+    # =====================================================
     enforced = enforce_budget(payload)
-    enforced["history"] = payload.get("question_history", [])
+    history = payload.get("question_history", []) or []
+    enforced["history"] = history
 
-    # Prepare prompt once (deterministic)
-    prompt = build_generate_question_prompt(enforced, mode=payload.get("mode", "first"))
+    state = get_interview_state(
+        payload["session_id"],
+        payload.get("resume_summary", "")
+    )
+    state.hydrate_from_history(history)
+    logger.info(
+    "📊 Section counts | projects=%d, experience=%d, dsa=%d, achievements=%d, conceptual=%d",
+    state.section_counts["projects"],
+    state.section_counts["experience"],
+    state.section_counts["dsa"],
+    state.section_counts["achievements"],
+    state.section_counts["conceptual"],
+)
 
-    # Build ordered list of models to try
-    tried_models = []
-    default_model = os.getenv("GROQ_MODEL", GROQ_MODEL)
-    tried_models.append(default_model)
-    alt_models_env = os.getenv("ALT_GROQ_MODELS", "")
-    if alt_models_env:
-        for m in [m.strip() for m in alt_models_env.split(",") if m.strip()]:
-            if m not in tried_models:
-                tried_models.append(m)
+    current_q_count = len(history) + 1
 
-    generation_attempts = []
+    # =====================================================
+    # 🛑 TERMINATION CHECK (ONLY PLACE IT HAPPENS)
+    # =====================================================
+    if len(history) >= TERMINATION_RULES["max_questions"]:
+        decision = call_decision({
+            "resume": payload.get("resume_summary", ""),
+            "question_history": history,
+            "conversation": payload.get("conversation", []),
+            "retrieved_chunks": enforced.get("chunks", [])
+        }, temperature=0.0)
+
+        return {
+            "request_id": payload["request_id"],
+            "q_count": current_q_count,
+            "ended": True,
+            "final_decision": decision.get("parsed"),
+            "parsed": {"question": "Interview Complete", "type": "info"},
+        }
+
+    # =====================================================
+    # 2. DETERMINE REQUIRED TYPE (ONCE)
+    # =====================================================
+    required_type = state.next_question_type()
+    logger.info(f"🎯 Required question type: {required_type}")
+
+    # =====================================================
+    # 3. GENERATION LOOP
+    # =====================================================
+    MAX_RETRIES = 3
     parsed = None
     chosen_raw = None
-    chosen_model = None
 
-    try:
-        for model_name in tried_models:
-            logger.info("generate_question: trying model '%s' for request_id=%s", model_name, payload.get("request_id"))
-            try:
-                resp = groq_call(prompt, model=model_name, temperature=0.0, max_tokens=1200)
-            except Exception as e:
-                logger.exception("groq_call failed for model %s: %s", model_name, e)
-                generation_attempts.append({"model": model_name, "raw": None, "error": str(e)})
-                continue
+    for attempt in range(MAX_RETRIES):
+        temperature = 0.3 + attempt * 0.2
 
-            raw = resp.get("raw", "") if isinstance(resp, dict) else str(resp)
-            generation_attempts.append({"model": model_name, "raw": raw})
+        prompt = build_generate_question_prompt(
+            enforced,
+            mode=payload.get("mode", "first"),
+            required_type=required_type,
+            state=state
+        )
 
-            candidate = extract_json_from_text(raw)
-            if not candidate or not isinstance(candidate, dict):
-                logger.info("Model '%s' returned unparsable or non-dict JSON; continuing.", model_name)
-                continue
+        if attempt > 0:
+            prompt += "\n\n🚨 Previous attempt failed. Generate a DIFFERENT question."
 
-            # Validate it's a code question with >=3 properly shaped test cases
-            if candidate.get("type") != "code":
-                logger.info("Model '%s' returned non-code type; continuing.", model_name)
-                continue
+        try:
+            resp = llm_call(prompt, temperature=temperature, max_tokens=1200)
+        except Exception:
+            continue
 
-            cc = candidate.get("coding_challenge") or {}
-            tcs = cc.get("test_cases")
-            def valid_tc_list(tc_list):
-                if not isinstance(tc_list, list) or len(tc_list) < 3:
-                    return False
-                for tc in tc_list:
-                    if not isinstance(tc, dict):
-                        return False
-                    if "input" not in tc or "expected" not in tc:
-                        return False
-                    if not isinstance(tc["input"], str) or not isinstance(tc["expected"], str):
-                        return False
-                return True
+        if not resp.get("ok"):
+            continue
 
-            if valid_tc_list(tcs):
-                # success
-                parsed = candidate
-                chosen_raw = raw
-                chosen_model = model_name
-                logger.info("Model '%s' produced valid test_cases for request_id=%s", model_name, payload.get("request_id"))
-                break
+        raw = resp.get("raw", "")
+        candidate = extract_json_from_text(raw)
+
+        if not isinstance(candidate, dict):
+            continue
+
+        question = candidate.get("question")
+        if not question:
+            continue
+
+        # ❌ Reject repetition
+        if state.is_question_too_similar(question):
+            continue
+
+        # ❌ Reject topic overlap (except DSA)
+        new_topics = extract_question_topics(question)
+        old_topics = set().union(*[
+            extract_question_topics(h.get("question", ""))
+            for h in state.history
+        ])
+
+        if (
+            required_type != "coding_challenge"
+            and len(new_topics & old_topics) / max(len(new_topics), 1) > 0.6
+        ):
+            continue
+
+        # 🔒 HARD TYPE ENFORCEMENT (NO SILENT SKIP)
+        candidate["type"] = required_type
+
+        # 🔒 Coding challenge enforcement
+        if required_type == "coding_challenge":
+            cc = candidate.get("coding_challenge", {})
+            tcs = cc.get("test_cases", [])
+
+            if (
+                not isinstance(tcs, list)
+                or len(tcs) < 2
+                or any("input" not in tc or "expected" not in tc for tc in tcs)
+            ):
+                try:
+                    enforce_test_cases_for_challenge(
+                        parsed=candidate,
+                        resp_raw=raw,
+                        original_prompt=prompt
+                    )
+                except HTTPException:
+                    continue
+
+        parsed = candidate
+        chosen_raw = raw
+        break
+
+    # =====================================================
+    # 4. FALLBACK (RARE, SAFE)
+    # =====================================================
+    if parsed is None:
+        parsed = FALLBACK_QUESTIONS["conceptual"].copy()
+        parsed["type"] = "conceptual"
+        parsed["_is_fallback"] = True
+        chosen_raw = "FALLBACK_TRIGGERED"
+
+    # =====================================================
+    # 5. FINAL NORMALIZATION (NO STATE MUTATION)
+    # =====================================================
+    parsed.setdefault("domain", "general")
+    parsed.setdefault("target_project", "general")
+    parsed["difficulty"] = state.difficulty_level
+
+    # Ensure coding fields
+    if parsed["type"] == "coding_challenge":
+        cc = parsed.get("coding_challenge", {})
+        tcs = cc.get("test_cases", [])
+        
+        # If test cases are missing/empty, FORCE generation right now
+        if not tcs or len(tcs) < 2:
+            logger.warning(f"⚠️ Coding challenge missing test cases. repairing: {question[:50]}...")
+            q_text = parsed.get("question", "")
+            # Use a specialized prompt to get just the test cases
+            starter = cc.get("starter_code", "def solve(x):\n    pass")
+            repaired_tcs = generate_missing_test_cases(q_text, starter)
+            
+            if repaired_tcs and len(repaired_tcs) >= 1:
+                cc["test_cases"] = repaired_tcs
+                # Fix legacy fields for frontend compatibility
+                cc["test_case_input"] = repaired_tcs[0]["input"]
+                cc["expected_output"] = repaired_tcs[0]["expected"]
+                parsed["coding_challenge"] = cc
+                logger.info(f"✅ Auto-repaired {len(repaired_tcs)} test cases.")
             else:
-                logger.info("Model '%s' produced invalid or insufficient test_cases; continuing.", model_name)
+                # If repair fails, DOWNGRADE to conceptual so the app doesn't crash
+                logger.warning("❌ Repair failed. Downgrading question to 'conceptual'.")
+                parsed["type"] = "conceptual"
+                # Remove the broken coding_challenge object
+                parsed.pop("coding_challenge", None)
+    if parsed["type"] == "coding_challenge":
+        cc = parsed.setdefault("coding_challenge", {})
+        cc.setdefault("language", "python")
+        cc.setdefault("starter_code", "def solve(x):\n    pass")
+        
 
-        # If no model produced a valid parsed result, fail loudly with debugging info
-        if parsed is None:
-            logger.error("All attempted models failed to produce valid test_cases for request_id=%s", payload.get("request_id"))
-            raise HTTPException(status_code=502, detail={
-                "error": "model_failed_to_provide_test_cases",
-                "message": "None of the attempted models returned a coding challenge with >=3 valid test_cases.",
-                "attempts": generation_attempts
-            })
+        if not parsed.get("_is_fallback"):
+            tcs = cc.get("test_cases", [])
+            if tcs:
+                cc["test_case_input"] = tcs[0]["input"]
+                cc["expected_output"] = tcs[0]["expected"]
 
-    except HTTPException:
-        # Re-raise HTTPException so FastAPI handles properly
-        raise
-    except Exception as e:
-        logger.exception("Unexpected generation error: %s", e)
-        raise HTTPException(status_code=500, detail="AI generation failed")
-
-    # At this point 'parsed' is valid and contains coding_challenge.test_cases >= 3
-    # Optionally, enforce legacy fields for frontend compatibility
-    try:
-        challenge = parsed.get("coding_challenge") or {}
-        tcs = challenge.get("test_cases", [])
-        if isinstance(tcs, list) and len(tcs) >= 1:
-            challenge["test_case_input"] = tcs[0]["input"]
-            challenge["expected_output"] = tcs[0]["expected"]
-        if "language" not in challenge:
-            challenge["language"] = "python"
-        if "starter_code" not in challenge:
-            challenge["starter_code"] = "def solve(x):\n    pass"
-        parsed["coding_challenge"] = challenge
-    except Exception:
-        logger.warning("Failed to normalize legacy coding_challenge fields; continuing with parsed result.")
-
+    # =====================================================
+    # 6. RETURN (STATE IS DERIVED NEXT REQUEST)
+    # =====================================================
     return {
         "request_id": payload["request_id"],
-        "llm_raw": chosen_raw,
+        "q_count": current_q_count,
         "parsed": parsed,
-        "redaction_log": []
+        "llm_raw": chosen_raw,
+        "metadata": {
+            "required_type": parsed["type"],
+            "difficulty": state.difficulty_level,
+            "covered_projects": list(state.covered_projects),
+            "section_counts": state.section_counts
+        },
+        "ended": False
     }
+
 
 @app.post("/run_code")
 def run_code(req: CodeSubmissionRequest):
+    import json, re
+
+    # 1. NORMALIZE INPUT
+    if isinstance(req.stdin, (list, dict)):
+        req.stdin = json.dumps(req.stdin)
+    elif req.stdin is None:
+        req.stdin = ""
+
+    # 2. NORMALIZE TEST CASES
+    clean_test_cases = []
+    for tc in req.test_cases or []:
+        inp = tc.get("input") or tc.get("stdin") or tc.get("test_case_input") or ""
+        exp = tc.get("expected") or tc.get("expected_output") or tc.get("output") or ""
+        clean_test_cases.append({"input": str(inp), "expected": str(exp)})
+
     final_code = req.code
 
-    # ---------------------------------------------------------
-    # 1. ROBUST DRIVER (Reads from Sys.Stdin)
-    # ---------------------------------------------------------
-    # Inject driver if Python and file looks like a library (has a def
-    # but no "__main__" execution block). Avoid relying on "print(" check.
-    if req.language.lower() == "python" and "def " in final_code and "if __name__" not in final_code:
-
-        # Regex to find the function name
+    # 3. DRIVER INJECTION (PYTHON)
+    if (
+        req.language.lower() == "python"
+        and "def " in final_code
+        and "if __name__" not in final_code
+    ):
         target_func = "solve"
         match = re.search(r"def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", final_code)
         if match:
             target_func = match.group(1)
 
-        # Universal driver: safe parsing + fallback call strategies
         driver = f'''
-import sys, json, traceback
+import sys, json, inspect, traceback
 
 def _parse_input(raw):
     raw = raw.strip()
     if raw == "":
         return None
-    # Try JSON first
+
     try:
         return json.loads(raw)
     except:
-        pass
-    # If looks like CSV without brackets: "1, 2, 3"
-    if ',' in raw and '[' not in raw and raw.count('"') % 2 == 0:
-        parts = [p.strip() for p in raw.split(',')]
-        # Try convert to ints/floats, otherwise keep strings
-        out = []
-        for p in parts:
-            if p == "":
-                continue
-            try:
-                out.append(int(p))
-                continue
-            except:
-                pass
-            try:
-                out.append(float(p))
-                continue
-            except:
-                pass
-            # strip quotes if present
-            if len(p) >= 2 and ((p[0] == p[-1] == '"') or (p[0] == p[-1] == "'")):
-                out.append(p[1:-1])
-            else:
-                out.append(p)
-        return out
-    # Fallback: raw string (strip wrapping quotes if present)
-    if len(raw) >= 2 and ((raw[0] == raw[-1] == '"') or (raw[0] == raw[-1] == "'")):
-        return raw[1:-1]
-    return raw
+        return raw
+
 
 if __name__ == "__main__":
     try:
         raw_input = sys.stdin.read()
         input_data = _parse_input(raw_input)
+        
+        sig = inspect.signature({target_func})
+        params = list(sig.parameters)
 
-        # Try calling with one argument, fallback to zero-arg if TypeError
-        result = None
-        try:
+        if len(params) == 0:
+            result = {target_func}()
+        elif isinstance(input_data, list) and len(params) > 1:
+            if len(input_data) == len(params):
+                 result = {target_func}(*input_data)
+            else:
+                 result = {target_func}(input_data)
+        else:
             result = {target_func}(input_data)
-        except TypeError:
-            try:
-                result = {target_func}()
-            except Exception as e:
-                # re-raise to be caught below
-                raise
 
-        # Print result in JSON-friendly form
         if result is None:
             print("null")
         else:
             try:
                 print(json.dumps(result))
-            except TypeError:
-                # Objects not JSON serializable -> fallback to str()
+            except:
                 print(json.dumps(str(result)))
     except Exception as e:
-        # Provide structured driver error for debugging
-        tb = traceback.format_exc()
         print("DRIVER_ERROR")
-        print(json.dumps({{"error": str(e), "traceback": tb}}))
+        print(json.dumps({{"error": str(e), "traceback": traceback.format_exc()}}))
 '''
-        final_code = final_code + "\n\n" + driver
+        final_code += "\n\n" + driver
 
-    # ---------------------------------------------------------
-    # 2. EXECUTION (Pass stdin normally)
-    # ---------------------------------------------------------
-    run_result = run_code_in_sandbox(req.language, final_code, req.stdin)
+    # 4. SELECT TEST CASES
+    cases_to_run = clean_test_cases or [{"input": req.stdin or "", "expected": req.expected_output or ""}]
 
-    # Build base response (include lots of debug info)
-    response = {
-        "success": run_result.get("success", False),
-        "output": str(run_result.get("output", "") or "").strip(),
-        "error": run_result.get("error_type"),
-        "passed": False,
-        "stdin_received": req.stdin or "",
-        "raw_run": run_result,   # full raw sandbox response for troubleshooting
-        "debug": None
-    }
+    # 5. EXECUTION LOOP
+    results = []
+    all_passed = True
 
-    # ---------------------------------------------------------
-    # 3. ROBUST GRADING
-    # ---------------------------------------------------------
-    if req.expected_output and run_result.get("success"):
-        actual = response["output"]
-        expected = str(req.expected_output).strip()
+    def normalize(val):
+        if val is None:
+            return None
+        if isinstance(val, str):
+            v = val.strip()
+            # Try direct JSON
+            try:
+                return json.loads(v)
+            except:
+                pass
+            # Try wrapping in brackets (Comma separated outputs)
+            # 👇 THIS WAS THE BUGGY PART - CHANGED 'raw' TO 'v' 👇
+            try:
+                return json.loads(f"[{v}]")
+            except:
+                pass
+            return v
+        return val
 
-        # Exact match
-        if actual == expected:
-            response["passed"] = True
+    for case in cases_to_run:
+        c_input = case["input"]
+        c_expected = case["expected"]
+
+        run_result = run_code_in_sandbox(req.language, final_code, c_input)
+
+        stdout_raw = run_result.get("output", "")
+        stdout = str(stdout_raw).strip()
+
+        passed = False
+        error_msg = None
+
+        if "DRIVER_ERROR" in stdout:
+            error_msg = stdout
         else:
-            # Try JSON decode both sides (handles spacing, ordering for arrays/objects)
-            try:
-                actual_json = json.loads(actual) if actual not in ("None", "") else None
-            except:
-                actual_json = None
-            try:
-                expected_json = json.loads(expected) if expected not in ("None", "") else None
-            except:
-                expected_json = None
+            if run_result.get("success") and c_expected != "":
+                norm_out = normalize(stdout)
+                norm_exp = normalize(c_expected)
+                # Compare normalized values or their string representations
+                passed = (norm_out == norm_exp) or (str(norm_out) == str(norm_exp))
 
-            if actual_json is not None and expected_json is not None:
-                if actual_json == expected_json:
-                    response["passed"] = True
+        if not passed:
+            all_passed = False
 
-        if not response["passed"]:
-            response["debug"] = f"Expected: {expected} | Got: {actual}"
-            logger.info(f"❌ TEST FAILED: {response['debug']}")
+        results.append({
+            "input": c_input,
+            "expected": c_expected,
+            "stdout": stdout,
+            "passed": passed,
+            "success": run_result.get("success", False),
+            "error": run_result.get("error_type") or error_msg
+        })
 
-    # If sandbox failed, include its message in debug for easier triage
-    if not run_result.get("success"):
-        response["debug"] = response.get("debug") or run_result.get("output") or run_result.get("error_type")
-
-    return response
-
+    return {
+        "success": True,
+        "all_passed": all_passed,
+        "results": results
+    }
 @app.post("/interview/register-face")
 async def register_face(request: FaceRegisterRequest):
     """
@@ -1903,10 +2931,13 @@ async def register_face(request: FaceRegisterRequest):
         raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 @app.post("/score_answer")
 def score_answer(req: ScoreAnswerRequest):
-    """Score answer with multi-dimensional evaluation and bluff detection"""
+    """
+    Score answer using Groq (Llama 3.3) for ultra-low latency.
+    Falls back to OpenRouter only if Groq fails.
+    """
     payload = req.dict()
     
-    # PII redaction
+    # 1. PII redaction
     redaction_log = []
     if not payload.get("allow_pii") and payload.get("resume_summary"):
         r = redact_pii(payload["resume_summary"])
@@ -1915,11 +2946,12 @@ def score_answer(req: ScoreAnswerRequest):
     
     enforced = enforce_budget(payload)
     
+    # 2. Build Context & Prompt
     context = {
         "resume": enforced.get("resume", ""),
         "chunks": enforced.get("chunks", []),
-        "question_type": payload.get("question_type", "text"),          # <--- ADDED
-        "code_execution_result": payload.get("code_execution_result")   # <--- ADDED
+        "question_type": payload.get("question_type", "text"),
+        "code_execution_result": payload.get("code_execution_result")
     }
     
     prompt = build_score_prompt(
@@ -1929,21 +2961,34 @@ def score_answer(req: ScoreAnswerRequest):
         context
     )
     
-    options = payload.get("options", {})
-    temperature = float(options.get("temperature", 0.0))
-    max_tokens = int(options.get("max_response_tokens", 1000))
+    # 3. FAST PATH: Try Groq First (Llama 3.3)
+    parsed = None
+    used_source = "groq"
     
-    if len(prompt) > MAX_PROMPT_CHARS:
-        raise HTTPException(status_code=400, detail="prompt_too_large")
-    
-    resp = groq_call(prompt, temperature=temperature, max_tokens=max_tokens)
-    
-    if not resp.get("ok"):
-        raise HTTPException(status_code=502, detail=f"groq_error: {resp.get('error')}")
-    
-    parsed = extract_json_from_text(resp["raw"])
-    
-    # Validate and normalize scores
+    if groq_client:
+        try:
+            resp = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,  # Low temp = faster caching
+                max_tokens=1500,
+                response_format={"type": "json_object"} # <--- CRITICAL FOR SPEED
+            )
+            raw_text = resp.choices[0].message.content
+            parsed = extract_json_from_text(raw_text)
+        except Exception as e:
+            logger.warning(f"Groq Scoring failed: {e}")
+            used_source = "openrouter_fallback"
+
+    # 4. SLOW PATH: Fallback to OpenRouter if Groq failed/missing
+    if not parsed:
+        resp = llm_call(prompt, temperature=0.1, max_tokens=1500)
+        if not resp.get("ok"):
+             raise HTTPException(status_code=502, detail=f"Scoring failed: {resp.get('error')}")
+        parsed = extract_json_from_text(resp["raw"])
+        raw_text = resp["raw"]
+
+    # 5. Validation & Post-Processing
     validated = {
         "overall_score": None,
         "dimension_scores": {},
@@ -1956,7 +3001,7 @@ def score_answer(req: ScoreAnswerRequest):
     }
     
     needs_review = False
-    
+
     if parsed and isinstance(parsed, dict):
         try:
             # Overall score
@@ -1971,7 +3016,7 @@ def score_answer(req: ScoreAnswerRequest):
                 if val is not None:
                     validated["dimension_scores"][dim] = max(0.0, min(1.0, float(val)))
             
-            # Other fields
+            # Meta fields
             validated["confidence"] = max(0.0, min(1.0, float(parsed.get("confidence", 0.5))))
             validated["verdict"] = parsed.get("verdict", "weak")
             validated["rationale"] = parsed.get("rationale", "")
@@ -1979,7 +3024,27 @@ def score_answer(req: ScoreAnswerRequest):
             validated["missing_elements"] = parsed.get("missing_elements", [])
             validated["follow_up_probe"] = parsed.get("follow_up_probe")
             
-            # Gray zone detection
+            # Stabilize Score
+            validated["overall_score"] = normalize_overall_score(
+                  validated, 
+                  payload.get("question_history", [])
+            )
+            validated["verdict"] = derive_verdict_from_score(validated["overall_score"])
+            
+            # Record state
+            state = INTERVIEW_STATE.get(payload["session_id"])
+            if state:
+                state.record_question(
+                    {
+                        "question": payload.get("question_text"),
+                        "type": payload.get("question_type", "text"),
+                        "target_project": payload.get("target_project", "general"),
+                        "domain": payload.get("domain", "general"),
+                    },
+                    validated.get("overall_score", 0.5)
+                )
+
+            # Gray zone check (Initial Calculation)
             if validated["overall_score"] is not None:
                 rules = TERMINATION_RULES
                 if rules["gray_zone_min"] <= validated["overall_score"] <= rules["gray_zone_max"]:
@@ -1987,7 +3052,6 @@ def score_answer(req: ScoreAnswerRequest):
                     if not validated["follow_up_probe"]:
                         validated["follow_up_probe"] = "Ask for specific code example or implementation detail"
             
-            # Low confidence flag
             if validated["confidence"] < 0.4:
                 needs_review = True
             
@@ -1996,19 +3060,51 @@ def score_answer(req: ScoreAnswerRequest):
             needs_review = True
     else:
         needs_review = True
+
+    incoming_history = payload.get("question_history", []) or []
+    current_q_count = len(incoming_history) + 1
+
+    # 🛑 ANTI-LOOP MECHANISM START 🛑
     
+    # 1. Calculate raw Gray Zone status
+    raw_in_gray_zone = (
+        needs_review 
+        and validated["overall_score"] is not None 
+        and TERMINATION_RULES["gray_zone_min"] <= validated["overall_score"] <= TERMINATION_RULES["gray_zone_max"]
+    )
+    
+    # 2. Check history to suppress consecutive probes
+    final_in_gray_zone = raw_in_gray_zone
+    
+    if raw_in_gray_zone and incoming_history:
+        # Get the score of the immediately preceding question
+        prev_entry = incoming_history[-1]
+        prev_score = prev_entry.get("score")
+        
+        if prev_score is not None:
+            try:
+                p_val = float(prev_score)
+                # If the previous question's score was ALSO in the gray zone, we assume 
+                # we just asked a probe. Don't probe again.
+                if TERMINATION_RULES["gray_zone_min"] <= p_val <= TERMINATION_RULES["gray_zone_max"]:
+                    logger.info(f"🛑 Anti-Loop Triggered: Previous score ({p_val:.2f}) was also Gray. Suppressing probe.")
+                    final_in_gray_zone = False
+            except Exception:
+                pass
+    # 🛑 ANTI-LOOP MECHANISM END 🛑
+
     return {
         "request_id": payload["request_id"],
-        "llm_raw": resp["raw"],
+        "q_count": current_q_count,
+        "llm_raw": raw_text,
         "parsed": parsed,
         "validated": validated,
         "parse_ok": parsed is not None,
         "needs_human_review": needs_review,
-        "in_gray_zone": needs_review and validated["overall_score"] is not None and 
-                        TERMINATION_RULES["gray_zone_min"] <= validated["overall_score"] <= TERMINATION_RULES["gray_zone_max"],
+        "source": used_source,  # Debugging help
+        "in_gray_zone": final_in_gray_zone, # Uses the suppressed value if loop detected
         "redaction_log": redaction_log
     }
-
 @app.post("/probe")
 def probe(req: ProbeRequest):
     """Generate diagnostic probe question for weak/vague answers"""
@@ -2055,6 +3151,9 @@ def finalize_decision(req: DecisionRequest):
     
     enforced = enforce_budget(payload)
     
+    # ✅ Calculate metrics FIRST (fixes bug)
+    metrics = calculate_performance_metrics(payload.get("question_history", []))
+    
     context = {
         "resume": enforced.get("resume", ""),
         "conversation": payload.get("conversation", []),
@@ -2064,24 +3163,29 @@ def finalize_decision(req: DecisionRequest):
     
     result = call_decision(context, temperature=0.0)
     
-    # Determine if decision is final
+    # -------------------------------------------------
+    # FINALITY LOGIC (RULE-FIRST, MODEL-SECOND)
+    # -------------------------------------------------
     is_final = False
+    
     if result.get("ok") and result.get("parsed"):
         decision = result["parsed"]
-        if decision.get("ended"):
-            verdict = decision.get("verdict")
-            confidence = decision.get("confidence", 0.0)
-            
-            # Accept as final if confident and clear verdict
-            if payload.get("accept_model_final", True):
-                if verdict in ("hire", "reject") and confidence >= 0.75:
-                    is_final = True
-                elif verdict == "maybe" and confidence < 0.5:
-                    is_final = False  # Needs human review
-    
-    # Add performance metrics
-    metrics = calculate_performance_metrics(payload.get("question_history", []))
-    
+        verdict = decision.get("verdict")
+        confidence = decision.get("confidence", 0.0)
+
+        # 🔒 HARD RULES ALWAYS FINAL
+        if result.get("raw") == "hard_rule_triggered":
+            is_final = True
+
+        # 🔒 CLEAR MODEL DECISION
+        elif payload.get("accept_model_final", True):
+            if verdict in ("hire", "reject") and confidence >= 0.75:
+                is_final = True
+
+            # 🔒 LOW AVERAGE + REJECT = FINAL
+            elif verdict == "reject" and metrics["average_score"] < 0.45:
+                is_final = True
+
     return {
         "request_id": payload["request_id"],
         "result": result,
@@ -2089,6 +3193,7 @@ def finalize_decision(req: DecisionRequest):
         "performance_metrics": metrics,
         "termination_rule_triggered": result.get("raw") == "hard_rule_triggered"
     }
+
 
 @app.post("/parse_resume")
 async def parse_resume(
@@ -2146,7 +3251,7 @@ async def parse_resume(
         }
     
     try:
-        parsed = groq_parse_resume(raw_text)
+        parsed = ai_parse_resume(raw_text)
     except Exception as e:
         logger.exception(f"Resume parsing failed: {e}")
         parsed = regex_parse_resume(raw_text)
@@ -2167,7 +3272,37 @@ def get_performance_metrics(session_id: str):
             "recommendation": "continue"
         }
     }
-
+@app.get("/coverage/{session_id}")
+def get_coverage(session_id: str):
+    """Debug endpoint to see interview coverage"""
+    if session_id not in INTERVIEW_STATE:
+        return {"error": "Session not found"}
+    
+    state = INTERVIEW_STATE[session_id]
+    
+    uncovered = [
+        p["title"] for p in state.projects 
+        if p["project_id"] not in state.covered_projects
+    ]
+    
+    covered = [
+        p["title"] for p in state.projects 
+        if p["project_id"] in state.covered_projects
+    ]
+    
+    return {
+        "session_id": session_id,
+        "total_questions": len(state.history),
+        "difficulty": state.difficulty_level,
+        "section_counts": state.section_counts,
+        "projects": {
+            "total": len(state.projects),
+            "covered": len(covered),
+            "covered_list": covered,
+            "uncovered_list": uncovered
+        },
+        "visited_topics": list(state.visited_topics)[:20]  # Top 20 topics
+    }
 @app.get("/")
 def root():
     return {

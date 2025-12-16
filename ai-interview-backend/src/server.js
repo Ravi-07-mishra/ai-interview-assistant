@@ -52,6 +52,12 @@ app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.path} - ip=${req.ip}`);
   next();
 });
+function inferSemanticType(parsed) {
+  if (parsed?.type) return parsed.type;
+  if (parsed?.coding_challenge) return "dsa";
+  if (parsed?.target_project) return "project_discussion";
+  return "conceptual";
+}
 
 // Rate limiter
 const limiter = rateLimit({
@@ -212,18 +218,34 @@ async function getQAByQaId(qaId) {
 }
 
 async function buildQuestionHistory(sessionId) {
-  const sessionDoc = await Session.findOne({ sessionId }).lean();
-  const qaIds = (sessionDoc?.qaIds || []).slice(-12);
-  const qaDocs = await QA.find({ qaId: { $in: qaIds } }).sort({ askedAt: 1 }).lean();
-  return qaDocs.map(r => ({
-    question: r.questionText,
-    questionText: r.questionText,
-    answer: r.candidateAnswer || "",
-    score: (typeof r.score === "number") ? r.score : 0,
-    verdict: r.verdict || null,
-    ideal_outline: r.ideal_outline || "",
-  }));
+  try {
+    // 🗑️ DELETE THE OLD BROKEN LOGIC:
+    // const sessionDoc = await Session.findOne({ sessionId }).lean();
+    // const qaIds = (sessionDoc.qaIds || [])...
+
+    // ✅ NEW ROBUST LOGIC: Query the QA table directly
+    // This works even if the Session.qaIds array is broken
+    const qaDocs = await QA.find({ sessionId: sessionId })
+      .sort({ askedAt: 1 })
+      .lean();
+
+    console.log(`📜 History built for ${sessionId}: ${qaDocs.length} items found.`);
+
+    return qaDocs.map(r => ({
+      question: r.questionText,
+      questionText: r.questionText,
+      answer: r.candidateAnswer || "",
+      score: typeof r.score === "number" ? r.score : 0,
+      verdict: r.verdict || null,
+      ideal_outline: r.ideal_outline || "",
+      type: r.metadata?.type || "conceptual"
+    }));
+  } catch (error) {
+    console.error("❌ Error building history:", error);
+    return [];
+  }
 }
+
 
 // ---------------- AUTH MIDDLEWARE ----------------
 // verifyToken is expected to behave like express middleware (req, res, next)
@@ -613,7 +635,7 @@ app.post("/interview/start", requireAuth, async (req, res) => {
             resume_summary: body.resume_summary || (body.parsed_resume?.summary) || "",
             retrieved_chunks: body.retrieved_chunks || [],
             conversation: [],
-            question_history: [],
+question_history: await buildQuestionHistory(session.sessionId),
             token_budget: 3000,
             allow_pii: !!body.allow_pii,
             options: { return_prompt: false, temperature: 0.1 }
@@ -625,8 +647,14 @@ app.post("/interview/start", requireAuth, async (req, res) => {
 
         const questionText = parsed.question || parsed.questionText ||
             "Tell me about the most technically challenging project on your resume. What specific problem did you solve, and how did you approach it?";
+let normalizedType = parsed.type || "medium";
+        if (normalizedType === "coding_challenge") {
+            normalizedType = "code";
+        }
+        const semanticType = inferSemanticType(parsed);
 
         const qaMetadata = {
+   type: semanticType,
             target_project: parsed.target_project,
             technology_focus: parsed.technology_focus,
             red_flags: parsed.red_flags || [],
@@ -638,10 +666,13 @@ app.post("/interview/start", requireAuth, async (req, res) => {
             questionText,
             parsed.ideal_answer_outline || parsed.ideal_outline || "",
             // 👇 CHANGE THIS LINE 👇
-            parsed.type || parsed.expected_answer_type || parsed.expectedAnswerType || "medium", 
+            normalizedType, 
             parsed.difficulty || "hard",
             userId,
-            qaMetadata
+           {
+    ...qaMetadata,
+    type: semanticType      // ✅ THIS is what Python needs
+  }
         );
 
         console.log("✅ Interview started with question ID:", qaDoc.questionId);
@@ -655,7 +686,7 @@ app.post("/interview/start", requireAuth, async (req, res) => {
                 target_project: parsed.target_project,
                 technology_focus: parsed.technology_focus,
                 // 👇 CHANGE THIS LINE TOO 👇
-                expectedAnswerType: parsed.type || qaDoc.expectedAnswerType || "medium",
+                expectedAnswerType: normalizedType,
                 difficulty: qaDoc.difficulty,
                 ideal_outline: qaDoc.ideal_outline || parsed.ideal_outline,
                 red_flags: parsed.red_flags,
@@ -728,15 +759,19 @@ app.post("/interview/answer", requireAuth, async (req, res) => {
     if (!qaRec) {
       console.error("❌ QA record not found:", qaId || questionId);
       return res.status(404).json({ error: "qa_record_not_found" });
-    }
+    } 
 
     console.log("📝 Found QA record:", qaRec.qaId);
+    const semanticType = qaRec.metadata?.type || "conceptual";
+const uiType = qaRec.expectedAnswerType || "text";
+
 
     // Save answer text (Using the unified variable)
     await updateQARecordDB(qaRec.qaId, {
       candidateAnswer: candidateAnswer, // <--- UPDATED THIS LINE
       answeredAt: new Date()
     });
+
 
     // Build history
     const questionHistory = await buildQuestionHistory(sessionId);
@@ -788,21 +823,15 @@ app.post("/interview/answer", requireAuth, async (req, res) => {
       }
     };
     await updateQARecordDB(qaRec.qaId, scoreUpdate);
-
+console.log("🔄 Refreshing history with latest scores...");
+    const updatedHistory = await buildQuestionHistory(sessionId);
     // Update history array for decision making
-    questionHistory.push({
-      question: qaRec.questionText,
-      questionText: qaRec.questionText,
-      answer: candidateAnswer,
-      score: scoreUpdate.score,
-      verdict: scoreUpdate.verdict,
-      ideal_outline: qaRec.ideal_outline || ""
-    });
-
+    
     // Decision & next question
     let nextQuestion = null;
     let ended = false;
     let performanceMetrics = null;
+let modelDecision = null;
 
     try {
       const decisionPayload = {
@@ -811,7 +840,7 @@ app.post("/interview/answer", requireAuth, async (req, res) => {
         user_id: userId || "anonymous",
         resume_summary: req.body.resume_summary || "",
         conversation: req.body.conversation || [],
-        question_history: questionHistory,
+        question_history: updatedHistory,
         retrieved_chunks: req.body.retrieved_chunks || [],
         token_budget: 800,
         allow_pii: !!req.body.allow_pii,
@@ -823,8 +852,7 @@ app.post("/interview/answer", requireAuth, async (req, res) => {
       performanceMetrics = finalizeResp.performance_metrics || finalizeResp.performanceMetrics || null;
 
       const isFinal = finalizeResp.is_final || finalizeResp.isFinal || false;
-      const modelDecision = decisionResult?.parsed || decisionResult?.decision || decisionResult;
-
+modelDecision = decisionResult?.parsed || decisionResult?.decision || decisionResult;
       if (isFinal && modelDecision && modelDecision.ended) {
         ended = true;
         console.log("🏁 Interview ended by model decision:", modelDecision.verdict);
@@ -885,13 +913,17 @@ app.post("/interview/answer", requireAuth, async (req, res) => {
       sessionId,
       probeQuestion,
       parsed.ideal_answer_outline || parsed.ideal_outline || "",
-      parsed.type || parsed.expected_answer_type || parsed.expectedAnswerType || "text",
+      (parsed.type === "coding_challenge" ? "code" : (parsed.expected_answer_type || "text"))
+,
       parsed.difficulty || "medium",
       userId,
       {
         target_project: parsed.target_project || null,
         technology_focus: parsed.technology_focus || null,
-        red_flags: parsed.red_flags || []
+        red_flags: parsed.red_flags || [],
+         type: inferSemanticType(parsed)
+
+
       }
     );
 
@@ -919,7 +951,12 @@ app.post("/interview/answer", requireAuth, async (req, res) => {
       "text",
       "medium",
       userId,
-      { target_project: null, technology_focus: null, red_flags: [] }
+      {
+    target_project: null,
+    technology_focus: null,
+    red_flags: [],
+    type: "conceptual"   // explicit
+  }
     );
 
     nextQuestion = {
@@ -942,7 +979,7 @@ app.post("/interview/answer", requireAuth, async (req, res) => {
     resume_summary: req.body.resume_summary || "",
     retrieved_chunks: req.body.retrieved_chunks || [],
     conversation: req.body.conversation || [],
-    question_history: questionHistory,
+question_history: updatedHistory,
     token_budget: 1500,
     allow_pii: !!req.body.allow_pii,
     options: { temperature: 0.1 }
@@ -950,20 +987,26 @@ app.post("/interview/answer", requireAuth, async (req, res) => {
 
           const genResp = await callAiGenerateQuestion(genPayload);
           const parsed = genResp.parsed || {};
+console.log("🐍 RAWR PYTHON RESPONSE:", JSON.stringify(parsed, null, 2));
           const qText = parsed.question || parsed.followup_question ||
             "Can you elaborate on your approach with a specific example?";
+let nextType = parsed.expected_answer_type || "medium";
+if (parsed.type === "coding_challenge") {
+    nextType = "code";
+}
 
           const newQa = await createQARecordDB(
             sessionId,
             qText,
             parsed.ideal_answer_outline || parsed.ideal_outline || "",
-            parsed.expected_answer_type || parsed.expectedAnswerType || "medium",
+            nextType,
             parsed.difficulty || "hard",
             userId,
             {
               target_project: parsed.target_project,
               technology_focus: parsed.technology_focus,
-              red_flags: parsed.red_flags || []
+              red_flags: parsed.red_flags || [],
+type: inferSemanticType(parsed)
             }
           );
 
@@ -975,7 +1018,8 @@ app.post("/interview/answer", requireAuth, async (req, res) => {
             technology_focus: parsed.technology_focus,
             expectedAnswerType: newQa.expectedAnswerType,
             difficulty: newQa.difficulty,
-            ideal_outline: newQa.ideal_outline
+            ideal_outline: newQa.ideal_outline,
+coding_challenge: parsed.coding_challenge || null
           };
         }
       } catch (e) {
@@ -1009,6 +1053,7 @@ app.post("/interview/answer", requireAuth, async (req, res) => {
       nextQuestion,
       ended,
       is_final: ended,
+final_decision: ended ? modelDecision : null,
       performance_metrics: performanceMetrics,
       needs_human_review: latestQa?.needsHumanReview || false,
       in_gray_zone: latestQa?.metadata?.in_gray_zone || false

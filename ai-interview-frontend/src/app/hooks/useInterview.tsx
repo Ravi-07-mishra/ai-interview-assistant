@@ -49,6 +49,7 @@ export type PerformanceMetrics = {
   confidence: number;
   score_variance?: number;
 };
+const normalizeType = (t: any) => t || "conceptual";
 
 const API = process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") ?? "";
 
@@ -74,11 +75,23 @@ export function useInterview() {
   const [resumeFileUrl, setResumeFileUrl] = useState<string | null>(null);
   const [finalDecision, setFinalDecision] = useState<any | null>(null);
 
-  const onResumeReady = useCallback((parsed: any, fileUrl?: string | null) => {
+ // REPLACE THIS FUNCTION in hooks/useInterview.tsx
+
+const onResumeReady = useCallback((parsed: any, fileUrl?: string | null) => {
+    console.log("📄 Resume Loaded in Hook:", parsed);
+
+    // 🚨 CRITICAL FIX: If the backend provided the rich context, 
+    // overwrite the short summary with it immediately.
+    // This ensures that startInterview and submitAnswer always use the full text.
+    if (parsed && (parsed as any).full_context_for_prompt) {
+        console.log("✅ Upgrading Resume Summary to Rich Context");
+        parsed.summary = (parsed as any).full_context_for_prompt;
+    }
+
     setResumeParsed(parsed);
     if (fileUrl) setResumeFileUrl(fileUrl);
     setStage("idle");
-  }, []);
+}, []);
 
   const buildConversationFromHistory = useCallback(() => {
     const conv: Array<{ role: "assistant" | "user"; text: string }> = [];
@@ -89,16 +102,16 @@ export function useInterview() {
     return conv;
   }, [history]);
 
-  const buildQuestionHistory = useCallback(() => {
-    return history.map(h => ({
-      question: h.q.questionText,
-      questionText: h.q.questionText,
-      answer: h.a,
-      score: h.result?.score || h.result?.overall_score || 0,
-      verdict: h.result?.verdict,
-      ideal_outline: h.q.ideal_outline || h.q.ideal_answer_outline
-    }));
-  }, [history]);
+const buildQuestionHistory = useCallback(() => {
+  return history.map(h => ({
+    question: h.q.questionText,
+    type: normalizeType(h.q.type),   // 🔧 FIX
+    target_project: h.q.target_project || "general",
+    score: h.result?.overall_score ?? h.result?.score ?? null
+  }));
+}, [history]);
+
+
 
   const getAuthHeaders = useCallback(() => {
     if (!token) return {};
@@ -162,6 +175,7 @@ export function useInterview() {
       const normalizedQuestion: InterviewQuestion = {
         questionId: backendId || `q_${Date.now()}`,
         questionText: existingQuestionData.question || existingQuestionData.questionText || "",
+        type: normalizeType(existingQuestionData.type),
         target_project: existingQuestionData.target_project,
         technology_focus: existingQuestionData.technology_focus,
         expectedAnswerType: existingQuestionData.expected_answer_type || existingQuestionData.expectedAnswerType || "medium",
@@ -170,6 +184,7 @@ export function useInterview() {
         red_flags: existingQuestionData.red_flags || [],
         confidence: existingQuestionData.confidence
       };
+console.log("🧭 CURRENT QUESTION TYPE:", currentQuestion?.type);
 
       // Preserve full backend payload so nested fields (like coding_challenge/test_cases) are available to the UI
       setCurrentQuestion({
@@ -229,6 +244,8 @@ export function useInterview() {
         const normalizedQuestion: InterviewQuestion = {
           questionId: backendId || `q_${Date.now()}`, // Fallback only if backend fails
           questionText: questionData.question || questionData.questionText || "",
+          type: normalizeType(questionData.type), 
+
           target_project: questionData.target_project,
           technology_focus: questionData.technology_focus,
           expectedAnswerType: question_data_or_default(questionData),
@@ -265,57 +282,58 @@ export function useInterview() {
   }
 
 const submitAnswer = useCallback(
-  async (candidateAnswerOrPayload: any, questionIdArg?: string) => {
-    setError(null);
-    setLastFeedback(null);
+    async (candidateAnswerOrPayload: any, questionIdArg?: string) => {
+      setError(null);
+      setLastFeedback(null);
 
-    if (!token) { setError("Please log in to submit an answer."); return null; }
-    if (!sessionId || !currentQuestion) { setError("Session not initialized or no active question"); return null; }
+      if (!token) { setError("Please log in to submit an answer."); return null; }
+      if (!sessionId || !currentQuestion) { setError("Session not initialized or no active question"); return null; }
 
-    setLoading(true);
-    try {
-      // Normalize incoming arg
-      let candidateAnswer: string;
-      let code_execution_result = null;
-      if (typeof candidateAnswerOrPayload === "string") {
-        candidateAnswer = candidateAnswerOrPayload;
-      } else {
-        // payload object from page
-        candidateAnswer = candidateAnswerOrPayload.answer || candidateAnswerOrPayload.candidateAnswer || "";
-        code_execution_result = candidateAnswerOrPayload.code_execution_result ?? null;
-      }
+      setLoading(true);
+      try {
+        // Normalize incoming arg
+        let candidateAnswer: string;
+        let code_execution_result = null;
+        if (typeof candidateAnswerOrPayload === "string") {
+          candidateAnswer = candidateAnswerOrPayload;
+        } else {
+          // payload object from page
+          candidateAnswer = candidateAnswerOrPayload.answer || candidateAnswerOrPayload.candidateAnswer || "";
+          code_execution_result = candidateAnswerOrPayload.code_execution_result ?? null;
+        }
 
-      const conv = buildConversationFromHistory();
-      conv.push({ role: "assistant", text: currentQuestion.questionText });
-      conv.push({ role: "user", text: candidateAnswer });
+        const conv = buildConversationFromHistory();
+        conv.push({ role: "assistant", text: currentQuestion.questionText });
+        conv.push({ role: "user", text: candidateAnswer });
 
-      const questionHistory = buildQuestionHistory();
+        const questionHistory = buildQuestionHistory();
 
-      const payload = {
-        sessionId,
-        qaId: currentQuestion.questionId,
-        questionId: currentQuestion.questionId,
-        questionText: currentQuestion.questionText,
-        ideal_outline: currentQuestion.ideal_outline || currentQuestion.ideal_answer_outline || "",
-        candidateAnswer,
-        candidate_answer: candidateAnswer,
-        resume_summary: resumeParsed?.summary || "",
-        retrieved_chunks: [],
-        conversation: conv,
-        question_history: questionHistory,
-        allow_pii: false,
-        // include code execution result if provided
-        code_execution_result,
-      };
+        const payload = {
+          sessionId,
+          qaId: currentQuestion.questionId,
+          questionId: currentQuestion.questionId,
+          questionText: currentQuestion.questionText,
+          ideal_outline: currentQuestion.ideal_outline || currentQuestion.ideal_answer_outline || "",
+          candidateAnswer,
+          candidate_answer: candidateAnswer,
+          resume_summary: resumeParsed?.summary || "",
+          retrieved_chunks: [],
+          conversation: conv,
+          question_history: questionHistory,
+          allow_pii: false,
+          // include code execution result if provided
+          code_execution_result,
+        };
+console.log("🚀 QUESTION HISTORY SENT TO BACKEND:", questionHistory);
 
-      const res = await fetch(`${API}/interview/answer`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
-        body: JSON.stringify(payload),
-      });
+        const res = await fetch(`${API}/interview/answer`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+          body: JSON.stringify(payload),
+        });
 
-      const body = await res.json();
-      if (!res.ok) throw new Error(body?.message || body?.error || JSON.stringify(body) || "Answer submit failed");
+        const body = await res.json();
+        if (!res.ok) throw new Error(body?.message || body?.error || JSON.stringify(body) || "Answer submit failed");
 
         // Parse result with multiple fallback paths
         const rawResult = body.result || body.validated || body;
@@ -333,7 +351,10 @@ const submitAnswer = useCallback(
           improvement: rawResult.improvement || rawResult.follow_up_probe,
           follow_up_probe: rawResult.follow_up_probe,
           ended: body.ended || rawResult.ended || false,
-          decision: body.decision || rawResult.decision,
+          
+          // 🚨 FIX 1: Map 'final_decision' from backend to 'decision' in frontend
+          decision: body.final_decision || body.decision || rawResult.decision,
+          
           in_gray_zone: body.in_gray_zone || rawResult.in_gray_zone || false,
           needs_human_review: body.needs_human_review || rawResult.needs_human_review || false
         };
@@ -355,7 +376,11 @@ const submitAnswer = useCallback(
 
         // Check if interview ended
         if (result.ended || body.is_final) {
-          const decision = result.decision || body.result?.parsed || body.decision;
+          // 🚨 FIX 2: Ensure we capture the decision object correctly here too
+          const decision = result.decision || body.final_decision || body.result?.parsed || body.decision;
+          
+          console.log("🏁 Interview Ended. Final Decision Data:", decision);
+          
           setFinalDecision(decision);
           setCurrentQuestion(null);
           setStage("done");
@@ -366,7 +391,7 @@ const submitAnswer = useCallback(
           // Debug: show raw next question (if any)
           console.log("🔥 submitAnswer: raw nextQuestionData:", nextQuestionData);
 
-          if (nextQuestionData) {
+          if (nextQuestionData && nextQuestionData.question !== "Interview Complete") {
             // FIX: Prioritize 'qaId' for the next question as well
             const backendId = nextQuestionData.qaId || nextQuestionData.questionId;
 
@@ -374,6 +399,8 @@ const submitAnswer = useCallback(
               questionId: backendId || `q_${Date.now()}`,
               questionText: nextQuestionData.question || nextQuestionData.questionText ||
                 nextQuestionData.followup_question || nextQuestionData.follow_up_question || "",
+              type: normalizeType(nextQuestionData.type), // 🔧 FIX
+
               target_project: nextQuestionData.target_project,
               technology_focus: nextQuestionData.technology_focus,
               expectedAnswerType: nextQuestionData.expected_answer_type || nextQuestionData.expectedAnswerType || "medium",
@@ -390,6 +417,10 @@ const submitAnswer = useCallback(
               coding_challenge: nextQuestionData.coding_challenge || nextQuestionData.challenge || nextQuestionData
             });
             setStage("running");
+          } else if (result.ended) {
+             // If backend says ended but we fell through here (safety net)
+             setStage("done");
+             setCurrentQuestion(null);
           } else {
             // No next question but not ended - treat as done
             setCurrentQuestion(null);
@@ -408,7 +439,6 @@ const submitAnswer = useCallback(
     },
     [sessionId, currentQuestion, buildConversationFromHistory, buildQuestionHistory, resumeParsed, token, getAuthHeaders]
   );
-
   const endInterview = useCallback(async (reason?: string, markRejected = false) => {
     setError(null);
 

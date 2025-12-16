@@ -73,7 +73,7 @@ const renderVerdictBadge = (verdict: string | undefined) => {
   };
 
   switch (verdict.toLowerCase()) {
-    case "strong hire":
+    case "strong":
     case "exceptional":
       style = {
         ...style,
@@ -162,6 +162,10 @@ export default function InterviewPage() {
 const [codeOutput, setCodeOutput] = useState<string | null>(null);
 const [codeStatus, setCodeStatus] = useState<"idle" | "running" | "success" | "error">("idle");
 const [executionResult, setExecutionResult] = useState<any>(null); // Store Piston result here
+const allTestsPassed =
+  executionResult?.summary &&
+  executionResult.summary.passed === executionResult.summary.total;
+
   // Violation state (UI)
   const [violationCount, setViolationCount] = useState(0);
   const [showViolationWarning, setShowViolationWarning] = useState(false);
@@ -185,6 +189,10 @@ const [executionResult, setExecutionResult] = useState<any>(null); // Store Pist
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [cameraPermissionRequested, setCameraPermissionRequested] = useState(false);
 
+const normalizeVerdict = (v?: string) => {
+  if (!v) return "pending";
+  return v.toLowerCase();
+};
 
   // Prefer a single API base env var (fallbacks supported)
   const API =
@@ -234,7 +242,10 @@ const buildTestCasesFromChallenge = (challenge: any) => {
     challenge?.test_cases,
     challenge?.tests,
     challenge?.cases,
-    (challenge?.examples || []).map((ex: any) => ({ input: ex.input, expected: ex.output })),
+    (challenge?.examples || []).map((ex: any) => ({ 
+      input: ex.input, 
+      expected: ex.output 
+    })),
   ].filter(Boolean);
 
   let rawCases: any[] = [];
@@ -245,198 +256,146 @@ const buildTestCasesFromChallenge = (challenge: any) => {
     }
   }
 
+  // Fallback: single test case from legacy fields
   if (rawCases.length === 0 && (challenge?.test_case_input || challenge?.test_case)) {
     rawCases.push({
       input: challenge?.test_case_input ?? challenge?.test_case,
-      expected: challenge?.expected_output ?? challenge?.test_case_expected ?? challenge?.expected,
+      expected: challenge?.expected_output ?? challenge?.expected ?? "",
     });
   }
 
+  // Last resort: empty test (prevents crash)
   if (rawCases.length === 0) {
-    // fallback smoke test (won't crash typical solutions)
     rawCases.push({ input: "[]", expected: "" });
   }
 
+  // Normalize to strings
   const normalized = rawCases.map((tc: any) => {
-    const inVal = tc.input;
     let inputStr: string;
+    const inVal = tc.input ?? tc.stdin ?? "";
+    
     if (typeof inVal === "object") {
-      try { inputStr = JSON.stringify(inVal); } catch (e) { inputStr = String(inVal); }
+      try { 
+        inputStr = JSON.stringify(inVal); 
+      } catch { 
+        inputStr = String(inVal); 
+      }
     } else {
-      inputStr = String(inVal ?? "");
+      inputStr = String(inVal);
     }
-    const expectedVal = tc.expected;
+
     let expectedStr: string;
-    if (typeof expectedVal === "object") {
-      try { expectedStr = JSON.stringify(expectedVal); } catch (e) { expectedStr = String(expectedVal); }
+    const expVal = tc.expected ?? tc.expected_output ?? tc.output ?? "";
+    
+    if (typeof expVal === "object") {
+      try { 
+        expectedStr = JSON.stringify(expVal); 
+      } catch { 
+        expectedStr = String(expVal); 
+      }
     } else {
-      expectedStr = String(expectedVal ?? "");
+      expectedStr = String(expVal);
     }
-    return { input: inputStr, expected: expectedStr, raw: tc };
+
+    return { 
+      input: inputStr, 
+      expected: expectedStr 
+    };
   });
 
   return normalized;
 };
-
 // --------------------- Replace existing handleRunCode with this ---------------------
 // paste this whole function to replace your existing handleRunCode
 const handleRunCode = async () => {
+  console.log("🔍 handleRunCode called");
+  console.trace();
+
   const codeToRun = answer.trim();
   if (!codeToRun) return;
 
-  // Defensive resolution for the coding challenge payload
   const challenge =
     currentQuestion?.coding_challenge ||
     currentQuestion?.raw?.coding_challenge ||
-    currentQuestion?.raw ||
-    (currentQuestion as any)?.challenge ||
     {};
 
-  // Normalize testcases
   const testsToRun = buildTestCasesFromChallenge(challenge);
+
+  console.log("📦 Sending", testsToRun.length, "test cases in ONE request");
 
   setCodeStatus("running");
   setCodeOutput(null);
   setExecutionResult(null);
 
-  const aggregatedResults: Array<any> = [];
-
-  // Determine whether server has authoritative tests
-  const willGrade = !!(
-    challenge &&
-    (challenge.test_cases ||
-      challenge.tests ||
-      challenge.cases ||
-      challenge.test_case_input ||
-      (challenge.examples && challenge.examples.length))
-  );
-
-  // helper to coerce server response into our result shape
-  const normalizeServerResponse = (data: any, tcIndex: number) => {
-    // Backend may return wrapper { success, results: [...] }
-    if (Array.isArray(data?.results) && data.results.length > 0) {
-      const r = data.results[tcIndex] ?? data.results[0];
-      return {
-        index: tcIndex,
-        input: r.input ?? r.stdin_received ?? testsToRun[tcIndex]?.input ?? "",
-        expected: r.expected ?? testsToRun[tcIndex]?.expected ?? "",
-        success: !!r.passed || !!r.success,
-        output: r.stdout ?? r.output ?? (r.raw?.output) ?? "",
-        raw: r,
-      };
-    }
-
-    // Or backend returns a single-result object { success, output, passed, raw_run... }
-    if (data) {
-      const success = !!data.passed || !!data.success;
-      const out = data.stdout ?? data.output ?? (data.raw?.output) ?? "";
-      return {
-        index: tcIndex,
-        input: testsToRun[tcIndex]?.input ?? "",
-        expected: testsToRun[tcIndex]?.expected ?? "",
-        success,
-        output: out,
-        raw: data,
-      };
-    }
-
-    // fallback
-    return {
-      index: tcIndex,
-      input: testsToRun[tcIndex]?.input ?? "",
-      expected: testsToRun[tcIndex]?.expected ?? "",
-      success: false,
-      output: "No output",
-      raw: data,
+  try {
+    const payload = {
+      language: (challenge.language || "python").toLowerCase(),
+      code: codeToRun,
+      test_cases: testsToRun,
     };
-  };
 
-  if (willGrade) {
-    // run each test and pass that test's stdin
-    for (let i = 0; i < testsToRun.length; i++) {
-      const tc = testsToRun[i];
-      try {
-        const payload = {
-          language: (challenge?.language || "python").toLowerCase(),
-          code: codeToRun,
-          stdin: tc.input,
-          expected_output: tc.expected,
-          test_cases: testsToRun,
-          // optionally: test_index: i
-        };
+    const res = await fetch(`${API}/run-code`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(payload),
+    });
 
-        // send run request
-        const res = await fetch(`${API}/run-code`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-          body: JSON.stringify(payload),
-        });
+    const data = await res.json();
+    console.log("📥 Raw backend response:", JSON.stringify(data, null, 2));
 
-        const data = await res.json().catch(() => ({ success: false, output: "Network Error" }));
+    /**
+     * ✅ CORRECT INTERPRETATION
+     * Backend structure:
+     * data.results[0].raw.results   -> actual per-test results
+     * data.results[0].raw.all_passed -> FINAL truth
+     */
 
-        // normalize into common object
-        const normalized = normalizeServerResponse(data, i);
+    const outer = data?.results?.[0];
+    const raw = outer?.raw;
 
-        aggregatedResults.push(normalized);
-        // incremental update so the UI shows progress
-        setExecutionResult({ cases: [...aggregatedResults] });
-      } catch (err: any) {
-        aggregatedResults.push({ index: i, input: tc.input, expected: tc.expected, success: false, output: `Client Error: ${err.message}` });
-        setExecutionResult({ cases: [...aggregatedResults] });
-      }
-    }
+    const rawResults = Array.isArray(raw?.results) ? raw.results : [];
 
-    const allPassed = aggregatedResults.length > 0 && aggregatedResults.every((r) => r.success);
+    const normalizedCases = rawResults.map((r: any, i: number) => ({
+      index: i,
+      input: r.input ?? "",
+      expected: r.expected ?? "",
+      output: r.stdout ?? "(no output)",
+      success: r.passed === true,
+    }));
+
+    const allPassed = raw?.all_passed === true;
+
+    setExecutionResult({
+      cases: normalizedCases,
+      summary: {
+        total: normalizedCases.length,
+        passed: normalizedCases.filter(c => c.success).length,
+      },
+    });
+
     setCodeStatus(allPassed ? "success" : "error");
 
     setCodeOutput(
-      aggregatedResults
-        .map((r) => `Test ${r.index + 1}: ${r.success ? "PASSED" : "FAILED"}\nInput: ${r.input}\nExpected: ${r.expected}\nGot: ${r.output}`)
+      normalizedCases
+        .map(
+          c =>
+            `Test ${c.index + 1}: ${c.success ? "✅ PASSED" : "❌ FAILED"}\n` +
+            `Input: ${c.input}\n` +
+            `Expected: ${c.expected}\n` +
+            `Got: ${c.output}`
+        )
         .join("\n\n")
     );
-
-    setExecutionResult({
-      cases: aggregatedResults,
-      summary: { total: aggregatedResults.length, passed: aggregatedResults.filter((r) => r.success).length },
-    });
-
-  } else {
-    // smoke run: send the first test (or empty) and show raw run output
-    const singleStdin = testsToRun[0]?.input ?? "";
-
-    try {
-      const payload = {
-        language: (challenge?.language || "python").toLowerCase(),
-        code: codeToRun,
-        stdin: singleStdin,
-        test_cases: testsToRun,
-      };
-
-      const res = await fetch(`${API}/run-code`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify(payload),
-      });
-
-      const data = await res.json().catch(() => ({ success: false, output: "Network Error" }));
-
-      // try to pull common fields
-      let out = data.output ?? data.stdout ?? (data.results && data.results[0] && (data.results[0].stdout ?? data.results[0].output)) ?? "No output";
-      const success = !!data.success || (data.results && data.results.every((r: any) => r.passed || r.success));
-
-      const singleResult = { index: 0, input: singleStdin, expected: null, success: !!success, output: String(out).trim(), raw: data };
-      setExecutionResult({ cases: [singleResult], summary: { total: 1, passed: singleResult.success ? 1 : 0 } });
-      setCodeStatus(singleResult.success ? "success" : "error");
-      setCodeOutput(`Raw Run${singleResult.success ? " (container success)" : ""}:\nInput: ${singleResult.input}\nOutput: ${singleResult.output}`);
-    } catch (err: any) {
-      setCodeStatus("error");
-      setCodeOutput(`Client Error: ${err.message}`);
-      setExecutionResult({ cases: [{ index: 0, success: false, output: `Client Error: ${err.message}` }], summary: { total: 1 } });
-    }
+  } catch (err: any) {
+    console.error("❌ Run code error:", err);
+    setCodeStatus("error");
+    setCodeOutput(`Network error: ${err.message}`);
+    setExecutionResult(null);
   }
 };
-
-
 
   /* -------------------------
       Violation wrapper (unchanged behavior)
@@ -768,8 +727,9 @@ const captureReferenceImage = useCallback(async () => {
 const captureFrameToDataUrl = useCallback(async (): Promise<string | null> => {
   const video = proctorVideoRef.current;
   const canvas = captureCanvasRef.current;
-  if (!video || !canvas) return null;
-
+if (!video || !canvas || video.readyState < 2) {
+      return null;
+    }
   // Wait for a frame
   const maxWait = 1500;
   const step = 100;
@@ -979,6 +939,7 @@ useEffect(() => {
       - Guarantees capture and check happens ONLY ONCE on the start click.
       - **CRITICAL:** Only proceeds to the backend call if `referenceImage` is available.
       -------------------------------------------------------------------------- */
+// REPLACE YOUR handleStart FUNCTION WITH THIS
 const handleStart = useCallback(
   async (
     firstArg: string | object | React.MouseEvent | undefined = "Technical Interview",
@@ -1019,18 +980,22 @@ const handleStart = useCallback(
       
       setFullscreenPromptVisible(false);
 
-      // STEP 3: Call backend (single call with registration)
+      // 🚨 CRITICAL FIX: Use the FULL CONTEXT if available, otherwise fallback to summary
+      // This sends the detailed projects/skills to the AI.
+      const richContext = (resumeParsed as any)?.full_context_for_prompt || resumeParsed?.summary || "";
+
+      // STEP 3: Call backend
       const startPayload: any = {
         jobTitle,
         difficulty,
         techStack,
-        resume_summary: resumeParsed?.summary || "",
+        resume_summary: richContext, // <--- NOW SENDING DETAILED DATA
         allow_pii: false,
         referenceImage: capturedImage,
       };
 
       const startUrl = `${API || ""}/interview/start`;
-      console.log("🚀 Starting interview with validated image...");
+      console.log("🚀 Starting interview with RICH CONTEXT payload...");
 
       const resp = await fetch(startUrl, {
         method: "POST",
@@ -1081,7 +1046,6 @@ const handleStart = useCallback(
         setCameraActive(true);
         
       } else {
-        // Backend returned error
         let body;
         try {
           body = await resp.json();
@@ -1095,21 +1059,12 @@ const handleStart = useCallback(
 
     } catch (e: any) {
       console.error("❌ Start error:", e);
-
       const displayError = e.message || String(e);
-      
-      // Provide helpful suggestions based on error
       let suggestion = "";
-      if (displayError.includes("dark")) {
-        suggestion = " Try turning on more lights.";
-      } else if (displayError.includes("bright")) {
-        suggestion = " Try reducing backlight or moving away from windows.";
-      } else if (displayError.includes("face")) {
-        suggestion = " Ensure your face is centered and clearly visible.";
-      } else if (displayError.includes("decode") || displayError.includes("format")) {
-        suggestion = " Camera issue detected. Try refreshing the page.";
-      }
-
+      if (displayError.includes("dark")) suggestion = " Try turning on more lights.";
+      else if (displayError.includes("bright")) suggestion = " Try reducing backlight.";
+      else if (displayError.includes("face")) suggestion = " Ensure your face is visible.";
+      
       setCameraError(displayError + suggestion);
       setImageStatus("error");
       stopCamera();
@@ -1889,25 +1844,19 @@ useEffect(() => {
         </div>
         
         {/* SUCCESS BADGE */}
-        {codeStatus === "success" && (
-          <span className="text-xs font-bold text-emerald-400 flex items-center gap-1 bg-emerald-400/10 px-2 py-1 rounded">
-            <CheckCircle size={12} /> Test Case Passed
-          </span>
-        )}
+        {codeStatus === "success" && allTestsPassed && (
+  <span className="text-xs font-bold text-emerald-400 flex items-center gap-1 bg-emerald-400/10 px-2 py-1 rounded">
+    <CheckCircle size={12} /> All Tests Passed
+  </span>
+)}
 
-        {/* WRONG ANSWER BADGE */}
-        {codeStatus === "error" && executionResult?.success && (
-          <span className="text-xs font-bold text-amber-400 flex items-center gap-1 bg-amber-400/10 px-2 py-1 rounded">
-             <AlertCircle size={12} /> Wrong Answer
-          </span>
-        )}
+{codeStatus === "error" && executionResult && !allTestsPassed && (
+  <span className="text-xs font-bold text-rose-400 flex items-center gap-1 bg-rose-400/10 px-2 py-1 rounded">
+    <XCircle size={12} /> Some Tests Failed
+  </span>
+)}
 
-        {/* RUNTIME ERROR BADGE */}
-        {codeStatus === "error" && !executionResult?.success && (
-          <span className="text-xs font-bold text-rose-400 flex items-center gap-1 bg-rose-400/10 px-2 py-1 rounded">
-            <XCircle size={12} /> Runtime Error
-          </span>
-        )}
+
       </div>
 
       <div className="bg-black/50 p-3 rounded-lg min-h-[80px] max-h-[200px] overflow-y-auto">
@@ -1921,7 +1870,7 @@ useEffect(() => {
         {/* OUTPUT DISPLAY */}
         {codeOutput && (
           <pre className={`whitespace-pre-wrap break-words font-mono text-xs md:text-sm ${
-             codeStatus === "error" && !executionResult?.success ? "text-rose-400" : "text-green-400"
+             codeStatus === "error" && !allTestsPassed ? "text-rose-400" : "text-green-400"
           }`}>
             {codeOutput}
           </pre>
@@ -2161,7 +2110,7 @@ useEffect(() => {
                                   Overall Score:
                                 </span>
                                 {renderScoreBadge(
-                                  h.result.score || h.result.overall_score
+                                  h.result.overall_score
                                 )}
                               </div>
 
