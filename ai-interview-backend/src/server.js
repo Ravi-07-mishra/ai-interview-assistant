@@ -139,7 +139,7 @@ async function callWithRetry(path, payload, opts = {}, attempts = 2, backoffMs =
   throw lastErr;
 }
 
-async function callAiGenerateQuestion(payload) { return callWithRetry("/generate_question", payload, {}, 2, 300); }
+async function callAiGenerateQuestion(payload) { return callWithRetry("/generate_question", payload, {}, 2, 600); }
 async function callAiScoreAnswer(payload) { return callWithRetry("/score_answer", payload, {}, 2, 300); }
 async function callAiProbe(payload) { return callWithRetry("/probe", payload, {}, 2, 300); }
 async function callAiFinalizeDecision(payload) { return callWithRetry("/finalize_decision", payload, {}, 2, 300); }
@@ -217,36 +217,51 @@ async function getQAByQaId(qaId) {
   return QA.findOne({ qaId }).lean();
 }
 
-async function buildQuestionHistory(sessionId) {
+async function buildQuestionHistory(sessionId, excludeQaId = null) {
   try {
-    // 🗑️ DELETE THE OLD BROKEN LOGIC:
-    // const sessionDoc = await Session.findOne({ sessionId }).lean();
-    // const qaIds = (sessionDoc.qaIds || [])...
+    const query = { sessionId: sessionId };
+    
+    // EXCLUDE the current question so AI doesn't see it as "history" with 0 score
+    if (excludeQaId) {
+        query.qaId = { $ne: excludeQaId };
+    }
 
-    // ✅ NEW ROBUST LOGIC: Query the QA table directly
-    // This works even if the Session.qaIds array is broken
-    const qaDocs = await QA.find({ sessionId: sessionId })
+    const qaDocs = await QA.find(query)
       .sort({ askedAt: 1 })
       .lean();
 
-    console.log(`📜 History built for ${sessionId}: ${qaDocs.length} items found.`);
+    console.log(`📜 History built for ${sessionId}: ${qaDocs.length} items found (excluded: ${excludeQaId}).`);
 
-    return qaDocs.map(r => ({
-      question: r.questionText,
-      questionText: r.questionText,
-      answer: r.candidateAnswer || "",
-      score: typeof r.score === "number" ? r.score : 0,
-      verdict: r.verdict || null,
-      ideal_outline: r.ideal_outline || "",
-      type: r.metadata?.type || "conceptual"
-    }));
+    return qaDocs.map(r => {
+      // --- HEURISTIC TYPE RECOVERY ---
+      let qType = r.metadata?.type;
+      
+      if (!qType || qType === "conceptual") {
+        const text = (r.questionText || "").toLowerCase();
+        if (r.expectedAnswerType === "code" || text.includes("function") || text.includes("code")) {
+          qType = "coding_challenge";
+        } else if (r.target_project || r.metadata?.target_project || text.includes("project")) {
+          qType = "project_discussion";
+        }
+      }
+      // -------------------------------
+
+      return {
+        question: r.questionText,
+        questionText: r.questionText,
+        answer: r.candidateAnswer || "",
+        score: typeof r.score === "number" ? r.score : 0,
+        verdict: r.verdict || null,
+        ideal_outline: r.ideal_outline || "",
+        type: qType || "conceptual",
+        target_project: r.metadata?.target_project || r.target_project || null 
+      };
+    });
   } catch (error) {
     console.error("❌ Error building history:", error);
     return [];
   }
 }
-
-
 // ---------------- AUTH MIDDLEWARE ----------------
 // verifyToken is expected to behave like express middleware (req, res, next)
 function requireAuth(req, res, next) {
@@ -720,70 +735,57 @@ app.post("/interview/answer", requireAuth, async (req, res) => {
     const { sessionId, qaId, questionId, questionText } = req.body || {};
     const userId = req.userId || null;
 
-    // --- FIX: UNIFIED VARIABLE NAME 'candidateAnswer' ---
-    let candidateAnswerRaw = req.body.candidateAnswer || req.body.candidate_answer;
-    
-    // 1. Initialize the unified variable
-    let candidateAnswer = ""; 
-    
-    // 2. Metadata defaults
+    // --- UNIFIED VARIABLE NAME ---
+    let candidateAnswerRaw =
+      req.body.candidateAnswer || req.body.candidate_answer;
+
+    let candidateAnswer = "";
     let questionType = req.body.question_type || "text";
     let codeExecutionResult = req.body.code_execution_result || null;
 
-    // 3. Extraction Logic
-    if (typeof candidateAnswerRaw === 'object' && candidateAnswerRaw !== null) {
-        console.log("📦 Detected nested answer object, extracting fields...");
-        candidateAnswer = candidateAnswerRaw.answer || candidateAnswerRaw.candidateAnswer || "";
-        
-        if (candidateAnswerRaw.question_type) questionType = candidateAnswerRaw.question_type;
-        if (candidateAnswerRaw.code_execution_result) codeExecutionResult = candidateAnswerRaw.code_execution_result;
+    if (typeof candidateAnswerRaw === "object" && candidateAnswerRaw !== null) {
+      candidateAnswer =
+        candidateAnswerRaw.answer ||
+        candidateAnswerRaw.candidateAnswer ||
+        "";
+      if (candidateAnswerRaw.question_type)
+        questionType = candidateAnswerRaw.question_type;
+      if (candidateAnswerRaw.code_execution_result)
+        codeExecutionResult = candidateAnswerRaw.code_execution_result;
     } else {
-        candidateAnswer = String(candidateAnswerRaw || "");
+      candidateAnswer = String(candidateAnswerRaw || "");
     }
-    // --- END FIX ---
 
-    if (!sessionId) {
-      console.error("❌ Missing sessionId");
+    if (!sessionId)
       return res.status(400).json({ error: "missing sessionId" });
-    }
-    if (!qaId && !questionId) {
-      console.error("❌ Missing qaId/questionId");
+    if (!qaId && !questionId)
       return res.status(400).json({ error: "missing qaId or questionId" });
-    }
 
-    // find QA
+    // Find QA
     let qaRec = null;
     if (qaId) qaRec = await getQAByQaId(qaId);
     else qaRec = await QA.findOne({ questionId, sessionId }).lean();
 
-    if (!qaRec) {
-      console.error("❌ QA record not found:", qaId || questionId);
+    if (!qaRec)
       return res.status(404).json({ error: "qa_record_not_found" });
-    } 
 
-    console.log("📝 Found QA record:", qaRec.qaId);
-    const semanticType = qaRec.metadata?.type || "conceptual";
-const uiType = qaRec.expectedAnswerType || "text";
-
-
-    // Save answer text (Using the unified variable)
+    // Save answer
     await updateQARecordDB(qaRec.qaId, {
-      candidateAnswer: candidateAnswer, // <--- UPDATED THIS LINE
-      answeredAt: new Date()
+      candidateAnswer,
+      answeredAt: new Date(),
     });
-
 
     // Build history
     const questionHistory = await buildQuestionHistory(sessionId);
-    
-    // Build score payload
+
+    // Score payload
     const scorePayload = {
       request_id: uuidv4(),
       session_id: sessionId,
       user_id: userId || "anonymous",
       question_text: questionText || qaRec.questionText,
       ideal_outline: qaRec.ideal_outline || "",
-      candidate_answer: candidateAnswer, // <--- UPDATED THIS LINE
+      candidate_answer: candidateAnswer,
       resume_summary: req.body.resume_summary || "",
       retrieved_chunks: req.body.retrieved_chunks || [],
       question_history: questionHistory,
@@ -791,283 +793,253 @@ const uiType = qaRec.expectedAnswerType || "text";
       allow_pii: !!req.body.allow_pii,
       options: { temperature: 0.0 },
       question_type: questionType,
-      code_execution_result: codeExecutionResult
+      code_execution_result: codeExecutionResult,
     };
 
     const aiScoreResp = await callAiScoreAnswer(scorePayload);
-    // normalize AI score fields (support both snake_case and camelCase)
-    const validated = aiScoreResp.validated || aiScoreResp.validation || {};
-    const overallScore = validated.overall_score ?? validated.score ?? (validated.overallScore ?? 0);
-    const rubricScores = validated.dimension_scores || validated.rubric_scores || validated.dimensionScores || null;
-    const verdict = validated.verdict || "weak";
-    const confidence = validated.confidence ?? 0.5;
+    const validated = aiScoreResp.validated || aiScoreResp.validation || {};
+    const overallScore =
+      validated.overall_score ?? validated.score ?? 0;
 
-    console.log("📊 Score received:", overallScore);
+    console.log("📊 Score received:", overallScore);
 
-    // Update QA with score and normalized fields
-    const scoreUpdate = {
-      gradedBy: "llm",
-      score: overallScore,
-      rubricScores,
-      verdict,
-      confidence,
-      rationale: validated.rationale || aiScoreResp.rationale || "",
-      improvement: validated.mentor_tip || validated.follow_up_probe || null, // Check for mentor_tip from AI service
-      red_flags_detected: validated.red_flags_detected || validated.redFlagsDetected || [],
-      missing_elements: validated.missing_elements || validated.missingElements || [],
-      needsHumanReview: aiScoreResp.needs_human_review || aiScoreResp.needsHumanReview || aiScoreResp.in_gray_zone || aiScoreResp.inGrayZone || false,
-      gradedAt: new Date(),
-      metadata: {
-        ai_parse_ok: !!aiScoreResp.parse_ok,
-        in_gray_zone: aiScoreResp.in_gray_zone || aiScoreResp.inGrayZone || false
-      }
-    };
-    await updateQARecordDB(qaRec.qaId, scoreUpdate);
-console.log("🔄 Refreshing history with latest scores...");
+    // Update QA with score
+    const scoreUpdate = {
+      gradedBy: "llm",
+      score: overallScore,
+      rubricScores: validated.dimension_scores,
+      verdict: validated.verdict || "weak",
+      confidence: validated.confidence ?? 0.5,
+      rationale:
+        validated.rationale || aiScoreResp.rationale || "",
+      improvement:
+        validated.mentor_tip ||
+        validated.follow_up_probe ||
+        null,
+      red_flags_detected:
+        validated.red_flags_detected || [],
+      missing_elements:
+        validated.missing_elements || [],
+      needsHumanReview: aiScoreResp.in_gray_zone || false,
+      gradedAt: new Date(),
+      metadata: {
+        ...qaRec.metadata,
+        ai_parse_ok: !!aiScoreResp.parse_ok,
+        in_gray_zone: aiScoreResp.in_gray_zone || false,
+      },
+    };
+
+    await updateQARecordDB(qaRec.qaId, scoreUpdate);
+
+    console.log("🔄 Refreshing history with latest scores...");
     const updatedHistory = await buildQuestionHistory(sessionId);
-    // Update history array for decision making
-    
-    // Decision & next question
-    let nextQuestion = null;
-    let ended = false;
-    let performanceMetrics = null;
-let modelDecision = null;
 
-    try {
-      const decisionPayload = {
-        request_id: uuidv4(),
-        session_id: sessionId,
-        user_id: userId || "anonymous",
-        resume_summary: req.body.resume_summary || "",
-        conversation: req.body.conversation || [],
-        question_history: updatedHistory,
-        retrieved_chunks: req.body.retrieved_chunks || [],
-        token_budget: 800,
-        allow_pii: !!req.body.allow_pii,
-        accept_model_final: true
-      };
+    let nextQuestion = null;
+    let ended = false;
+    let performanceMetrics = null;
+    let modelDecision = null;
 
-      const finalizeResp = await callAiFinalizeDecision(decisionPayload);
-      const decisionResult = finalizeResp.result || finalizeResp;
-      performanceMetrics = finalizeResp.performance_metrics || finalizeResp.performanceMetrics || null;
+    try {
+      const decisionPayload = {
+        request_id: uuidv4(),
+        session_id: sessionId,
+        user_id: userId || "anonymous",
+        resume_summary: req.body.resume_summary || "",
+        conversation: req.body.conversation || [],
+        question_history: updatedHistory,
+        retrieved_chunks: req.body.retrieved_chunks || [],
+        token_budget: 800,
+        allow_pii: !!req.body.allow_pii,
+        accept_model_final: true,
+      };
 
-      const isFinal = finalizeResp.is_final || finalizeResp.isFinal || false;
-modelDecision = decisionResult?.parsed || decisionResult?.decision || decisionResult;
-      if (isFinal && modelDecision && modelDecision.ended) {
-        ended = true;
-        console.log("🏁 Interview ended by model decision:", modelDecision.verdict);
+      const finalizeResp = await callAiFinalizeDecision(decisionPayload);
+      const decisionResult =
+        finalizeResp.result || finalizeResp;
 
-        const decisionDoc = await Decision.create({
-          decisionId: uuidv4(),
-          sessionId,
-          decidedBy: "model",
-          verdict: modelDecision.verdict,
-          confidence: modelDecision.confidence || 0.5,
-          reason: modelDecision.reason || "",
-          recommended_role: modelDecision.recommended_role || modelDecision.recommendedRole || null,
-          key_strengths: modelDecision.key_strengths || modelDecision.keyStrengths || [],
-          critical_weaknesses: modelDecision.critical_weaknesses || modelDecision.criticalWeaknesses || [],
-          rawModelOutput: decisionResult,
-          performanceMetrics,
-          decidedAt: new Date()
-        });
+      performanceMetrics =
+        finalizeResp.performance_metrics || null;
 
-        await markSessionCompletedDB(sessionId, {
-          finalDecisionRef: decisionDoc._id,
-          performanceMetrics
-        });
-      }
-    } catch (e) {
-      console.warn("⚠️ Decision check failed:", e?.message || e);
-    }
+      modelDecision =
+        decisionResult?.parsed || decisionResult;
 
-    // If not ended, generate probe or followup
-    if (!ended) {
-      try {
-        const inGrayZone = aiScoreResp.in_gray_zone || aiScoreResp.inGrayZone || false;
-        const shouldProbe = inGrayZone || (scoreUpdate.score < 0.60 && scoreUpdate.score >= 0.30);
+      if (
+        finalizeResp.is_final &&
+        modelDecision &&
+        modelDecision.ended
+      ) {
+        ended = true;
 
-    if (shouldProbe && (validated.follow_up_probe || scoreUpdate.improvement)) {
-  console.log("🔍 Generating probe question");
-  const probePayload = {
-    request_id: uuidv4(),
-    session_id: sessionId,
-    user_id: userId || "anonymous",
-    weakness_topic: validated.missing_elements?.[0] || "the previous topic",
-    prev_question: qaRec.questionText,
-    prev_answer: candidateAnswer,
-    resume_summary: req.body.resume_summary || "",
-    retrieved_chunks: req.body.retrieved_chunks || [],
-    conversation: req.body.conversation || [],
-    token_budget: 600,
-    allow_pii: !!req.body.allow_pii
-  };
+        const decisionDoc = await Decision.create({
+          decisionId: uuidv4(),
+          sessionId,
+          decidedBy: "model",
+          verdict: modelDecision.verdict,
+          confidence: modelDecision.confidence || 0.5,
+          reason: modelDecision.reason || "",
+          recommended_role:
+            modelDecision.recommended_role,
+          key_strengths:
+            modelDecision.key_strengths || [],
+          critical_weaknesses:
+            modelDecision.critical_weaknesses || [],
+          rawModelOutput: decisionResult,
+          performanceMetrics,
+          decidedAt: new Date(),
+        });
 
-  try {
-    const probeResp = await callAiProbe(probePayload);
-    const parsed = probeResp.parsed || {};
-    const probeQuestion = parsed.probe_question || validated.follow_up_probe || scoreUpdate.improvement || "Can you provide a specific code example or pseudocode for how you implemented that?";
-
-    // Create QA using probeQuestion (defensive defaults)
-    const newQa = await createQARecordDB(
-      sessionId,
-      probeQuestion,
-      parsed.ideal_answer_outline || parsed.ideal_outline || "",
-      (parsed.type === "coding_challenge" ? "code" : (parsed.expected_answer_type || "text"))
-,
-      parsed.difficulty || "medium",
-      userId,
-      {
-        target_project: parsed.target_project || null,
-        technology_focus: parsed.technology_focus || null,
-        red_flags: parsed.red_flags || [],
-         type: inferSemanticType(parsed)
-
-
+        await markSessionCompletedDB(sessionId, {
+          finalDecisionRef: decisionDoc._id,
+          performanceMetrics,
+        });
       }
-    );
+    } catch (e) {
+      console.warn("⚠️ Decision check failed:", e.message);
+    }
 
-    nextQuestion = {
-      qaId: newQa.qaId,
-      questionId: newQa.questionId,
-      questionText: newQa.questionText,
-      target_project: parsed.target_project || null,
-      technology_focus: parsed.technology_focus || null,
-      expectedAnswerType: newQa.expectedAnswerType || parsed.type || "text",
-      difficulty: newQa.difficulty || parsed.difficulty || "medium",
-      ideal_outline: newQa.ideal_outline || parsed.ideal_answer_outline || "",
-      coding_challenge: parsed.coding_challenge || null
-    };
-  } catch (probeErr) {
-    // Non-fatal: fall back to safe follow-up question instead of ending interview
-    console.warn("⚠️ Probe generation failed (non-fatal):", probeErr?.message || probeErr);
+    // ================= NEXT QUESTION =================
+    if (!ended) {
+      try {
+        const inGrayZone = aiScoreResp.in_gray_zone || false;
 
-    const fallbackQ = validated.follow_up_probe || scoreUpdate.improvement || "Can you elaborate on your approach with a specific example?";
+        const shouldProbe = inGrayZone === true;
 
-    const newQa = await createQARecordDB(
-      sessionId,
-      fallbackQ,
-      (probeErr && probeErr.parsed && (probeErr.parsed.ideal_answer_outline || probeErr.parsed.ideal_outline)) || "",
-      "text",
-      "medium",
-      userId,
-      {
-    target_project: null,
-    technology_focus: null,
-    red_flags: [],
-    type: "conceptual"   // explicit
+        if (
+          shouldProbe &&
+          (validated.follow_up_probe ||
+            scoreUpdate.improvement)
+        ) {
+          const probePayload = {
+            request_id: uuidv4(),
+            session_id: sessionId,
+            user_id: userId || "anonymous",
+            weakness_topic:
+              validated.missing_elements?.[0] ||
+              "the previous topic",
+            prev_question: qaRec.questionText,
+            prev_answer: candidateAnswer,
+            resume_summary:
+              req.body.resume_summary || "",
+            token_budget: 600,
+            allow_pii: !!req.body.allow_pii,
+          };
+
+          const probeResp = await callAiProbe(probePayload);
+          const parsedProbe = probeResp.parsed || {};
+
+          const newQa = await createQARecordDB(
+            sessionId,
+            parsedProbe.probe_question ||
+              "Can you explain your approach?",
+            parsedProbe.ideal_answer_outline || "",
+            parsedProbe.type === "coding_challenge"
+              ? "code"
+              : "text",
+            parsedProbe.difficulty || "medium",
+            userId,
+            {
+              ...qaRec.metadata,
+              is_probe: true,
+              probe_parent_qaId: qaRec.qaId,
+            }
+          );
+
+          nextQuestion = {
+            qaId: newQa.qaId,
+            questionId: newQa.questionId,
+            questionText: newQa.questionText,
+            expectedAnswerType:
+              newQa.expectedAnswerType,
+            difficulty: newQa.difficulty,
+            is_probe: true,
+          };
+        } else {
+          const genPayload = {
+            request_id: uuidv4(),
+            session_id: sessionId,
+            user_id: userId || "anonymous",
+            mode: "next",
+            resume_summary:
+              req.body.resume_summary || "",
+            question_history: updatedHistory,
+            token_budget: 1500,
+            allow_pii: !!req.body.allow_pii,
+            options: { temperature: 0.1 },
+          };
+
+          const genResp =
+            await callAiGenerateQuestion(genPayload);
+          const parsedNext = genResp.parsed || {};
+
+          const newQa = await createQARecordDB(
+            sessionId,
+            parsedNext.question,
+            parsedNext.ideal_answer_outline || "",
+            parsedNext.type === "coding_challenge"
+              ? "code"
+              : "text",
+            parsedNext.difficulty || "medium",
+            userId,
+            {
+              target_project:
+                parsedNext.target_project,
+              technology_focus:
+                parsedNext.technology_focus,
+              type: inferSemanticType(parsedNext),
+              is_probe: false,
+            }
+          );
+
+          nextQuestion = {
+            qaId: newQa.qaId,
+            questionId: newQa.questionId,
+            questionText: newQa.questionText,
+            expectedAnswerType:
+              newQa.expectedAnswerType,
+            coding_challenge:
+              parsedNext.coding_challenge || null,
+            is_probe: false,
+          };
+        }
+      } catch (e) {
+        console.warn(
+          "⚠️ Next question generation failed:",
+          e.message
+        );
+        ended = true;
+      }
+    }
+
+    // ================= RESPONSE =================
+    return res.json({
+      validated: {
+        overall_score: overallScore,
+        verdict: validated.verdict,
+      },
+      result: {
+        score: overallScore,
+        verdict: validated.verdict,
+      },
+      nextQuestion,
+      ended,
+      is_final: ended,
+      final_decision: ended ? modelDecision : null,
+      needs_human_review: scoreUpdate.needsHumanReview,
+      in_gray_zone: scoreUpdate.metadata.in_gray_zone,
+      probe_decision: {
+        was_authorized: !!nextQuestion?.is_probe,
+        python_gray_zone_flag: aiScoreResp.in_gray_zone,
+        current_question_count:
+          updatedHistory.length + 1,
+      },
+    });
+  } catch (err) {
+    console.error("❌ /interview/answer failed:", err);
+    return res.status(500).json({
+      error: "internal_server_error",
+      message: err.message,
+    });
   }
-    );
-
-    nextQuestion = {
-      qaId: newQa.qaId,
-      questionId: newQa.questionId,
-      questionText: newQa.questionText,
-      expectedAnswerType: newQa.expectedAnswerType,
-      difficulty: newQa.difficulty,
-      ideal_outline: newQa.ideal_outline
-    };
-  }
-} else {
-  // existing follow-up generation (unchanged)
-  console.log("➡️ Generating follow-up question");
-  const genPayload = {
-    request_id: uuidv4(),
-    session_id: sessionId,
-    user_id: userId || "anonymous",
-    mode: "followup",
-    resume_summary: req.body.resume_summary || "",
-    retrieved_chunks: req.body.retrieved_chunks || [],
-    conversation: req.body.conversation || [],
-question_history: updatedHistory,
-    token_budget: 1500,
-    allow_pii: !!req.body.allow_pii,
-    options: { temperature: 0.1 }
-  };
-
-          const genResp = await callAiGenerateQuestion(genPayload);
-          const parsed = genResp.parsed || {};
-console.log("🐍 RAWR PYTHON RESPONSE:", JSON.stringify(parsed, null, 2));
-          const qText = parsed.question || parsed.followup_question ||
-            "Can you elaborate on your approach with a specific example?";
-let nextType = parsed.expected_answer_type || "medium";
-if (parsed.type === "coding_challenge") {
-    nextType = "code";
-}
-
-          const newQa = await createQARecordDB(
-            sessionId,
-            qText,
-            parsed.ideal_answer_outline || parsed.ideal_outline || "",
-            nextType,
-            parsed.difficulty || "hard",
-            userId,
-            {
-              target_project: parsed.target_project,
-              technology_focus: parsed.technology_focus,
-              red_flags: parsed.red_flags || [],
-type: inferSemanticType(parsed)
-            }
-          );
-
-          nextQuestion = {
-            qaId: newQa.qaId,
-            questionId: newQa.questionId,
-            questionText: newQa.questionText,
-            target_project: parsed.target_project,
-            technology_focus: parsed.technology_focus,
-            expectedAnswerType: newQa.expectedAnswerType,
-            difficulty: newQa.difficulty,
-            ideal_outline: newQa.ideal_outline,
-coding_challenge: parsed.coding_challenge || null
-          };
-        }
-      } catch (e) {
-        console.warn("⚠️ Next question generation failed:", e?.message || e);
-        ended = true;
-      }
-    }
-
-    // Return latest QA
-    const latestQa = await getQAByQaId(qaRec.qaId);
-
-    const result = {
-      overall_score: latestQa?.score ?? 0,
-      score: latestQa?.score ?? 0,
-      dimension_scores: latestQa?.rubricScores ?? null,
-      rubricScores: latestQa?.rubricScores ?? null,
-      verdict: latestQa?.verdict ?? "weak",
-      confidence: latestQa?.confidence ?? 0.5,
-      rationale: latestQa?.rationale ?? "",
-      red_flags_detected: latestQa?.red_flags_detected ?? [],
-      missing_elements: latestQa?.missing_elements ?? [],
-      improvement: latestQa?.improvement ?? null,
-      follow_up_probe: latestQa?.improvement ?? null,
-    };
-
-    console.log("✅ Answer processed successfully");
-
-    return res.json({
-      validated: result,
-      result,
-      nextQuestion,
-      ended,
-      is_final: ended,
-final_decision: ended ? modelDecision : null,
-      performance_metrics: performanceMetrics,
-      needs_human_review: latestQa?.needsHumanReview || false,
-      in_gray_zone: latestQa?.metadata?.in_gray_zone || false
-    });
-
-  } catch (err) {
-    console.error("❌ Interview answer error:", err?.message || err);
-    console.error(err?.stack || "");
-    const details = err?.response?.data ?? err?.message ?? String(err);
-    return res.status(500).json({
-      error: "failed_to_score_answer",
-      details: process.env.NODE_ENV === "production" ? undefined : details
-    });
-  }
 });
 
 // Record a violation
@@ -1257,99 +1229,80 @@ app.get("/admin/session/:id", requireAuth, async (req, res) => {
 // Proctoring endpoint (face verification)
 // Proctoring endpoint (face verification + object detection)
 // Proctoring endpoint (face verification + object detection)
+// Proctoring endpoint (face verification + object detection)
 app.post("/interview/proctor", requireAuth, async (req, res) => {
     try {
         const { sessionId, image } = req.body;
         if (!sessionId || !image) return res.status(400).json({ error: "Missing data" });
 
-        // Optimization: We verify the session exists, but we don't need to fetch the 
-        // heavy referenceFace string anymore since Python has it cached.
         const session = await Session.findOne({ sessionId }).select("sessionId metadata").lean();
-        
         if (!session) return res.status(404).json({ error: "Session not found" });
 
+        // Basic sanity check
         if (!isValidDataImage(image, 300)) {
             return res.json({ status: "warning", message: "Live frame invalid" });
         }
 
-        // --- Registration Fallback Logic (Kept as requested) ---
-        if (!session.metadata?.referenceFace) {
-            // ... (Your existing late registration code) ...
-        }
-        // -----------------------------------------------------------------
-
         try {
             // ============================================================
-            // UPDATE: Send session_id so Python uses cached embedding.
-            // DO NOT send reference_image.
+            // 1. CALL AI SERVICE (now returns 200 OK for violations too)
             // ============================================================
             const verifyPayload = {
                 session_id: sessionId, 
                 current_image: AI_EXPECTS_RAW_BASE64 ? stripDataPrefix(image) : image
             };
 
-            // 1. CALL AI SERVICE
-            // If Python returns 200 OK, it means "Verified: True"
+            // This will now SUCCEED (200 OK) even if face verification fails
             const aiResponse = await aiClient.post("/verify_face", verifyPayload, { timeout: 10000 });
-            
-            // Success path
-            const { distance } = aiResponse.data;
-            return res.json({ status: "success", verified: true, distance });
+            const data = aiResponse.data;
 
-        } catch (aiErr) {
-            // 2. HANDLE VIOLATIONS (Python returns 400 Bad Request)
-            if (aiErr.response && aiErr.response.status === 400) {
-                const data = aiErr.response.data;
-                const violationType = data.violation_type;
+            // ============================================================
+            // 2. CHECK FOR VIOLATIONS IN THE 200 RESPONSE
+            // ============================================================
+            if (data.verified === false) {
+                const violationType = data.violation_type || "unknown_violation";
                 const errorMsg = data.error || "Verification failed";
 
-                // Define which types count as DB violations
-                const VIOLATION_TYPES = [
-                    "face_mismatch", 
-                    "no_face_detected", 
-                    "prohibited_object", 
-                    "multiple_people"
-                ];
-
-                if (VIOLATION_TYPES.includes(violationType)) {
-                    
-                    // Format a readable reason for the database
-                    let dbReason = errorMsg;
-                    if (violationType === "prohibited_object") {
-                        const items = data.objects ? data.objects.join(", ") : "unknown object";
-                        dbReason = `Prohibited object detected: ${items}`;
-                    } else if (violationType === "multiple_people") {
-                        dbReason = `Multiple people detected (${data.person_count || 2} found)`;
-                    } else if (violationType === "face_mismatch") {
-                        dbReason = `Unauthorized face detected (Distance: ${data.distance?.toFixed(4)})`;
-                    }
-
-                    console.log(`⚠️ VIOLATION RECORDED (${violationType}): ${dbReason}`);
-
-                    // 3. RECORD IN MONGODB
-                    await Session.updateOne(
-                        { sessionId },
-                        {
-                            $inc: { violationCount: 1 },
-                            $push: { events: {
-                                id: uuidv4(),
-                                type: violationType,
-                                reason: dbReason,
-                                at: new Date()
-                            }}
-                        }
-                    );
-
-                    // 4. FORWARD ERROR TO FRONTEND
-                    return res.status(400).json(data);
+                // Format a readable reason for the database
+                let dbReason = errorMsg;
+                if (violationType === "prohibited_object") {
+                    const items = data.objects ? data.objects.join(", ") : "unknown object";
+                    dbReason = `Prohibited object detected: ${items}`;
+                } else if (violationType === "multiple_people") {
+                    dbReason = `Multiple people detected (${data.person_count || 2} found)`;
+                } else if (violationType === "face_mismatch") {
+                    dbReason = `Unauthorized face detected (Distance: ${data.distance?.toFixed(4)})`;
                 }
-                
-                // If it's a 400 but not a standard violation (e.g. "Image decode failed")
-                return res.status(400).json(data);
+
+                console.log(`⚠️ VIOLATION RECORDED (${violationType}): ${dbReason}`);
+
+                // 3. RECORD IN MONGODB
+                await Session.updateOne(
+                    { sessionId },
+                    {
+                        $inc: { violationCount: 1 },
+                        $push: { events: {
+                            id: uuidv4(),
+                            type: violationType,
+                            reason: dbReason,
+                            at: new Date()
+                        }}
+                    }
+                );
+
+                // 4. RETURN 200 OK TO FRONTEND (With verified: false)
+                // This prevents the frontend from freaking out and retrying
+                return res.json(data);
             }
 
-            // 3. HANDLE NETWORK/SERVER ERRORS (500/502)
+            // Success path (Verified: True)
+            return res.json({ status: "success", verified: true, distance: data.distance });
+
+        } catch (aiErr) {
+            // 5. REAL ERRORS (Network/Crash)
             console.error("❌ AI Service Error:", aiErr.message);
+            
+            // Only return 502 if the AI service is actually down/crashing
             return res.status(502).json({ 
                 status: "failed", 
                 verified: false, 

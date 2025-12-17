@@ -510,7 +510,7 @@ const reportViolationWrapper = useCallback(
       });
     }, 1000);
   },
-  [reportViolation, sessionId, endInterview, stopCamera, showViolationWarning]
+  [reportViolation, sessionId, endInterview, stopCamera]
 );
 
   useEffect(() => {
@@ -901,7 +901,7 @@ useEffect(() => {
   return () => {
     if (proctorInterval) window.clearInterval(proctorInterval);
   };
-}, [stage, cameraActive, sessionId, token, API, captureFrameToDataUrl, reportViolationWrapper, showViolationWarning]);
+}, [stage, cameraActive, sessionId, token, API, captureFrameToDataUrl]);
 
   /* -------------------------
       Fullscreen helpers (unchanged)

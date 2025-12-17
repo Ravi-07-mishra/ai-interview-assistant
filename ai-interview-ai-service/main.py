@@ -97,7 +97,16 @@ INTERVIEW_MODELS = [
     # Reasoner: Good for scoring/decisions (DeepSeek R1 Distill)
     "deepseek/deepseek-r1-distill-llama-70b",
 ]
-
+INTERVIEW_FLOW = [
+    "project_discussion",  # Q1: Warm up with their best project
+    "experience",          # Q2: Verify work history (or Core Concept if fresher)
+    "coding_challenge",    # Q3: DSA Check 1 (Arrays/Strings)
+    "project_discussion",  # Q4: Deep dive into a DIFFERENT project
+    "coding_challenge",    # Q5: DSA Check 2 (Trees/HashMaps)
+    "achievement",         # Q6: Behavioral/Achievement check
+    "coding_challenge",    # Q7: Final Complexity Check (Optional)
+    "conceptual"           # Q8+: System Design / filler
+]
 
 TERMINATION_RULES = {
     "instant_fail_threshold": 0.20,
@@ -107,8 +116,8 @@ TERMINATION_RULES = {
     "excellence_count": 3,
     
     # 👇 ADD THIS LINE (Fixes the 500 Crash) 👇
-    "max_questions": 10,
-    
+    "max_questions": len(INTERVIEW_FLOW) + 3,
+
     "min_confidence_to_end": 0.85,
     "max_questions_soft_limit": 9,
     "gray_zone_min": 0.40,
@@ -277,29 +286,67 @@ def compute_similarity(text1: str, text2: str) -> float:
 def get_diverse_question_hint(history: List[Dict[str, Any]], required_type: str) -> str:
     """
     Generates STRICT constraints to prevent topic repetition.
-    Extracts key technical terms from recent questions and FORBIDS them.
+    NOW: Detects probe patterns and FORCES topic switch after 1 probe.
     """
     if not history:
         return "STARTING INTERVIEW: Scan the resume. Identify the MOST COMPLEX project or skill listed and start there."
     
-    # Extract significant words from the last 6 questions (increased from 5)
+    # ==============================================================================
+    # 1. ENHANCED STAGNATION DETECTION (CATCHES PROBE LOOPS)
+    # ==============================================================================
+    pivot_instruction = ""
+    
+    # A. Detect Probe Pattern (Last 2 questions are similar)
+    if len(history) >= 2:
+        last_q = history[-1].get("question", "")
+        prev_q = history[-2].get("question", "")
+        
+        similarity = compute_similarity(last_q, prev_q)
+        
+        # If similarity > 0.25, we JUST probed. MANDATORY SWITCH.
+        if similarity > 0.25:
+            pivot_instruction += f"""
+🚨 PROBE LOOP DETECTED (Similarity: {similarity:.2f})
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MANDATORY ACTION: COMPLETE TOPIC SWITCH
+- The last question was ALREADY a follow-up/probe
+- You MUST ask about a COMPLETELY DIFFERENT topic now
+- Switch category entirely (e.g., Project → DSA, DSA → Experience)
+- DO NOT reference anything from the last 2 questions
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
+    # B. Detect Chronic Weakness (Last answer scored low)
+    last_entry = history[-1]
+    last_score = last_entry.get("score")
+    
+    if last_score is not None and float(last_score) < 0.50:
+        pivot_instruction += f"""
+⚠️ LOW SCORE DETECTED ({float(last_score):.2f})
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Candidate struggled with this topic
+- Give them a FRESH START on a different area
+- DO NOT drill deeper into this weakness
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
+    # ==============================================================================
+    # 2. EXISTING LOGIC: EXTRACT FORBIDDEN WORDS (Preserved)
+    # ==============================================================================
     recent_words = set()
     recent_questions_text = []
     
     for h in history[-6:]:
         q = h.get("question", "").lower()
-        recent_questions_text.append(q[:100])  # Store for full-text check
+        recent_questions_text.append(q[:100])
         
-        # Capture key technical terms (words > 4 chars, excluding common words)
         words = re.findall(r'\b[a-z]{5,}\b', q)
-        
-        # Filter out generic interview words
         stopwords = {'would', 'could', 'should', 'please', 'explain', 'describe', 
-                     'implement', 'create', 'write', 'function', 'method', 'class'}
+                     'implement', 'create', 'write', 'function', 'method', 'class', 
+                     'what', 'how', 'when', 'why'}
         technical_words = [w for w in words if w not in stopwords]
-        recent_words.update(technical_words[:15])  # Increased from 8
+        recent_words.update(technical_words[:15])
     
-    # Extract specific topics/technologies mentioned
     tech_patterns = [
         r'\b(python|java|javascript|react|node|sql|aws|docker|kubernetes)\b',
         r'\b(machine learning|deep learning|neural network|nlp|cnn|lstm)\b',
@@ -313,14 +360,20 @@ def get_diverse_question_hint(history: List[Dict[str, Any]], required_type: str)
         matches = re.findall(pattern, combined_history)
         mentioned_techs.update(matches)
     
-    # Build negative constraints (what NOT to ask about)
     forbidden_list = list(recent_words)[:12] + list(mentioned_techs)[:8]
     
     hint = f"\n⛔ ABSOLUTE PROHIBITION - DO NOT ASK ABOUT:\n"
     hint += f"   Topics: {', '.join(forbidden_list)}\n"
     hint += f"   Context: These were ALREADY covered in previous questions.\n"
     
-    # Add positive constraints based on question type
+    # ==============================================================================
+    # 3. MERGE: PREPEND PIVOT INSTRUCTION (Most Important)
+    # ==============================================================================
+    hint = pivot_instruction + hint
+
+    # ==============================================================================
+    # 4. TYPE CONSTRAINTS (Preserved)
+    # ==============================================================================
     if required_type == "project_discussion":
         hint += "\n🎯 MANDATORY REQUIREMENTS:\n"
         hint += "   1. Pick a DIFFERENT project than previously discussed\n"
@@ -900,57 +953,51 @@ def validate_and_fix_test_cases(
     reference_code: str,
     language: str = "python"
 ) -> List[Dict[str, str]]:
-    """🔧 IMPROVED: Better stub detection and validation"""
-    
-    # Check if reference_code is just a stub
-    is_stub = (
-        not reference_code or
-        reference_code.strip() == "" or
-        len(reference_code.strip().split('\n')) <= 3 or
-        reference_code.strip().endswith("pass") or
-        "pass" in reference_code and "def" in reference_code and reference_code.count('\n') <= 5
-    )
-    
-    if is_stub:
-        logger.warning("Reference code is a stub, trusting LLM test cases")
-        # Return original test cases but ensure they're properly formatted
-        fixed = []
-        for tc in test_cases:
-            inp = str(tc.get("input", ""))
-            exp = str(tc.get("expected", ""))
-            if inp or exp:  # At least one must be present
-                fixed.append({"input": inp, "expected": exp})
-        return fixed[:3]  # Max 3 test cases
+    """
+    HARD VALIDATION:
+    - Execute reference code for each test case
+    - Replace expected output with execution output
+    - Drop invalid test cases
+    """
 
-    # If we have real reference code, validate by execution
-    fixed = []
+    validated = []
+
     for tc in test_cases:
-        inp = tc.get("input", "")
-        expected_from_llm = tc.get("expected", "")
+        raw_input = tc.get("input", "")
+        if raw_input is None:
+            continue
 
+        # 🔥 Execute reference solution
         result = run_code_in_sandbox(
             language=language,
             code=reference_code,
-            stdin=inp
+            stdin=raw_input
         )
 
+        # ❌ If execution failed → INVALID TEST CASE
         if not result.get("success"):
-            logger.warning(f"Test case execution failed for input '{inp}': {result.get('error_type')}")
-            # Keep the LLM's expected output if execution failed
-            fixed.append({
-                "input": inp,
-                "expected": expected_from_llm
-            })
             continue
 
-        # Use execution output as ground truth
-        stdout = str(result.get("output", "")).strip()
-        fixed.append({
-            "input": inp,
-            "expected": stdout
+        output = str(result.get("output", "")).strip()
+
+        # ❌ Empty output → INVALID
+        if output == "":
+            continue
+
+        validated.append({
+            "input": str(raw_input),
+            "expected": output
         })
 
-    return fixed[:3] 
+    # ❌ If fewer than 2 valid cases → reject question
+    if len(validated) < 2:
+        raise HTTPException(
+            status_code=422,
+            detail="Reference solution could not validate enough test cases"
+        )
+
+    return validated[:3]  # cap for UI
+
 
 def extract_projects_smart(resume_text: str) -> List[Dict[str, Any]]:
     """
@@ -1179,11 +1226,15 @@ def build_generate_question_prompt(
     resume = context.get("resume", "")
     history = context.get("history", []) or []
     
-    # 1. Build STRICT history context
-    recent_q_text = "\n".join([
-        f"Q{i+1}: {h.get('question','')[:120]}" 
-        for i, h in enumerate(history[-6:])
-    ])
+    # 1. Build STRICT history context with Status Tags
+    # This helps the LLM see if the previous topic was a failure
+    recent_q_text_list = []
+    for i, h in enumerate(history[-6:]):
+        score = h.get("score", 1.0)
+        status = "PASSED" if score >= 0.5 else "FAILED"
+        recent_q_text_list.append(f"Q{i+1} [{status}]: {h.get('question','')[:120]}")
+        
+    recent_q_text = "\n".join(recent_q_text_list)
     
     diversity_hint = get_diverse_question_hint(history, required_type)
     difficulty_level = state.difficulty_level if state else "medium"
@@ -1193,9 +1244,15 @@ def build_generate_question_prompt(
     history_blob = " ".join([h.get("question", "").lower() for h in history])
     covered_projects = state.covered_projects if state else set()
 
+    # Identify LAST project discussed to prevent immediate re-selection
+    last_project_id = None
+    if history:
+        last_project_id = history[-1].get("target_project")
+
     available_projects = [
         p for p in projects 
         if p["project_id"] not in covered_projects 
+        and p["project_id"] != last_project_id # <--- Added: Force switch if we just discussed this
         and p["title"].lower()[:15] not in history_blob
     ]
     
@@ -1204,8 +1261,12 @@ def build_generate_question_prompt(
         if available_projects:
             target_project = random.choice(available_projects)
         elif projects:
-            # Force a different angle on a revisited project
-            target_project = random.choice(projects)
+            # Force a different angle on a revisited project, but try to avoid the very last one
+            candidates = [p for p in projects if p["project_id"] != last_project_id]
+            if candidates:
+                target_project = random.choice(candidates)
+            else:
+                target_project = random.choice(projects)
     
     # 3. Universal Strategy Controller with Resume Validation
     project_focus = "" 
@@ -1350,16 +1411,16 @@ OUTPUT FORMAT (JSON ONLY, NO MARKDOWN):
   "type": "{required_type}",
   "target_project": "{target_project['project_id'] if target_project else 'general'}",
   "difficulty": "{difficulty_level}",
-  "coding_challenge": {{  // ONLY include if type is coding_challenge
+  "coding_challenge": {{
       "language": "python",
-      "starter_code": "def function_name(params):\\n    pass",
+     "starter_code": "def function_name(params):\n    # TODO: Implement this function\n    pass",
+      "reference_solution": "def function_name(params):\\n    # FULL WORKING SOLUTION REQUIRED FOR VALIDATION\\n    return result",
       "test_cases": [
-         {{"input": "\\"json_value\\"", "expected": "\\"expected_output\\""}},
-         {{"input": "\\"different_input\\"", "expected": "\\"different_output\\""}}
+          {{"input": "\\"json_value\\"", "expected": "\\"expected_output\\""}},
+          {{"input": "\\"different_input\\"", "expected": "\\"different_output\\""}}
       ]
   }}
 }}
-
 🚨 FINAL CHECK: Re-read the PREVIOUS QUESTIONS section. Is your new question about the SAME topic? If yes, CHANGE IT.
 """
     return prompt.strip()
@@ -2298,73 +2359,55 @@ class InterviewState:
     # =====================================================
     def next_question_type(self) -> str:
         """
-        Determines the NEXT question type.
-        This function is deterministic and enforces curriculum coverage.
+        Determines the NEXT question type based on INTERVIEW_FLOW.
+        Robustly handles probes by 'consuming' them into the current stage.
         """
+        history_indices_used = set()
+        
+        # Iterate through the required stages defined in Config
+        for stage_type in INTERVIEW_FLOW:
+            found_match = False
+            
+            # Look through history to see if this stage has been completed
+            for i, h in enumerate(self.history):
+                if i in history_indices_used:
+                    continue # This question was already assigned to a previous stage
 
-        total_q = len(self.history)
-        if self.section_counts["dsa"] == 0 and len(self.history) >= 2:
-            return "coding_challenge"
+                q_type = h.get("type", "conceptual")
+                
+                # CHECK: Does this history item match the required stage?
+                # We also treat "conceptual" as a wildcard/fallback if the flow asks for 
+                # "experience" or "achievement" but the user didn't have any (fallback logic).
+                match = (q_type == stage_type) or \
+                        (stage_type == "experience" and q_type == "conceptual") or \
+                        (stage_type == "achievement" and q_type == "conceptual")
 
-        dsa = self.section_counts["dsa"]
-        proj = self.section_counts["projects"]
-        exp = self.section_counts["experience"]
-        ach = self.section_counts["achievements"]
+                if match:
+                    found_match = True
+                    history_indices_used.add(i)
+                    
+                    # 💡 ABSORB PROBES: 
+                    # If the VERY NEXT question in history is the SAME type, 
+                    # it is a probe/follow-up. Mark it as used for this stage too.
+                    next_idx = i + 1
+                    if next_idx < len(self.history):
+                        next_q = self.history[next_idx]
+                        # If the next question is the same type (or a conceptual fallback), absorb it
+                        next_type = next_q.get("type", "conceptual")
+                        if next_type == q_type:
+                            history_indices_used.add(next_idx)
+                    
+                    # We found the question that satisfies this Stage.
+                    # Stop searching history and move to the next Stage in INTERVIEW_FLOW.
+                    break 
+            
+            # If we completed the inner loop and DID NOT find a match in history,
+            # then THIS is the stage we need to do now.
+            if not found_match:
+                return stage_type
 
-        uncovered_projects = [
-            p for p in self.projects
-            if p["project_id"] not in self.covered_projects
-        ]
-
-        # -------------------------------------------------
-        # ROUND-BASED GUARANTEES (Q1–Q5)
-        # -------------------------------------------------
-        if total_q == 0:
-            return "project_discussion"            # Q1
-
-        if total_q == 1:
-            return "experience" if self.has_work_experience else "conceptual"
-
-        if total_q == 2:
-            return "coding_challenge"              # DSA-1
-
-        if total_q == 3:
-            return "project_discussion" if uncovered_projects else "conceptual"
-
-        if total_q == 4:
-            return "coding_challenge"              # DSA-2 (hard guarantee)
-        if total_q == 5:
-            if self.has_achievements and self.section_counts["achievements"] == 0:
-                return "achievement"
-            # If no achievements, or already asked, fallback to project/conceptual
-            return "project_discussion" if uncovered_projects else "conceptual"
-        # -------------------------------------------------
-        # DYNAMIC PHASE (Q6+)
-        # -------------------------------------------------
-
-        # 1️⃣ HARD GUARANTEE: minimum 2 DSA
-        if dsa < 2:
-            return "coding_challenge"
-
-        # 2️⃣ Cover remaining projects (cap at 3)
-        if uncovered_projects and proj < 3:
-            return "project_discussion"
-
-        # 3️⃣ Force experience exactly once
-        if self.has_work_experience and exp == 0:
-            return "experience"
-
-        # 4️⃣ Force achievements exactly once
-        if ach < 1:
-            return "achievement"
-
-        # 5️⃣ Optional third DSA for long interviews
-        if total_q >= 7 and dsa < 3:
-            return "coding_challenge"
-
-        # 6️⃣ Safe fallback
+        # Fallback if flow is exhausted
         return "conceptual"
-
     # =====================================================
     # 🧩 HELPERS
     # =====================================================
@@ -2608,28 +2651,43 @@ def generate_question(req: GenerateQuestionRequest):
         candidate["type"] = required_type
 
         # 🔒 Coding challenge enforcement
+# 🔒 Coding challenge enforcement
         if required_type == "coding_challenge":
             cc = candidate.get("coding_challenge", {})
             tcs = cc.get("test_cases", [])
-
+            
+            # 1. Structural Check (Keep this to ensure frontend doesn't crash)
             if (
-                not isinstance(tcs, list)
-                or len(tcs) < 2
+                not isinstance(tcs, list) 
+                or len(tcs) < 2 
                 or any("input" not in tc or "expected" not in tc for tc in tcs)
             ):
                 try:
                     enforce_test_cases_for_challenge(
-                        parsed=candidate,
-                        resp_raw=raw,
+                        parsed=candidate, 
+                        resp_raw=raw, 
                         original_prompt=prompt
                     )
+                    cc = candidate["coding_challenge"]  # 🔥 re-fetch after repair
+                    tcs = cc.get("test_cases", [])
                 except HTTPException:
-                    continue
+                    logger.warning("Failed to repair structure. Retrying...")
+                    continue  # reject question
+            
+            # 2. ⚠️ VALIDATION REMOVED: Trust the LLM directly
+            # We are NOT running the reference solution anymore. 
+            # This prevents the "failing on validation" error.
+            
+            cc["test_cases"] = tcs[:3]
 
+            # Security: Remove the solution so the user doesn't see it
+            if "reference_solution" in cc:
+                del cc["reference_solution"]
+        
+        # ✅ SUCCESS: Accept the candidate
         parsed = candidate
         chosen_raw = raw
         break
-
     # =====================================================
     # 4. FALLBACK (RARE, SAFE)
     # =====================================================
@@ -2658,8 +2716,15 @@ def generate_question(req: GenerateQuestionRequest):
             # Use a specialized prompt to get just the test cases
             starter = cc.get("starter_code", "def solve(x):\n    pass")
             repaired_tcs = generate_missing_test_cases(q_text, starter)
-            
-            if repaired_tcs and len(repaired_tcs) >= 1:
+            try:
+                repaired_tcs = repaired_tcs[:3]
+    
+            except HTTPException:
+                parsed = FALLBACK_QUESTIONS["coding_challenge"].copy()
+
+                parsed["_is_fallback"] = True
+
+            if repaired_tcs and len(repaired_tcs) >= 2:
                 cc["test_cases"] = repaired_tcs
                 # Fix legacy fields for frontend compatibility
                 cc["test_case_input"] = repaired_tcs[0]["input"]
@@ -2669,9 +2734,11 @@ def generate_question(req: GenerateQuestionRequest):
             else:
                 # If repair fails, DOWNGRADE to conceptual so the app doesn't crash
                 logger.warning("❌ Repair failed. Downgrading question to 'conceptual'.")
-                parsed["type"] = "conceptual"
+                parsed = FALLBACK_QUESTIONS["coding_challenge"].copy()
+
                 # Remove the broken coding_challenge object
-                parsed.pop("coding_challenge", None)
+                parsed["_is_fallback"] = True
+
     if parsed["type"] == "coding_challenge":
         cc = parsed.setdefault("coding_challenge", {})
         cc.setdefault("language", "python")
@@ -2706,13 +2773,13 @@ def generate_question(req: GenerateQuestionRequest):
 def run_code(req: CodeSubmissionRequest):
     import json, re
 
-    # 1. NORMALIZE INPUT
+    # ---------- 1. NORMALIZE STDIN ----------
     if isinstance(req.stdin, (list, dict)):
         req.stdin = json.dumps(req.stdin)
     elif req.stdin is None:
         req.stdin = ""
 
-    # 2. NORMALIZE TEST CASES
+    # ---------- 2. NORMALIZE TEST CASES ----------
     clean_test_cases = []
     for tc in req.test_cases or []:
         inp = tc.get("input") or tc.get("stdin") or tc.get("test_case_input") or ""
@@ -2721,7 +2788,7 @@ def run_code(req: CodeSubmissionRequest):
 
     final_code = req.code
 
-    # 3. DRIVER INJECTION (PYTHON)
+    # ---------- 3. DRIVER INJECTION (PYTHON ONLY) ----------
     if (
         req.language.lower() == "python"
         and "def " in final_code
@@ -2739,30 +2806,28 @@ def _parse_input(raw):
     raw = raw.strip()
     if raw == "":
         return None
-
     try:
         return json.loads(raw)
     except:
         return raw
 
-
 if __name__ == "__main__":
     try:
         raw_input = sys.stdin.read()
         input_data = _parse_input(raw_input)
-        
+
         sig = inspect.signature({target_func})
         params = list(sig.parameters)
 
+        # ---------- STRICT & DETERMINISTIC DISPATCH ----------
         if len(params) == 0:
             result = {target_func}()
-        elif isinstance(input_data, list) and len(params) > 1:
-            if len(input_data) == len(params):
-                 result = {target_func}(*input_data)
-            else:
-                 result = {target_func}(input_data)
-        else:
+        elif len(params) == 1:
             result = {target_func}(input_data)
+        else:
+            if not isinstance(input_data, list):
+                raise ValueError("Expected list input for multiple parameters")
+            result = {target_func}(*input_data)
 
         if result is None:
             print("null")
@@ -2771,16 +2836,20 @@ if __name__ == "__main__":
                 print(json.dumps(result))
             except:
                 print(json.dumps(str(result)))
+
     except Exception as e:
         print("DRIVER_ERROR")
         print(json.dumps({{"error": str(e), "traceback": traceback.format_exc()}}))
 '''
         final_code += "\n\n" + driver
 
-    # 4. SELECT TEST CASES
-    cases_to_run = clean_test_cases or [{"input": req.stdin or "", "expected": req.expected_output or ""}]
+    # ---------- 4. SELECT TEST CASES ----------
+    cases_to_run = clean_test_cases or [{
+        "input": req.stdin or "",
+        "expected": req.expected_output or ""
+    }]
 
-    # 5. EXECUTION LOOP
+    # ---------- 5. EXECUTION LOOP ----------
     results = []
     all_passed = True
 
@@ -2789,13 +2858,10 @@ if __name__ == "__main__":
             return None
         if isinstance(val, str):
             v = val.strip()
-            # Try direct JSON
             try:
                 return json.loads(v)
             except:
                 pass
-            # Try wrapping in brackets (Comma separated outputs)
-            # 👇 THIS WAS THE BUGGY PART - CHANGED 'raw' TO 'v' 👇
             try:
                 return json.loads(f"[{v}]")
             except:
@@ -2821,7 +2887,6 @@ if __name__ == "__main__":
             if run_result.get("success") and c_expected != "":
                 norm_out = normalize(stdout)
                 norm_exp = normalize(c_expected)
-                # Compare normalized values or their string representations
                 passed = (norm_out == norm_exp) or (str(norm_out) == str(norm_exp))
 
         if not passed:
@@ -2841,6 +2906,7 @@ if __name__ == "__main__":
         "all_passed": all_passed,
         "results": results
     }
+
 @app.post("/interview/register-face")
 async def register_face(request: FaceRegisterRequest):
     """
@@ -2970,9 +3036,9 @@ def score_answer(req: ScoreAnswerRequest):
             resp = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,  # Low temp = faster caching
+                temperature=0.1,
                 max_tokens=1500,
-                response_format={"type": "json_object"} # <--- CRITICAL FOR SPEED
+                response_format={"type": "json_object"}
             )
             raw_text = resp.choices[0].message.content
             parsed = extract_json_from_text(raw_text)
@@ -3064,7 +3130,9 @@ def score_answer(req: ScoreAnswerRequest):
     incoming_history = payload.get("question_history", []) or []
     current_q_count = len(incoming_history) + 1
 
-    # 🛑 ANTI-LOOP MECHANISM START 🛑
+    # ========================================================================
+    # 🛑 ENHANCED ANTI-LOOP MECHANISM (MAX 1 PROBE PER TOPIC)
+    # ========================================================================
     
     # 1. Calculate raw Gray Zone status
     raw_in_gray_zone = (
@@ -3073,25 +3141,79 @@ def score_answer(req: ScoreAnswerRequest):
         and TERMINATION_RULES["gray_zone_min"] <= validated["overall_score"] <= TERMINATION_RULES["gray_zone_max"]
     )
     
-    # 2. Check history to suppress consecutive probes
-    final_in_gray_zone = raw_in_gray_zone
+    # 2. STRICT PROBE SUPPRESSION LOGIC
+    final_in_gray_zone = False  # Default: NO PROBE
     
     if raw_in_gray_zone and incoming_history:
-        # Get the score of the immediately preceding question
-        prev_entry = incoming_history[-1]
-        prev_score = prev_entry.get("score")
-        
-        if prev_score is not None:
-            try:
-                p_val = float(prev_score)
-                # If the previous question's score was ALSO in the gray zone, we assume 
-                # we just asked a probe. Don't probe again.
-                if TERMINATION_RULES["gray_zone_min"] <= p_val <= TERMINATION_RULES["gray_zone_max"]:
-                    logger.info(f"🛑 Anti-Loop Triggered: Previous score ({p_val:.2f}) was also Gray. Suppressing probe.")
+        # ====================================================================
+        # RULE 1: Check if we JUST asked a similar question (Probe Detection)
+        # ====================================================================
+        if len(incoming_history) >= 2:
+            last_q = incoming_history[-1].get("question", "").lower()
+            prev_q = incoming_history[-2].get("question", "").lower()
+            
+            similarity = compute_similarity(last_q, prev_q)
+            
+            # If questions are >25% similar, we JUST probed. STOP.
+            if similarity > 0.25:
+                logger.info(f"🛑 Anti-Loop Rule 1: Question similarity {similarity:.2f} > 0.25. NO PROBE.")
+                final_in_gray_zone = False
+            
+            # ================================================================
+            # RULE 2: Check Topic Overlap (Prevent drilling same concept)
+            # ================================================================
+            elif similarity <= 0.25:
+                # Extract technical topics from both questions
+                last_topics = extract_question_topics(last_q)
+                prev_topics = extract_question_topics(prev_q)
+                
+                # If >50% topic overlap, we're beating a dead horse
+                if last_topics and prev_topics:
+                    overlap_ratio = len(last_topics & prev_topics) / max(len(last_topics), 1)
+                    if overlap_ratio > 0.5:
+                        logger.info(f"🛑 Anti-Loop Rule 2: Topic overlap {overlap_ratio:.2f} > 0.5. NO PROBE.")
+                        final_in_gray_zone = False
+                    else:
+                        # ONLY allow probe if BOTH similarity AND topic overlap are low
+                        final_in_gray_zone = True
+                        logger.info(f"✅ Probe allowed: similarity={similarity:.2f}, topic_overlap={overlap_ratio:.2f}")
+                else:
+                    # If we can't extract topics, err on the side of NO PROBE
                     final_in_gray_zone = False
-            except Exception:
-                pass
-    # 🛑 ANTI-LOOP MECHANISM END 🛑
+        
+        # ====================================================================
+        # RULE 3: Check if Previous Answer was ALSO Weak (Consecutive Weakness)
+        # ====================================================================
+        if final_in_gray_zone:  # Only check if not already suppressed
+            prev_score = incoming_history[-1].get("score")
+            if prev_score is not None:
+                try:
+                    prev_val = float(prev_score)
+                    # If last question was ALSO in gray zone, candidate is stuck. Move on.
+                    if TERMINATION_RULES["gray_zone_min"] <= prev_val <= TERMINATION_RULES["gray_zone_max"]:
+                        logger.info(f"🛑 Anti-Loop Rule 3: Previous score {prev_val:.2f} was also gray. NO PROBE.")
+                        final_in_gray_zone = False
+                except Exception:
+                    pass
+        
+        # ====================================================================
+        # RULE 4: Hard Limit - Never Probe After Question 5
+        # ====================================================================
+        if final_in_gray_zone and current_q_count > 5:
+            logger.info(f"🛑 Anti-Loop Rule 4: Question #{current_q_count} > 5. NO MORE PROBES.")
+            final_in_gray_zone = False
+    
+    # ========================================================================
+    # 3. DEBUGGING LOG (Shows why decision was made)
+    # ========================================================================
+    logger.info(
+        f"Probe Decision | Q#{current_q_count} | Score: {validated['overall_score']:.2f} | "
+        f"Raw Gray Zone: {raw_in_gray_zone} | Final Probe: {final_in_gray_zone}"
+    )
+    
+    # ========================================================================
+    # END ANTI-LOOP MECHANISM
+    # ========================================================================
 
     return {
         "request_id": payload["request_id"],
@@ -3101,10 +3223,12 @@ def score_answer(req: ScoreAnswerRequest):
         "validated": validated,
         "parse_ok": parsed is not None,
         "needs_human_review": needs_review,
-        "source": used_source,  # Debugging help
-        "in_gray_zone": final_in_gray_zone, # Uses the suppressed value if loop detected
+        "source": used_source,
+        "in_gray_zone": final_in_gray_zone,  # Uses the suppressed value
         "redaction_log": redaction_log
     }
+
+
 @app.post("/probe")
 def probe(req: ProbeRequest):
     """Generate diagnostic probe question for weak/vague answers"""
@@ -3327,12 +3451,12 @@ from scipy.spatial.distance import cosine # <--- ADD THIS IMPORT
 def verify_face(req: FaceVerificationRequest):
     """
     MTCNN Verification:
-    - Uses 'mtcnn' backend: A 3-stage deep learning detector.
-    - Stage 3 explicitly verifies facial landmarks, so notebooks/books are rejected.
-    - More reliable than OpenCV, faster than RetinaFace.
+    - Returns 200 OK for violations (so frontend handles them as valid checks).
+    - Returns 400 only for session/image errors.
     """
     # 1. Validate Session
     if req.session_id not in FACE_DB:
+        # This is a setup error, so 400 is appropriate here
         return JSONResponse(status_code=400, content={"verified": False, "error": "Session not found."})
 
     reference_embedding = FACE_DB[req.session_id]["embedding"]
@@ -3345,23 +3469,20 @@ def verify_face(req: FaceVerificationRequest):
     # =========================================================================
     # CHECK 1: COUNT FACES with MTCNN
     # =========================================================================
-    # MTCNN is very strict. It requires eyes/nose/mouth to confirm a face.
     try:
         face_objs = DeepFace.extract_faces(
             img_path=img2,
-            detector_backend="mtcnn",   # <--- SWAPPED TO MTCNN
+            detector_backend="mtcnn",   # Strict detector
             enforce_detection=False,    # Don't crash if 0 faces
             align=True
         )
         
-        # MTCNN confidence scores are usually very reliable.
-        # We filter out anything below 0.8 to be safe against shadows.
+        # Filter low confidence (ghost faces)
         valid_faces = [f for f in face_objs if f.get('confidence', 0) > 0.80]
         face_count = len(valid_faces)
         
     except Exception as e:
         logger.error(f"MTCNN error: {e}")
-        # If MTCNN fails (e.g. image too small), we default to 0 to be safe
         face_count = 0
 
     # =========================================================================
@@ -3369,7 +3490,6 @@ def verify_face(req: FaceVerificationRequest):
     # =========================================================================
     detected_items = []
     try:
-        # We ONLY use YOLO for phones, not for counting people/faces
         results = object_model(img2, verbose=False, conf=0.40)
         PROHIBITED_CLASSES = {67: "cell phone"} 
         
@@ -3383,36 +3503,40 @@ def verify_face(req: FaceVerificationRequest):
         logger.warning(f"Object detection skipped: {e}")
 
     # =========================================================================
-    # DECISION LOGIC
+    # DECISION LOGIC (UPDATED: Return Dicts = 200 OK)
     # =========================================================================
     
     # 1. Check Multiple People
     if face_count > 1:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "verified": False,
-                "violation_type": "multiple_people",
-                "error": "Multiple people detected",
-                "person_count": face_count,
-                "details": f"MTCNN detected {face_count} distinct faces."
-            }
-        )
+        return {
+            "verified": False,
+            "violation_type": "multiple_people",
+            "error": "Multiple people detected",
+            "person_count": face_count,
+            "details": f"MTCNN detected {face_count} distinct faces."
+        }
     
     # 2. Check Objects
     if detected_items:
-        return JSONResponse(status_code=400, content={"verified": False, "violation_type": "prohibited_object", "objects": detected_items, "error": "Prohibited object detected"})
+        return {
+            "verified": False, 
+            "violation_type": "prohibited_object", 
+            "objects": detected_items, 
+            "error": "Prohibited object detected"
+        }
 
     # 3. Check No Face
     if face_count == 0:
-         return JSONResponse(status_code=400, content={"verified": False, "error": "No face detected", "violation_type": "no_face_detected"})
+         return {
+             "verified": False, 
+             "error": "No face detected", 
+             "violation_type": "no_face_detected"
+         }
 
     # =========================================================================
     # CHECK 3: IDENTITY MATCH (VGG-Face via MTCNN)
     # =========================================================================
     try:
-        # We use the same backend to ensure alignment consistency
-        # We assume the valid face found above is the one we want to check
         embedding_objs = DeepFace.represent(
             img_path=img2,
             model_name="VGG-Face",
@@ -3420,7 +3544,6 @@ def verify_face(req: FaceVerificationRequest):
             enforce_detection=True
         )
         
-        # Take the most confident face (DeepFace usually sorts by size/confidence)
         current_embedding = embedding_objs[0]["embedding"]
         
         distance = cosine(reference_embedding, current_embedding)
@@ -3428,11 +3551,20 @@ def verify_face(req: FaceVerificationRequest):
         if distance <= STRICT_DISTANCE_THRESHOLD:
             return {"verified": True, "distance": distance}
         else:
-            return JSONResponse(status_code=400, content={"verified": False, "distance": distance, "error": "Face mismatch", "violation_type": "face_mismatch"})
+            # Return 200 OK with verified=False
+            return {
+                "verified": False, 
+                "distance": distance, 
+                "error": "Face mismatch", 
+                "violation_type": "face_mismatch"
+            }
 
     except Exception as e:
-        # If verify fails despite finding a face earlier, it's usually an alignment edge case
-        return JSONResponse(status_code=500, content={"verified": False, "error": f"Identity check failed: {str(e)}"})
+        # Return 200 with error so frontend doesn't crash
+        return {
+            "verified": False, 
+            "error": f"Identity check failed: {str(e)}"
+        }
 def health():
     return {"status": "healthy", "model": GROQ_MODEL}
 
