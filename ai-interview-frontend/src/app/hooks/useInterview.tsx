@@ -295,7 +295,27 @@ console.log("🧭 CURRENT QUESTION TYPE:", currentQuestion?.type);
   function question_data_or_default(q: any) {
     return q.expected_answer_type || q.expectedAnswerType || "medium";
   }
-
+const fetchHint = useCallback(async (questionText: string, type: string) => {
+    if (!sessionId || !token || !currentQuestion?.questionId) return null;
+    
+    try {
+      const res = await fetch(`${API}/interview/hint`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+        body: JSON.stringify({ 
+            sessionId, 
+            questionId: currentQuestion.questionId,
+            questionText,
+            type 
+        })
+      });
+      const data = await res.json();
+      return data.hint;
+    } catch (e) {
+      console.error("Hint fetch error:", e);
+      return null;
+    }
+  }, [sessionId, token, currentQuestion, getAuthHeaders]);
 const submitAnswer = useCallback(
   async (candidateAnswerOrPayload: any, questionIdArg?: string) => {
     setError(null);
@@ -548,5 +568,6 @@ const submitAnswer = useCallback(
     reportViolation,      // <-- expose this so components can call it directly if needed
     setResumeParsed,
     setError,
+    fetchHint,
   };
 }

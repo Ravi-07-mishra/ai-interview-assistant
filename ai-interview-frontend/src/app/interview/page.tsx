@@ -5,6 +5,8 @@ import ResumeUploader from "../resume/page";
 import { useInterview } from "../hooks/useInterview";
 import { useAuth } from "../context/AuthContext";
 import Link from "next/link";
+import jsPDF from "jspdf";
+import autoTable from "jspdf-autotable";
 import Editor from "@monaco-editor/react";
 import {
   Sparkles,
@@ -20,7 +22,9 @@ import {
   XCircle,
   HelpCircle,
   Lightbulb,
-  Loader2, // Added for loading indicator
+  Loader2,
+  FileText, // <--- NEW
+  ArrowRight // <--- NEW // Added for loading indicator
 } from "lucide-react";
 
 /* -------------------------
@@ -154,6 +158,7 @@ export default function InterviewPage() {
     endInterview,
     reportViolation,
     sessionId,
+    fetchHint
   } = useInterview();
 
   const { token } = useAuth();
@@ -165,6 +170,8 @@ const [executionResult, setExecutionResult] = useState<any>(null); // Store Pist
 const [currentRound, setCurrentRound] = useState<string>("screening");
 const [roundProgress, setRoundProgress] = useState<any>(null);
 const [isProbeQuestion, setIsProbeQuestion] = useState(false);
+const [showRoundModal, setShowRoundModal] = useState(false);
+  const [nextRoundName, setNextRoundName] = useState("");
 const allTestsPassed =
   executionResult?.summary &&
   executionResult.summary.passed === executionResult.summary.total;
@@ -206,7 +213,8 @@ const normalizeVerdict = (v?: string) => {
   const [reenterPromptVisible, setReenterPromptVisible] = useState(false);
   const [needsFullscreen, setNeedsFullscreen] = useState(true);
   const startAttemptRef = useRef(false); // Used to prevent duplicate handleStart calls
-
+const [hint, setHint] = useState<string | null>(null);
+  const [loadingHint, setLoadingHint] = useState(false);
   // Countdown for re-enter modal
   const [countdown, setCountdown] = useState<number>(30);
   const countdownTimerRef = useRef<number | null>(null);
@@ -308,6 +316,9 @@ const buildTestCasesFromChallenge = (challenge: any) => {
 
   return normalized;
 };
+useEffect(() => {
+     setHint(null);
+  }, [currentQuestion?.questionId]);
 // --------------------- Replace existing handleRunCode with this ---------------------
 // paste this whole function to replace your existing handleRunCode
 const handleRunCode = async () => {
@@ -1090,59 +1101,62 @@ if (data?.firstQuestion?.is_probe) {
    referenceImage, resumeParsed, API, stopCamera, imageStatus]
 );
 
+
   /* -------------------------
       Answer submit handler (unchanged)
       ------------------------- */
-const handleSubmitAnswer = useCallback(async (e: React.FormEvent) => {
-  e.preventDefault();
-  if (!answer.trim() || loading || !currentQuestion) return;
+const handleSubmitAnswer = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!answer.trim() || loading || !currentQuestion) return;
 
-  const answerToSubmit = answer;
-  setAnswer("");
-  const currentQId = currentQuestion.questionId;
-  
-  const payload: any = { answer: answerToSubmit };
-  
-  if (currentQuestion.expectedAnswerType === "code") {
-    payload.code_execution_result = executionResult;
-    payload.question_type = "code";
-  } else {
-    payload.question_type = "text";
-  }
+    const payload: any = { 
+        answer, 
+        question_type: "text", 
+        code_execution_result: executionResult 
+    };
+    
+    if (currentQuestion.expectedAnswerType === "code") {
+        payload.question_type = "code";
+    }
 
-  try {
-    const result = await submitAnswer(payload, currentQId);
-    
-    if (result?.round_info) {
-      console.log("🔄 Round updated from backend:", result.round_info);
-      setCurrentRound(result.round_info.current || currentRound);
-      setRoundProgress(result.round_info.progress || roundProgress);
+    try {
+      const result = await submitAnswer(payload, currentQuestion.questionId);
+      setAnswer("");
+      setCodeOutput(null);
+      setExecutionResult(null);
+
+      // --- ROUND TRANSITION LOGIC ---
+      const newRoundData = result?.round_info || result?.metadata;
+      const incomingRound = newRoundData?.current || newRoundData?.current_round;
+
+      // 1. Detect Round Change (and it's not the end of interview)
+      if (incomingRound && incomingRound !== currentRound && incomingRound !== "complete" && result?.nextQuestion) {
+          console.log(`🔀 Round Transition: ${currentRound} -> ${incomingRound}`);
+          
+          setNextRoundName(incomingRound); // Store next round name
+          setShowRoundModal(true);         // Trigger the Modal
+          
+          // Update progress in background, but keep currentRound same until user clicks "Start"
+          if (newRoundData.progress) setRoundProgress(newRoundData.progress);
+          return; 
+      }
+
+      // 2. Standard Update (Same round)
+      if (newRoundData) {
+         setCurrentRound(incomingRound || currentRound);
+         if (newRoundData.progress) setRoundProgress(newRoundData.progress);
+      }
+
+    } catch (e) { 
+        console.error("Submit error:", e); 
     }
-    
-    if (result?.nextQuestion) {
-      const isProbe = result.nextQuestion.is_probe || false;
-      setIsProbeQuestion(isProbe);
-      console.log("🔍 Next question probe status:", isProbe);
-    } else {
-      setIsProbeQuestion(false);
-    }
-    
-    if (result?.eliminated) {
-      console.error("❌ CANDIDATE ELIMINATED:", result.elimination_reason);
-      setTerminatedByViolation(true);
-      setViolationReason(result.elimination_reason || "Interview terminated due to performance criteria");
-      stopCamera();
-      return;
-    }
-    
-    setCodeOutput(null);
-    setCodeStatus("idle");
-    setExecutionResult(null);
-    
-  } catch (e) {
-    console.error("Error submitting answer:", e);
-  }
-}, [answer, loading, currentQuestion, submitAnswer, executionResult, currentRound, roundProgress, stopCamera]);
+  };
+
+  // Helper for the modal button
+  const handleNextRound = () => {
+      setShowRoundModal(false);
+      setCurrentRound(nextRoundName); // Update badge to new round
+  };
   /* -------------------------
       Cleanup effect (unmount) (unchanged)
       ------------------------- */
@@ -1198,6 +1212,38 @@ const handleSubmitAnswer = useCallback(async (e: React.FormEvent) => {
     </div>
   );
 };
+const RoundTransitionModal = () => {
+  if (!showRoundModal) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+      <div className="max-w-lg w-full bg-white rounded-2xl p-8 shadow-2xl text-center animate-in fade-in zoom-in">
+        
+        <div className="w-20 h-20 mx-auto mb-4 rounded-full bg-indigo-100 flex items-center justify-center">
+          <CheckCircle size={40} className="text-indigo-600" />
+        </div>
+
+        <h3 className="text-2xl font-black text-slate-900 mb-2">
+          {currentRound.toUpperCase()} Round Completed 🎉
+        </h3>
+
+        <p className="text-slate-600 mb-6">
+          Great work! Click below to continue to the{" "}
+          <span className="font-bold capitalize">{nextRoundName}</span> round.
+        </p>
+
+        <button
+          onClick={handleNextRound}
+          className="inline-flex items-center gap-2 px-6 py-3 bg-gradient-to-r from-indigo-600 to-purple-600 text-white rounded-xl font-bold text-lg shadow-lg hover:scale-105 transition"
+        >
+          Start {nextRoundName} Round
+          <ArrowRight size={20} />
+        </button>
+      </div>
+    </div>
+  );
+};
+
 
   const handleBeforeUnload = useCallback(
     (event: BeforeUnloadEvent) => {
@@ -1306,7 +1352,6 @@ useEffect(() => {
     const round = currentQuestion.round || "screening";
     
     setIsProbeQuestion(isProbe);
-    setCurrentRound(round);
     
     console.log(`📋 Question loaded - Round: ${round}, Probe: ${isProbe}, Type: ${currentQuestion.expectedAnswerType}`);
   }
@@ -1357,54 +1402,177 @@ useEffect(() => {
   // setAnswer(starter || "");
 }, [currentQuestion?.questionId]);
  // run when question changes
- const RoundIndicator = () => {
-  if (stage !== "running" || !currentRound) return null;
+ // --- PDF GENERATION LOGIC ---
+  const generatePDF = () => {
+    if (!finalDecision) return;
+    const doc = new jsPDF();
+    const pageWidth = doc.internal.pageSize.getWidth();
 
-  const roundConfig = {
-    screening: { label: "Screening", color: "bg-blue-500", icon: "🎯" },
-    technical: { label: "Technical Deep-Dive", color: "bg-purple-500", icon: "⚙️" },
-    behavioral: { label: "Behavioral", color: "bg-green-500", icon: "💬" },
-    complete: { label: "Complete", color: "bg-emerald-500", icon: "✅" }
+    // Header
+    doc.setFillColor(79, 70, 229);
+    doc.rect(0, 0, pageWidth, 40, "F");
+    doc.setTextColor(255, 255, 255);
+    doc.setFontSize(22);
+    doc.setFont("helvetica", "bold");
+    doc.text("Interview Performance Report", 14, 20);
+    
+    doc.setFontSize(12);
+    doc.setFont("helvetica", "normal");
+    doc.text(`Date: ${new Date().toLocaleDateString()}`, 14, 30);
+    doc.text(`Verdict: ${finalDecision.verdict?.toUpperCase() || "N/A"}`, pageWidth - 14, 20, { align: "right" });
+
+    // Summary
+    let y = 50;
+    doc.setTextColor(0, 0, 0);
+    doc.setFontSize(16);
+    doc.setFont("helvetica", "bold");
+    doc.text("Performance Summary", 14, y);
+    y += 10;
+
+    // 🔴 FIX: Use optional chaining (?.) and default values (?? 0)
+    const avgScore = (performanceMetrics?.average_score ?? 0) * 100;
+    const confidence = (finalDecision.confidence ?? 0) * 100;
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(12);
+    doc.text(`Overall Score: ${avgScore.toFixed(0)}%`, 14, y);
+    doc.text(`Confidence: ${confidence.toFixed(0)}%`, 80, y);
+    doc.text(`Total Questions: ${history.length}`, 150, y);
+    y += 15;
+
+    // Strengths
+    if (finalDecision.key_strengths?.length > 0) {
+        doc.setFont("helvetica", "bold");
+        doc.setTextColor(22, 163, 74);
+        doc.text("Key Strengths:", 14, y);
+        y += 7;
+        doc.setFont("helvetica", "normal");
+        doc.setTextColor(0, 0, 0);
+        finalDecision.key_strengths.forEach((s: string) => {
+            doc.text(`• ${s}`, 14, y);
+            y += 6;
+        });
+        y += 5;
+    }
+
+    // Weaknesses
+    if (finalDecision.critical_weaknesses?.length > 0) {
+        doc.setFont("helvetica", "bold");
+        doc.setTextColor(220, 38, 38);
+        doc.text("Areas for Improvement:", 14, y);
+        y += 7;
+        doc.setFont("helvetica", "normal");
+        doc.setTextColor(0, 0, 0);
+        finalDecision.critical_weaknesses.forEach((w: string) => {
+            doc.text(`• ${w}`, 14, y);
+            y += 6;
+        });
+        y += 10;
+    }
+
+    // Question Table
+    doc.setFontSize(16);
+    doc.setFont("helvetica", "bold");
+    doc.text("Question Transcript", 14, y);
+    y += 5;
+
+    const tableData = history.map((h, i) => {
+      // 🔴 FIX: Safe access for history items
+      const qText = h.q?.questionText || "";
+      const verdict = h.result?.verdict?.toUpperCase() || "N/A";
+      const scoreVal = (h.result?.overall_score ?? 0) * 100;
+      const feedback = h.result?.improvement?.substring(0, 100) || h.result?.rationale?.substring(0, 100) || "";
+
+      return [
+        `Q${i + 1}`,
+        qText.substring(0, 80) + (qText.length > 80 ? "..." : ""),
+        verdict,
+        `${Math.round(scoreVal)}%`,
+        feedback
+      ];
+    });
+
+    autoTable(doc, {
+      startY: y,
+      head: [['#', 'Question', 'Verdict', 'Score', 'Feedback']],
+      body: tableData,
+      headStyles: { fillColor: [67, 56, 202] },
+      columnStyles: {
+          0: { cellWidth: 10 },
+          1: { cellWidth: 60 },
+          2: { cellWidth: 25 },
+          3: { cellWidth: 20 },
+          4: { cellWidth: 'auto' }
+      },
+      styles: { fontSize: 9, cellPadding: 3 },
+    });
+
+    doc.save("Interview_Report.pdf");
   };
+  const handleGetHint = async () => {
+     if (hint) return;
+     if (!confirm("Taking a hint will reduce your maximum score for this question by 15%. Continue?")) return;
+     
+     setLoadingHint(true);
+     // Pass question type to get better context-aware hints
+     const h = await fetchHint(currentQuestion?.questionText || "", currentQuestion?.type || "conceptual");
+     setHint(h);
+     setLoadingHint(false);
+  };
+const RoundIndicator = () => {
+    if (stage !== "running") return null;
 
-  const config = roundConfig[currentRound as keyof typeof roundConfig] || roundConfig.screening;
+    // Config for round colors
+    const roundConfig: any = {
+      screening: { label: "Screening", color: "bg-blue-600" },
+      technical: { label: "Technical", color: "bg-purple-600" },
+      behavioral: { label: "Behavioral", color: "bg-emerald-600" },
+      complete: { label: "Complete", color: "bg-slate-600" }
+    };
 
-  return (
-    <div className="mb-6 bg-white rounded-xl shadow-md border border-slate-200 p-4">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <div className={`${config.color} text-white px-3 py-1 rounded-lg font-bold text-sm flex items-center gap-2`}>
-            <span>{config.icon}</span>
-            <span>{config.label}</span>
-          </div>
+    const activeConfig = roundConfig[currentRound] || roundConfig.screening;
+
+    return (
+      <div className="mb-6 bg-white rounded-xl shadow-sm border border-slate-200 p-4 animate-in fade-in slide-in-from-top-2">
+        <div className="flex flex-wrap items-center justify-between gap-4">
           
-          {isProbeQuestion && (
-            <div className="bg-amber-100 text-amber-800 px-3 py-1 rounded-lg font-bold text-xs border-2 border-amber-300 animate-pulse">
-              🔍 Follow-up Probe
+          {/* Left: Active Round Badge */}
+          <div className="flex items-center gap-3">
+             <div className={`${activeConfig.color} text-white px-4 py-1.5 rounded-full font-bold text-sm shadow-sm flex items-center gap-2 capitalize`}>
+                {activeConfig.label} Round
+             </div>
+             
+             {isProbeQuestion && (
+                <div className="bg-amber-50 text-amber-700 border border-amber-200 px-3 py-1 rounded-full text-xs font-bold flex items-center gap-1 animate-pulse">
+                   <HelpCircle size={14} /> Deep Dive
+                </div>
+             )}
+          </div>
+
+          {/* Right: Progress Stats from Backend */}
+          {roundProgress && (
+            <div className="flex items-center gap-2 text-sm">
+               {Object.entries(roundProgress).map(([r, d]: any) => {
+                  const isCurrent = r === currentRound;
+                  const count = d.questions || 0; 
+                  
+                  // Style logic: Dark if current, Green if done, Gray if waiting
+                  let style = "bg-slate-50 text-slate-400 border-slate-100";
+                  if (isCurrent) style = "bg-slate-800 text-white border-slate-800 shadow-md transform scale-105";
+                  else if (d.status === "passed" || d.status === "completed") style = "bg-green-50 text-green-700 border-green-200";
+
+                  return (
+                    <div key={r} className={`px-3 py-1 rounded-lg border transition-all ${style}`}>
+                       <span className="capitalize font-medium">{r}</span>: <span className="font-bold">{count}</span>
+                    </div>
+                  );
+               })}
             </div>
           )}
         </div>
-
-        {roundProgress && (
-          <div className="flex items-center gap-4 text-sm">
-            {Object.entries(roundProgress).map(([round, data]: [string, any]) => (
-              <div key={round} className="flex items-center gap-2">
-                <span className="text-slate-600 capitalize">{round}:</span>
-                <span className={`font-bold ${
-                  data.status === "completed" ? "text-green-600" :
-                  data.status === "in_progress" ? "text-blue-600" :
-                  "text-slate-400"
-                }`}>
-                  {data.questions || 0} Q's
-                </span>
-              </div>
-            ))}
-          </div>
-        )}
       </div>
-    </div>
-  );
-};
+    );
+  };
 
   return (
     <div className="min-h-screen bg-slate-50 py-12">
@@ -1838,84 +2006,112 @@ useEffect(() => {
         )}
 
         {/* ACTIVE INTERVIEW (unchanged) */}
-        {stage === "running" && currentQuestion && !terminatedByViolation && (
-          <div className="space-y-6 max-w-5xl mx-auto">
-            {lastFeedback && (
-              <div className="p-6 bg-gradient-to-br from-amber-50 via-orange-50 to-yellow-50 border-l-4 border-amber-500 rounded-r-2xl shadow-lg animate-in fade-in slide-in-from-top-4 duration-500">
-                <div className="flex items-start gap-4">
-                  <div className="p-3 bg-gradient-to-br from-amber-400 to-orange-500 rounded-xl shrink-0 shadow-md">
-                    <Lightbulb size={24} className="text-white" />
-                  </div>
-                  <div className="flex-1">
-                    <h4 className="text-sm font-black text-amber-900 uppercase tracking-wider mb-2 flex items-center gap-2">
-                      💡 AI Mentor Feedback
-                    </h4>
-                    <p className="text-amber-900 text-base leading-relaxed font-medium">
-                      {lastFeedback}
-                    </p>
-                  </div>
-                </div>
-              </div>
+{stage === "running" && currentQuestion && !terminatedByViolation && (
+  <div className="space-y-6 max-w-5xl mx-auto">
+    {lastFeedback && (
+      <div className="p-6 bg-gradient-to-br from-amber-50 via-orange-50 to-yellow-50 border-l-4 border-amber-500 rounded-r-2xl shadow-lg animate-in fade-in slide-in-from-top-4 duration-500">
+        <div className="flex items-start gap-4">
+          <div className="p-3 bg-gradient-to-br from-amber-400 to-orange-500 rounded-xl shrink-0 shadow-md">
+            <Lightbulb size={24} className="text-white" />
+          </div>
+          <div className="flex-1">
+            <h4 className="text-sm font-black text-amber-900 uppercase tracking-wider mb-2 flex items-center gap-2">
+              💡 AI Mentor Feedback
+            </h4>
+            <p className="text-amber-900 text-base leading-relaxed font-medium">
+              {lastFeedback}
+            </p>
+          </div>
+        </div>
+      </div>
+    )}
+
+    <div className="bg-white rounded-2xl shadow-2xl border-2 border-slate-200 overflow-hidden">
+      <div className="bg-gradient-to-r from-indigo-50 to-purple-50 p-6 border-b-2 border-slate-200">
+        <div className="flex justify-between items-start mb-3">
+          <span className="text-xs font-black tracking-widest text-indigo-600 uppercase bg-indigo-100 px-3 py-1.5 rounded-lg border-2 border-indigo-200">
+            Question {history.length + 1}
+          </span>
+
+          {/* ✅ SINGLE HINT BUTTON (kept original handler) */}
+          <button
+            onClick={handleGetHint}
+            disabled={loadingHint || !!hint}
+            className={`flex items-center gap-1 text-xs font-bold px-3 py-1 rounded-full border transition-colors ${
+              hint
+                ? "bg-amber-100 text-amber-800 border-amber-200 cursor-default"
+                : "bg-white text-slate-600 border-slate-300 hover:bg-slate-50"
+            }`}
+          >
+            {loadingHint ? (
+              <Loader2 size={12} className="animate-spin" />
+            ) : (
+              <Lightbulb size={12} />
             )}
+            {hint ? "Hint Active (-15%)" : "Get Hint"}
+          </button>
+        </div>
 
-            <div className="bg-white rounded-2xl shadow-2xl border-2 border-slate-200 overflow-hidden">
-              <div className="bg-gradient-to-r from-indigo-50 to-purple-50 p-6 border-b-2 border-slate-200">
-                <div className="flex justify-between items-start mb-3">
-                  <span className="text-xs font-black tracking-widest text-indigo-600 uppercase bg-indigo-100 px-3 py-1.5 rounded-lg border-2 border-indigo-200">
-                    Question {history.length + 1}
-                  </span>
+        <div className="flex items-center gap-2 mb-2">
+          {currentQuestion.difficulty && (
+            <span
+              className={`text-xs font-bold px-2.5 py-1 rounded-lg ${
+                currentQuestion.difficulty === "expert" ||
+                currentQuestion.difficulty === "hard"
+                  ? "bg-rose-100 text-rose-700 border-2 border-rose-200"
+                  : "bg-amber-100 text-amber-700 border-2 border-amber-200"
+              }`}
+            >
+              {currentQuestion.difficulty.toUpperCase()}
+            </span>
+          )}
+        </div>
 
-                  <div className="flex items-center gap-2">
-                    {currentQuestion.difficulty && (
-                      <span
-                        className={`text-xs font-bold px-2.5 py-1 rounded-lg ${
-                          currentQuestion.difficulty === "expert" ||
-                          currentQuestion.difficulty === "hard"
-                            ? "bg-rose-100 text-rose-700 border-2 border-rose-200"
-                            : "bg-amber-100 text-amber-700 border-2 border-amber-200"
-                        }`}
-                      >
-                        {currentQuestion.difficulty.toUpperCase()}
-                      </span>
-                    )}
-                  </div>
-                </div>
-                {isProbeQuestion && (
-  <div className="mt-3 p-3 bg-amber-50 border-l-4 border-amber-400 rounded text-sm">
-    <div className="flex items-center gap-2 text-amber-800 font-bold mb-1">
-      <HelpCircle size={16} />
-      <span>Follow-up Question</span>
-    </div>
-    <p className="text-amber-700 text-xs">
-      This is a clarifying question based on your previous answer. 
-      Take your time to provide more detail.
-    </p>
-  </div>
-)}
+        {/* ✅ SINGLE HINT DISPLAY */}
+        {hint && (
+          <div className="mb-4 p-4 bg-yellow-50 border-l-4 border-yellow-400 rounded-r text-sm text-yellow-900 animate-in fade-in slide-in-from-top-2">
+            <strong className="block mb-1 font-bold flex items-center gap-2">
+              <Lightbulb size={16} /> Hint:
+            </strong>
+            {hint}
+          </div>
+        )}
 
+        {isProbeQuestion && (
+          <div className="mt-3 p-3 bg-amber-50 border-l-4 border-amber-400 rounded text-sm">
+            <div className="flex items-center gap-2 text-amber-800 font-bold mb-1">
+              <HelpCircle size={16} />
+              <span>Follow-up Question</span>
+            </div>
+            <p className="text-amber-700 text-xs">
+              This is a clarifying question based on your previous answer.
+              Take your time to provide more detail.
+            </p>
+          </div>
+        )}
 
-                <h2 className="text-2xl font-bold text-slate-900 leading-snug">
-                  {currentQuestion.questionText}
-                </h2>
+        <h2 className="text-2xl font-bold text-slate-900 leading-snug">
+          {currentQuestion.questionText}
+        </h2>
 
-                <div className="mt-4 flex flex-wrap gap-2">
-                  {currentQuestion.target_project && (
-                    <span className="text-xs bg-blue-100 text-blue-700 px-2.5 py-1 rounded-lg border border-blue-200 font-medium">
-                      🎯 {currentQuestion.target_project}
-                    </span>
-                  )}
-                  {currentQuestion.technology_focus && (
-                    <span className="text-xs bg-purple-100 text-purple-700 px-2.5 py-1 rounded-lg border border-purple-200 font-medium">
-                      ⚡ {currentQuestion.technology_focus}
-                    </span>
-                  )}
-                  {currentQuestion.expectedAnswerType === "code" && (
-                    <span className="text-xs bg-green-100 text-green-700 px-2.5 py-1 rounded-lg border border-green-200 font-medium">
-                      💻 Code Expected
-                    </span>
-                  )}
-                </div>
-              </div>
+        <div className="mt-4 flex flex-wrap gap-2">
+          {currentQuestion.target_project && (
+            <span className="text-xs bg-blue-100 text-blue-700 px-2.5 py-1 rounded-lg border border-blue-200 font-medium">
+              🎯 {currentQuestion.target_project}
+            </span>
+          )}
+          {currentQuestion.technology_focus && (
+            <span className="text-xs bg-purple-100 text-purple-700 px-2.5 py-1 rounded-lg border border-purple-200 font-medium">
+              ⚡ {currentQuestion.technology_focus}
+            </span>
+          )}
+          {currentQuestion.expectedAnswerType === "code" && (
+            <span className="text-xs bg-green-100 text-green-700 px-2.5 py-1 rounded-lg border border-green-200 font-medium">
+              💻 Code Expected
+            </span>
+          )}
+        </div>
+      </div>
 
               <div className="bg-slate-50 p-8 border-t border-slate-200">
 <form onSubmit={handleSubmitAnswer}>
@@ -2226,13 +2422,20 @@ useEffect(() => {
                 >
                   {showReport ? "Hide Full Transcript" : "View Full Transcript"}
                 </button>
-
+<button
+  onClick={generatePDF}
+  className="px-6 py-3 bg-gradient-to-r from-emerald-600 to-green-600 text-white rounded-xl hover:shadow-xl font-bold transition-all shadow-md flex items-center gap-2"
+>
+  <FileText size={18} />
+  Download Result (PDF)
+</button>
                 <button
                   onClick={() => setConfirmRestartVisible(true)}
                   className="px-6 py-3 bg-gradient-to-r from-indigo-600 to-purple-600 text-white rounded-xl hover:shadow-xl font-bold transition-all shadow-md"
                 >
                   Start New Interview
                 </button>
+
               </div>
             </div>
 
@@ -2258,8 +2461,8 @@ useEffect(() => {
                     <button
                       className="px-4 py-2 rounded bg-indigo-600 text-white"
                       onClick={() => {
-                        setConfirmRestartVisible(false);
-                        handleStart();
+                     window.location.reload();
+
                       }}
                     >
                       Yes, start new

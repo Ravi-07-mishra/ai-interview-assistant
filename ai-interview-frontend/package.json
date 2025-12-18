@@ -10,6 +10,8 @@
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",
+    "jspdf": "^3.0.4",
+    "jspdf-autotable": "^5.0.2",
     "lucide-react": "^0.556.0",
     "next": "16.0.7",
     "react": "19.2.0",

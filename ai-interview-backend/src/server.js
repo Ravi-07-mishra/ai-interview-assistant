@@ -798,7 +798,7 @@ app.post("/interview/answer", requireAuth, async (req, res) => {
 
     // Build history (excluding current)
     const questionHistory = await buildQuestionHistory(sessionId, qaRec.qaId);
-
+const hintUsed = qaRec.metadata?.hint_used || false;
     // Score payload
     const scorePayload = {
       request_id: uuidv4(),
@@ -815,6 +815,7 @@ app.post("/interview/answer", requireAuth, async (req, res) => {
       options: { temperature: 0.0 },
       question_type: questionType,
       code_execution_result: codeExecutionResult,
+      hint_used: hintUsed,
     };
 
     const aiScoreResp = await callAiScoreAnswer(scorePayload);
@@ -1185,7 +1186,44 @@ app.post("/interview/violation", requireAuth, async (req, res) => {
     return res.status(500).json({ error: "failed_to_record_violation", details: err?.message });
   }
 });
+// --- REPLACE YOUR EXISTING /interview/hint ROUTE WITH THIS ---
+app.post("/interview/hint", requireAuth, async (req, res) => {
+  try {
+    const { sessionId, questionId, questionText, type } = req.body;
+    
+    // Validation
+    if (!sessionId || !questionId || !questionText) {
+        return res.status(400).json({ error: "Missing required fields" });
+    }
 
+    // 1. Mark question as having used a hint (for scoring penalty)
+    await QA.updateOne(
+        { sessionId, questionId }, 
+        { $set: { "metadata.hint_used": true } }
+    );
+    
+    // 2. Generate the hint via Python
+    // ⚠️ CRITICAL FIX: Map camelCase (Node) to snake_case (Python)
+    const aiPayload = {
+        session_id: sessionId,      // mapped from req.body.sessionId
+        question: questionText,     // mapped from req.body.questionText
+        type: type || "conceptual"
+    };
+
+    try {
+        // Call the helper function that wraps axios
+        const aiResp = await callWithRetry("/generate_hint", aiPayload, {}, 2, 300);
+        return res.json({ hint: aiResp.hint });
+    } catch (aiErr) {
+        console.error("AI Hint Error details:", aiErr.response?.data || aiErr.message);
+        return res.status(502).json({ error: "AI hint generation failed" });
+    }
+
+  } catch (err) {
+    console.error("❌ Hint API Error:", err.message);
+    return res.status(500).json({ error: "internal_server_error" });
+  }
+});
 // Interview end
 app.post("/interview/end", requireAuth, async (req, res) => {
   try {
@@ -1373,7 +1411,9 @@ app.use((req, res) => {
       "POST /interview/proctor",
       "POST /interview/answer",
       "POST /interview/violation",
-      "POST /interview/end"
+      "POST /interview/end",
+      "POST /interview/hint",
+
     ]
   });
 });

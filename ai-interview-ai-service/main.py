@@ -2309,7 +2309,10 @@ def infer_type_from_question(q: str) -> str:
     return "conceptual"
 
 
-
+class HintRequest(BaseModel):
+    session_id: str
+    question: str
+    context_type: str = "conceptual"
 class InterviewState:
     """
     Stateless Interview Manager.
@@ -2576,6 +2579,7 @@ class ScoreAnswerRequest(BaseModel):
     # Coding fields
     question_type: Optional[str] = "text" 
     code_execution_result: Optional[Dict[str, Any]] = None 
+    hint_used: Optional[bool] = False
 
 # Update this class in main.py
 class CodeSubmissionRequest(BaseModel):
@@ -3164,6 +3168,31 @@ async def register_face(request: FaceRegisterRequest):
     except Exception as e:
         logger.exception("Unexpected error in register_face")
         raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
+@app.post("/generate_hint")
+def generate_hint(req: HintRequest):
+    """
+    Generates a helpful nudge without revealing the answer.
+    """
+    prompt = f"""
+    You are a technical interviewer. The candidate is stuck on this question:
+    "{req.question}"
+    
+    Provide a brief, helpful hint. 
+    - If coding: Suggest a data structure (e.g. HashMap, Heap) or pattern (Two Pointers).
+    - If system design: Suggest which component to start with.
+    - DO NOT write code or give the full solution.
+    - Keep it under 1 sentence.
+    """
+    
+    try:
+        resp = llm_call(prompt, temperature=0.3, max_tokens=100)
+        if not resp.get("ok"):
+             raise HTTPException(status_code=502, detail="AI hint generation failed")
+        
+        return {"hint": resp["raw"].strip()}
+    except Exception as e:
+        logger.error(f"Hint error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))    
 @app.post("/score_answer")
 def score_answer(req: ScoreAnswerRequest):
     """
@@ -3264,6 +3293,12 @@ def score_answer(req: ScoreAnswerRequest):
                   validated, 
                   payload.get("question_history", [])
             )
+            if payload.get("hint_used"):
+                original_score = validated["overall_score"]
+                penalized_score = original_score*0.85
+                validated["overall_score"] = round(penalized_score,2)
+                validated["rationale"] += " (Score reduced by 15% due to hint usage.)"
+                logger.info(f"💡 Hint Penalty Applied: {original_score} -> {validated['overall_score']}")
             validated["verdict"] = derive_verdict_from_score(validated["overall_score"])
             
             # Record state
