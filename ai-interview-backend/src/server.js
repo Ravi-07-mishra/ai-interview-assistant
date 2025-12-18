@@ -221,7 +221,6 @@ async function buildQuestionHistory(sessionId, excludeQaId = null) {
   try {
     const query = { sessionId: sessionId };
     
-    // EXCLUDE the current question so AI doesn't see it as "history" with 0 score
     if (excludeQaId) {
         query.qaId = { $ne: excludeQaId };
     }
@@ -233,7 +232,6 @@ async function buildQuestionHistory(sessionId, excludeQaId = null) {
     console.log(`📜 History built for ${sessionId}: ${qaDocs.length} items found (excluded: ${excludeQaId}).`);
 
     return qaDocs.map(r => {
-      // --- HEURISTIC TYPE RECOVERY ---
       let qType = r.metadata?.type;
       
       if (!qType || qType === "conceptual") {
@@ -244,7 +242,6 @@ async function buildQuestionHistory(sessionId, excludeQaId = null) {
           qType = "project_discussion";
         }
       }
-      // -------------------------------
 
       return {
         question: r.questionText,
@@ -254,7 +251,8 @@ async function buildQuestionHistory(sessionId, excludeQaId = null) {
         verdict: r.verdict || null,
         ideal_outline: r.ideal_outline || "",
         type: qType || "conceptual",
-        target_project: r.metadata?.target_project || r.target_project || null 
+        target_project: r.metadata?.target_project || r.target_project || null,
+        is_probe: r.metadata?.is_probe || false // 👈 NEW: Preserve probe flag
       };
     });
   } catch (error) {
@@ -600,7 +598,14 @@ app.post("/interview/start", requireAuth, async (req, res) => {
         session = await createSessionDB(userId, {
             from: "frontend",
             // Store reference image locally immediately, assuming client-side check passed
-            referenceFace: referenceImage
+            referenceFace: referenceImage,
+ current_round: "screening",
+            round_progress: {
+                screening: { questions: 0, status: "in_progress" },
+                technical: { questions: 0, status: "not_started" },
+                behavioral: { questions: 0, status: "not_started" }
+            }
+
         });
         console.log("📝 Created session:", session.sessionId);
 
@@ -658,6 +663,7 @@ question_history: await buildQuestionHistory(session.sessionId),
 
         const aiResp = await callAiGenerateQuestion(aiPayload);
         const parsed = aiResp.parsed || {};
+const metadata = aiResp.metadata || {}; 
         // ... (rest of the question generation logic remains the same)
 
         const questionText = parsed.question || parsed.questionText ||
@@ -673,7 +679,10 @@ let normalizedType = parsed.type || "medium";
             target_project: parsed.target_project,
             technology_focus: parsed.technology_focus,
             red_flags: parsed.red_flags || [],
-            confidence: parsed.confidence
+            confidence: parsed.confidence,
+round: metadata.current_round || "screening",
+            is_probe: false
+
         };
 
     const qaDoc = await createQARecordDB(
@@ -706,12 +715,17 @@ let normalizedType = parsed.type || "medium";
                 ideal_outline: qaDoc.ideal_outline || parsed.ideal_outline,
                 red_flags: parsed.red_flags,
                 // Pass coding challenge details to frontend
-                coding_challenge: parsed.coding_challenge || null 
+                coding_challenge: parsed.coding_challenge || null ,
+                 round: metadata.current_round || "screening",
             },
             proctoring: {
                 referenceRegistered: true, // Now guaranteed to be true if we reached here
                 aiRegistrationStatus: "registered"
-            }
+            },
+    round_info: {
+                current: metadata.current_round || "screening",
+                progress: metadata.round_progress || {}
+            }
         });
     } catch (err) {
         // FIX 2: Ensure logging uses session.sessionId only if session exists
@@ -728,6 +742,9 @@ let normalizedType = parsed.type || "medium";
 });
 
 // Interview answer
+// =========================================================================
+// REPLACE YOUR EXISTING app.post("/interview/answer" ...) WITH THIS BLOCK
+// =========================================================================
 app.post("/interview/answer", requireAuth, async (req, res) => {
   try {
     console.log("💬 Processing answer for session:", req.body.sessionId);
@@ -735,39 +752,43 @@ app.post("/interview/answer", requireAuth, async (req, res) => {
     const { sessionId, qaId, questionId, questionText } = req.body || {};
     const userId = req.userId || null;
 
-    // --- UNIFIED VARIABLE NAME ---
-    let candidateAnswerRaw =
-      req.body.candidateAnswer || req.body.candidate_answer;
+    // --- 1. GET SESSION STATE FROM DB (Fixes the "0 Questions" bug) ---
+    // We need the existing progress in case this request is a Probe (which returns no new stats)
+    const sessionDoc = await Session.findOne({ sessionId }).lean();
+    if (!sessionDoc) return res.status(404).json({ error: "session_not_found" });
 
+    // Initialize roundInfo from the DB so we don't start with 0s
+    let roundInfo = {
+      current_round: sessionDoc.metadata?.current_round || "screening",
+      round_progress: sessionDoc.metadata?.round_progress || {
+         screening: { questions: 0, status: "in_progress" },
+         technical: { questions: 0, status: "not_started" },
+         behavioral: { questions: 0, status: "not_started" }
+      }
+    };
+
+    // --- UNIFIED VARIABLE NAME ---
+    let candidateAnswerRaw = req.body.candidateAnswer || req.body.candidate_answer;
     let candidateAnswer = "";
     let questionType = req.body.question_type || "text";
     let codeExecutionResult = req.body.code_execution_result || null;
 
     if (typeof candidateAnswerRaw === "object" && candidateAnswerRaw !== null) {
-      candidateAnswer =
-        candidateAnswerRaw.answer ||
-        candidateAnswerRaw.candidateAnswer ||
-        "";
-      if (candidateAnswerRaw.question_type)
-        questionType = candidateAnswerRaw.question_type;
-      if (candidateAnswerRaw.code_execution_result)
-        codeExecutionResult = candidateAnswerRaw.code_execution_result;
+      candidateAnswer = candidateAnswerRaw.answer || candidateAnswerRaw.candidateAnswer || "";
+      if (candidateAnswerRaw.question_type) questionType = candidateAnswerRaw.question_type;
+      if (candidateAnswerRaw.code_execution_result) codeExecutionResult = candidateAnswerRaw.code_execution_result;
     } else {
       candidateAnswer = String(candidateAnswerRaw || "");
     }
 
-    if (!sessionId)
-      return res.status(400).json({ error: "missing sessionId" });
-    if (!qaId && !questionId)
-      return res.status(400).json({ error: "missing qaId or questionId" });
+    if (!qaId && !questionId) return res.status(400).json({ error: "missing qaId or questionId" });
 
-    // Find QA
+    // Find QA Record
     let qaRec = null;
     if (qaId) qaRec = await getQAByQaId(qaId);
     else qaRec = await QA.findOne({ questionId, sessionId }).lean();
 
-    if (!qaRec)
-      return res.status(404).json({ error: "qa_record_not_found" });
+    if (!qaRec) return res.status(404).json({ error: "qa_record_not_found" });
 
     // Save answer
     await updateQARecordDB(qaRec.qaId, {
@@ -775,8 +796,8 @@ app.post("/interview/answer", requireAuth, async (req, res) => {
       answeredAt: new Date(),
     });
 
-    // Build history
-    const questionHistory = await buildQuestionHistory(sessionId);
+    // Build history (excluding current)
+    const questionHistory = await buildQuestionHistory(sessionId, qaRec.qaId);
 
     // Score payload
     const scorePayload = {
@@ -798,10 +819,10 @@ app.post("/interview/answer", requireAuth, async (req, res) => {
 
     const aiScoreResp = await callAiScoreAnswer(scorePayload);
     const validated = aiScoreResp.validated || aiScoreResp.validation || {};
-    const overallScore =
-      validated.overall_score ?? validated.score ?? 0;
+    const overallScore = validated.overall_score ?? validated.score ?? 0;
+    const isProbe = aiScoreResp.is_probe || false;
 
-    console.log("📊 Score received:", overallScore);
+    console.log("📊 Score received:", overallScore, `(is_probe: ${isProbe})`);
 
     // Update QA with score
     const scoreUpdate = {
@@ -810,116 +831,47 @@ app.post("/interview/answer", requireAuth, async (req, res) => {
       rubricScores: validated.dimension_scores,
       verdict: validated.verdict || "weak",
       confidence: validated.confidence ?? 0.5,
-      rationale:
-        validated.rationale || aiScoreResp.rationale || "",
-      improvement:
-        validated.mentor_tip ||
-        validated.follow_up_probe ||
-        null,
-      red_flags_detected:
-        validated.red_flags_detected || [],
-      missing_elements:
-        validated.missing_elements || [],
+      rationale: validated.rationale || aiScoreResp.rationale || "",
+      improvement: validated.mentor_tip || validated.follow_up_probe || null,
+      red_flags_detected: validated.red_flags_detected || [],
+      missing_elements: validated.missing_elements || [],
       needsHumanReview: aiScoreResp.in_gray_zone || false,
       gradedAt: new Date(),
       metadata: {
         ...qaRec.metadata,
         ai_parse_ok: !!aiScoreResp.parse_ok,
         in_gray_zone: aiScoreResp.in_gray_zone || false,
+        is_probe: isProbe
       },
     };
 
     await updateQARecordDB(qaRec.qaId, scoreUpdate);
 
-    console.log("🔄 Refreshing history with latest scores...");
+    // Refresh history
     const updatedHistory = await buildQuestionHistory(sessionId);
 
     let nextQuestion = null;
     let ended = false;
-    let performanceMetrics = null;
+    let eliminated = false;
+    let eliminationReason = null;
     let modelDecision = null;
 
-    try {
-      const decisionPayload = {
-        request_id: uuidv4(),
-        session_id: sessionId,
-        user_id: userId || "anonymous",
-        resume_summary: req.body.resume_summary || "",
-        conversation: req.body.conversation || [],
-        question_history: updatedHistory,
-        retrieved_chunks: req.body.retrieved_chunks || [],
-        token_budget: 800,
-        allow_pii: !!req.body.allow_pii,
-        accept_model_final: true,
-      };
-
-      const finalizeResp = await callAiFinalizeDecision(decisionPayload);
-      const decisionResult =
-        finalizeResp.result || finalizeResp;
-
-      performanceMetrics =
-        finalizeResp.performance_metrics || null;
-
-      modelDecision =
-        decisionResult?.parsed || decisionResult;
-
-      if (
-        finalizeResp.is_final &&
-        modelDecision &&
-        modelDecision.ended
-      ) {
-        ended = true;
-
-        const decisionDoc = await Decision.create({
-          decisionId: uuidv4(),
-          sessionId,
-          decidedBy: "model",
-          verdict: modelDecision.verdict,
-          confidence: modelDecision.confidence || 0.5,
-          reason: modelDecision.reason || "",
-          recommended_role:
-            modelDecision.recommended_role,
-          key_strengths:
-            modelDecision.key_strengths || [],
-          critical_weaknesses:
-            modelDecision.critical_weaknesses || [],
-          rawModelOutput: decisionResult,
-          performanceMetrics,
-          decidedAt: new Date(),
-        });
-
-        await markSessionCompletedDB(sessionId, {
-          finalDecisionRef: decisionDoc._id,
-          performanceMetrics,
-        });
-      }
-    } catch (e) {
-      console.warn("⚠️ Decision check failed:", e.message);
-    }
-
-    // ================= NEXT QUESTION =================
+    // ================= NEXT QUESTION GENERATION =================
     if (!ended) {
       try {
         const inGrayZone = aiScoreResp.in_gray_zone || false;
-
         const shouldProbe = inGrayZone === true;
 
-        if (
-          shouldProbe &&
-          (validated.follow_up_probe ||
-            scoreUpdate.improvement)
-        ) {
+        // --- BRANCH A: PROBE GENERATION (No round progress update) ---
+        if (shouldProbe && (validated.follow_up_probe || scoreUpdate.improvement)) {
           const probePayload = {
             request_id: uuidv4(),
             session_id: sessionId,
             user_id: userId || "anonymous",
-            weakness_topic:
-              validated.missing_elements?.[0] ||
-              "the previous topic",
+            weakness_topic: validated.missing_elements?.[0] || "the previous topic",
             prev_question: qaRec.questionText,
             prev_answer: candidateAnswer,
-            resume_summary:
-              req.body.resume_summary || "",
+            resume_summary: req.body.resume_summary || "",
             token_budget: 600,
             allow_pii: !!req.body.allow_pii,
           };
@@ -929,18 +881,16 @@ app.post("/interview/answer", requireAuth, async (req, res) => {
 
           const newQa = await createQARecordDB(
             sessionId,
-            parsedProbe.probe_question ||
-              "Can you explain your approach?",
+            parsedProbe.probe_question || "Can you explain your approach?",
             parsedProbe.ideal_answer_outline || "",
-            parsedProbe.type === "coding_challenge"
-              ? "code"
-              : "text",
+            parsedProbe.type === "coding_challenge" ? "code" : "text",
             parsedProbe.difficulty || "medium",
             userId,
             {
               ...qaRec.metadata,
               is_probe: true,
               probe_parent_qaId: qaRec.qaId,
+              round: roundInfo.current_round // Keep current round
             }
           );
 
@@ -948,45 +898,139 @@ app.post("/interview/answer", requireAuth, async (req, res) => {
             qaId: newQa.qaId,
             questionId: newQa.questionId,
             questionText: newQa.questionText,
-            expectedAnswerType:
-              newQa.expectedAnswerType,
+            expectedAnswerType: newQa.expectedAnswerType,
             difficulty: newQa.difficulty,
             is_probe: true,
+            round: roundInfo.current_round
           };
+
         } else {
+          // --- BRANCH B: MAIN GENERATION (Updates round progress) ---
           const genPayload = {
             request_id: uuidv4(),
             session_id: sessionId,
             user_id: userId || "anonymous",
             mode: "next",
-            resume_summary:
-              req.body.resume_summary || "",
+            resume_summary: req.body.resume_summary || "",
             question_history: updatedHistory,
             token_budget: 1500,
             allow_pii: !!req.body.allow_pii,
             options: { temperature: 0.1 },
           };
 
-          const genResp =
-            await callAiGenerateQuestion(genPayload);
-          const parsedNext = genResp.parsed || {};
+          const genResp = await callAiGenerateQuestion(genPayload);
 
+          // 🔥 UPDATE DB WITH NEW PROGRESS IF AVAILABLE
+          if (genResp.metadata) {
+             roundInfo = genResp.metadata; // Update local variable
+             // Persist to MongoDB so the next request remembers the count
+             await Session.updateOne({ sessionId }, {
+                $set: {
+                    "metadata.current_round": roundInfo.current_round,
+                    "metadata.round_progress": roundInfo.round_progress
+                }
+             });
+          }
+
+          if (genResp.elimination) {
+            eliminated = true;
+            eliminationReason = genResp.reason;
+            ended = true;
+
+            const decisionDoc = await Decision.create({
+              decisionId: uuidv4(),
+              sessionId,
+              decidedBy: "system",
+              verdict: "reject",
+              confidence: 0.95,
+              reason: eliminationReason,
+              recommended_role: null,
+              key_strengths: [],
+              critical_weaknesses: [eliminationReason],
+              rawModelOutput: { eliminated: true, reason: eliminationReason },
+              performanceMetrics: genResp.round_history || {},
+              decidedAt: new Date()
+            });
+
+            await markSessionCompletedDB(sessionId, {
+              finalDecisionRef: decisionDoc._id,
+              eliminated: true,
+              eliminationReason
+            });
+
+            return res.json({
+              validated: { overall_score: overallScore, verdict: validated.verdict },
+              result: { score: overallScore, verdict: validated.verdict },
+              nextQuestion: null,
+              ended: true,
+              eliminated: true,
+              elimination_reason: eliminationReason,
+              is_final: true,
+              final_decision: {
+                  verdict: "reject",
+                  reason: eliminationReason
+              },
+              // Return the updated info
+              round_info: {
+                current: roundInfo.current_round,
+                progress: roundInfo.round_progress
+              }
+            });
+          }
+
+          if (genResp.ended && genResp.current_round === "complete") {
+            ended = true;
+            modelDecision = genResp.final_decision || { verdict: "hire", reason: "Completed" };
+            
+            const decisionDoc = await Decision.create({
+              decisionId: uuidv4(),
+              sessionId,
+              decidedBy: "model",
+              verdict: modelDecision.verdict || "hire",
+              confidence: modelDecision.confidence || 0.85,
+              reason: modelDecision.reason,
+              recommended_role: modelDecision.recommended_role,
+              key_strengths: modelDecision.key_strengths || [],
+              critical_weaknesses: modelDecision.critical_weaknesses || [],
+              rawModelOutput: genResp,
+              performanceMetrics: genResp.round_history || {},
+              decidedAt: new Date()
+            });
+
+            await markSessionCompletedDB(sessionId, {
+              finalDecisionRef: decisionDoc._id,
+              performanceMetrics: genResp.round_history
+            });
+
+            return res.json({
+              validated: { overall_score: overallScore, verdict: validated.verdict },
+              result: { score: overallScore, verdict: validated.verdict },
+              nextQuestion: null,
+              ended: true,
+              is_final: true,
+              final_decision: modelDecision,
+              round_info: {
+                current: "complete",
+                progress: roundInfo.round_progress
+              }
+            });
+          }
+
+          const parsedNext = genResp.parsed || {};
+          
           const newQa = await createQARecordDB(
             sessionId,
             parsedNext.question,
             parsedNext.ideal_answer_outline || "",
-            parsedNext.type === "coding_challenge"
-              ? "code"
-              : "text",
+            parsedNext.type === "coding_challenge" ? "code" : "text",
             parsedNext.difficulty || "medium",
             userId,
             {
-              target_project:
-                parsedNext.target_project,
-              technology_focus:
-                parsedNext.technology_focus,
+              target_project: parsedNext.target_project,
+              technology_focus: parsedNext.technology_focus,
               type: inferSemanticType(parsedNext),
               is_probe: false,
+              round: roundInfo.current_round
             }
           );
 
@@ -994,51 +1038,48 @@ app.post("/interview/answer", requireAuth, async (req, res) => {
             qaId: newQa.qaId,
             questionId: newQa.questionId,
             questionText: newQa.questionText,
-            expectedAnswerType:
-              newQa.expectedAnswerType,
-            coding_challenge:
-              parsedNext.coding_challenge || null,
+            expectedAnswerType: newQa.expectedAnswerType,
+            coding_challenge: parsedNext.coding_challenge || null,
             is_probe: false,
+            round: roundInfo.current_round,
+            difficulty: newQa.difficulty
           };
         }
       } catch (e) {
-        console.warn(
-          "⚠️ Next question generation failed:",
-          e.message
-        );
+        console.warn("⚠️ Next question generation failed:", e.message);
         ended = true;
       }
     }
 
     // ================= RESPONSE =================
     return res.json({
-      validated: {
-        overall_score: overallScore,
-        verdict: validated.verdict,
-      },
-      result: {
-        score: overallScore,
-        verdict: validated.verdict,
-      },
+      validated: { overall_score: overallScore, verdict: validated.verdict },
+      result: { score: overallScore, verdict: validated.verdict },
       nextQuestion,
       ended,
+      eliminated,
+      elimination_reason: eliminationReason,
       is_final: ended,
       final_decision: ended ? modelDecision : null,
       needs_human_review: scoreUpdate.needsHumanReview,
       in_gray_zone: scoreUpdate.metadata.in_gray_zone,
+      
+      // ✅ FINAL FIX: Ensure this structure matches what React expects
+      round_info: {
+        current: roundInfo.current_round || roundInfo.current,
+        // React expects 'progress' to contain the objects { questions: N, status: S }
+        progress: roundInfo.round_progress || roundInfo.progress,
+        section_counts: roundInfo.section_counts
+      },
       probe_decision: {
         was_authorized: !!nextQuestion?.is_probe,
         python_gray_zone_flag: aiScoreResp.in_gray_zone,
-        current_question_count:
-          updatedHistory.length + 1,
+        current_question_count: updatedHistory.length + 1,
       },
     });
   } catch (err) {
     console.error("❌ /interview/answer failed:", err);
-    return res.status(500).json({
-      error: "internal_server_error",
-      message: err.message,
-    });
+    return res.status(500).json({ error: "internal_server_error", message: err.message });
   }
 });
 

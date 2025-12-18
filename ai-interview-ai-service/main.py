@@ -107,6 +107,61 @@ INTERVIEW_FLOW = [
     "coding_challenge",    # Q7: Final Complexity Check (Optional)
     "conceptual"           # Q8+: System Design / filler
 ]
+# ==========================================
+# 1. Update INTERVIEW_ROUNDS
+# ==========================================
+# ==========================================
+# 1. Update INTERVIEW_ROUNDS
+# ==========================================
+INTERVIEW_ROUNDS = {
+    "screening": {
+        "name": "Screening Round",
+        "focus": ["experience", "resume_basics", "fundamentals"],
+        "min_questions": 1,   # Minimum 1 question to start
+        "max_questions": 3,   # Hard limit of 3
+        "pass_threshold": 0.55,
+        "elimination": True
+    },
+    "technical": {
+        "name": "Technical Round",
+        "focus": ["project_discussion", "coding_challenge", "system_design"],
+        # ✅ UPDATED: Enforces 3 to 4 questions strictly
+        "min_questions": 3,   
+        "max_questions": 4,   
+        "pass_threshold": 0.60,
+        "elimination": True
+    },
+    "behavioral": {
+        "name": "Behavioral Round",
+        "focus": ["achievement", "ownership", "collaboration"],
+        "min_questions": 1,
+        "max_questions": 2,   
+        "pass_threshold": 0.65,
+        "elimination": True
+    }
+}
+# ==========================================
+# 2. Update QUESTION_TYPE_TO_ROUND
+# ==========================================
+QUESTION_TYPE_TO_ROUND = {
+    # --- Screening (Experience & Basics) ---
+    "experience": "screening",
+    "resume_basics": "screening",
+    "fundamentals": "screening",
+    "conceptual": "screening",  # Fallback
+
+    # --- Technical (Projects & Coding) ---
+    "project_discussion": "technical",  # <--- Moved to Technical
+    "coding_challenge": "technical",
+    "debugging": "technical",
+    "system_design": "technical",
+
+    # --- Behavioral (Achievements & HR) ---
+    "achievement": "behavioral",
+    "ownership": "behavioral",
+    "collaboration": "behavioral",
+    "reflection": "behavioral"
+}
 
 TERMINATION_RULES = {
     "instant_fail_threshold": 0.20,
@@ -1237,6 +1292,21 @@ def build_generate_question_prompt(
     recent_q_text = "\n".join(recent_q_text_list)
     
     diversity_hint = get_diverse_question_hint(history, required_type)
+    round_context = ""
+    if state:
+        round_config = INTERVIEW_ROUNDS[state.current_round]
+        round_progress = len(state.round_history[state.current_round]["questions"])
+        
+        round_context = f"""
+═══════════════════════════════════════════════════════════════════
+🎯 CURRENT ROUND: {round_config['name'].upper()}
+Progress: Question {round_progress + 1} of {round_config['max_questions']}
+Focus Areas: {', '.join(round_config['focus'])}
+Pass Threshold: {round_config['pass_threshold'] * 100}%
+
+⚠️ ELIMINATION ROUND: Candidate must maintain {round_config['pass_threshold'] * 100}%+ average to advance
+═══════════════════════════════════════════════════════════════════
+"""    
     difficulty_level = state.difficulty_level if state else "medium"
 
     # 2. Smart Project Selection
@@ -1391,6 +1461,7 @@ SYSTEM: You are a STRICT Technical Interviewer. Your goal is to VERIFY the candi
 ═══════════════════════════════════════════════════════════════════
 CANDIDATE RESUME:
 {resume[:4000]}
+{round_context}
 
 ═══════════════════════════════════════════════════════════════════
 PREVIOUS QUESTIONS (DO NOT REPEAT THESE TOPICS):
@@ -2283,6 +2354,15 @@ class InterviewState:
             kw in resume_text.lower() 
             for kw in ['achievement', 'award', 'competition', 'hackathon', 'certification', 'rank', 'winner', 'finalist', 'prize']
         )
+        self.current_round = "screening"
+        self.round_history = {
+            "screening": {"questions": [], "scores": [], "status": "in_progress"},
+            "technical": {"questions": [], "scores": [], "status": "not_started"},
+            "behavioral": {"questions": [], "scores": [], "status": "not_started"}
+        }
+        self.eliminated = False
+        self.elimination_reason = None
+
         # Section counters (hydrated every request)
         self.section_counts = {
             "experience": 0,
@@ -2295,53 +2375,121 @@ class InterviewState:
     # =====================================================
     # 🔁 STATE HYDRATION (SOURCE OF TRUTH)
     # =====================================================
+    def _update_round_status(self):
+        """
+        Checks round completion and elimination.
+        Updates current_round pointer.
+        """
+        round_order = ["screening", "technical", "behavioral"]
+        
+        for round_name in round_order:
+            round_data = self.round_history[round_name]
+            round_config = INTERVIEW_ROUNDS[round_name]
+            
+            num_questions = len(round_data["questions"])
+            scores = round_data["scores"]
+            
+            # Skip if not started
+            if num_questions == 0:
+                if round_data["status"] == "not_started":
+                    self.current_round = round_name
+                return
+            
+            # Check if round is complete (min questions met)
+            if num_questions >= round_config["min_questions"]:
+                avg_score = sum(scores) / len(scores) if scores else 0.0
+                
+                # ELIMINATION CHECK
+                if avg_score < round_config["pass_threshold"]:
+                    self.eliminated = True
+                    self.elimination_reason = (
+                        f"Failed {round_config['name']} "
+                        f"(Score: {avg_score:.2f} < {round_config['pass_threshold']:.2f})"
+                    )
+                    round_data["status"] = "failed"
+                    return
+                
+                # Round passed
+                round_data["status"] = "passed"
+                
+                # Check if max questions reached (force advance)
+                if num_questions >= round_config["max_questions"]:
+                    continue  # Move to next round
+                
+                # If not at max, stay in current round
+                self.current_round = round_name
+                return
+            else:
+                # Still collecting minimum questions for this round
+                self.current_round = round_name
+                round_data["status"] = "in_progress"
+                return
+        
+        # All rounds complete
+        self.current_round = "complete"    
     def hydrate_from_history(self, history: List[Dict[str, Any]]):
         """
-        Rebuilds ALL state from frontend-provided history.
-        This makes the service stateless & restart-safe.
+        Rebuilds state from history INCLUDING round tracking.
         """
-
         self.history = history or []
         self.covered_projects.clear()
         self.recent_scores.clear()
-
-        # Reset counters
-        for k in self.section_counts:
-            self.section_counts[k] = 0
-
+        
+        # Reset round tracking
+        for round_name in self.round_history:
+            self.round_history[round_name] = {
+                "questions": [], 
+                "scores": [], 
+                "status": "not_started"
+            }
+        
+        self.current_round = "screening"
+        self.eliminated = False
+        
         scores: List[float] = []
-
+        
+        # Rebuild round state from history
         for h in self.history:
-            q_type = h.get("type")
-            if not q_type:
-                continue  
-
-            # ---- section counts ----
-            if q_type == "coding_challenge":
-                self.section_counts["dsa"] += 1
-            elif q_type == "project_discussion":
-                self.section_counts["projects"] += 1
-            elif q_type == "experience":
-                self.section_counts["experience"] += 1
-            elif q_type == "achievement":
-                self.section_counts["achievements"] += 1
-            else:
-                self.section_counts["conceptual"] += 1
-
-            # ---- project coverage ----
-            target = h.get("target_project")
-            if isinstance(target, str) and target != "general":
-                self.covered_projects.add(target)
-
-           
-
-            # ---- difficulty tracking ----
+            q_type = h.get("type", "conceptual")
+            
+            # Skip probes from round counting (they don't advance rounds)
+            if h.get("is_probe", False):
+                continue
+            
+            # Determine which round this question belongs to
+            round_name = QUESTION_TYPE_TO_ROUND.get(q_type, "screening")
+            
+            # Record question in round
+            self.round_history[round_name]["questions"].append(h)
+            
+            # Record score if available
             s = h.get("score")
             if s is not None:
                 try:
-                    scores.append(float(s))
-                except Exception:
+                    score_val = float(s)
+                    self.round_history[round_name]["scores"].append(score_val)
+                    scores.append(score_val)
+                except:
                     pass
+            
+            # Track project coverage
+            target = h.get("target_project")
+            if isinstance(target, str) and target != "general":
+                self.covered_projects.add(target)
+        
+        # Determine current round and check elimination
+        self._update_round_status()
+        
+        # Adaptive difficulty
+        self.recent_scores = scores
+        if scores:
+            avg = sum(scores[-3:]) / len(scores[-3:])
+            if avg > 0.8:
+                self.difficulty_level = "hard"
+            elif avg < 0.4:
+                self.difficulty_level = "easy"
+            else:
+                self.difficulty_level = "medium"
 
         # ---- adaptive difficulty ----
         self.recent_scores = scores
@@ -2359,55 +2507,34 @@ class InterviewState:
     # =====================================================
     def next_question_type(self) -> str:
         """
-        Determines the NEXT question type based on INTERVIEW_FLOW.
-        Robustly handles probes by 'consuming' them into the current stage.
+        Returns next question type based on current round.
+        Probes are handled separately and don't affect round progression.
         """
-        history_indices_used = set()
+        if self.eliminated:
+            return "eliminated"
         
-        # Iterate through the required stages defined in Config
-        for stage_type in INTERVIEW_FLOW:
-            found_match = False
-            
-            # Look through history to see if this stage has been completed
-            for i, h in enumerate(self.history):
-                if i in history_indices_used:
-                    continue # This question was already assigned to a previous stage
-
-                q_type = h.get("type", "conceptual")
-                
-                # CHECK: Does this history item match the required stage?
-                # We also treat "conceptual" as a wildcard/fallback if the flow asks for 
-                # "experience" or "achievement" but the user didn't have any (fallback logic).
-                match = (q_type == stage_type) or \
-                        (stage_type == "experience" and q_type == "conceptual") or \
-                        (stage_type == "achievement" and q_type == "conceptual")
-
-                if match:
-                    found_match = True
-                    history_indices_used.add(i)
-                    
-                    # 💡 ABSORB PROBES: 
-                    # If the VERY NEXT question in history is the SAME type, 
-                    # it is a probe/follow-up. Mark it as used for this stage too.
-                    next_idx = i + 1
-                    if next_idx < len(self.history):
-                        next_q = self.history[next_idx]
-                        # If the next question is the same type (or a conceptual fallback), absorb it
-                        next_type = next_q.get("type", "conceptual")
-                        if next_type == q_type:
-                            history_indices_used.add(next_idx)
-                    
-                    # We found the question that satisfies this Stage.
-                    # Stop searching history and move to the next Stage in INTERVIEW_FLOW.
-                    break 
-            
-            # If we completed the inner loop and DID NOT find a match in history,
-            # then THIS is the stage we need to do now.
-            if not found_match:
-                return stage_type
-
-        # Fallback if flow is exhausted
-        return "conceptual"
+        if self.current_round == "complete":
+            return "complete"
+        
+        round_config = INTERVIEW_ROUNDS[self.current_round]
+        focus_areas = round_config["focus"]
+        
+        # Get questions already asked in current round (excluding probes)
+        round_questions = self.round_history[self.current_round]["questions"]
+        asked_types = [q.get("type") for q in round_questions if not q.get("is_probe", False)]
+        
+        # Try to pick diverse question type from focus areas
+        available_types = [t for t in focus_areas if asked_types.count(t) < 2]
+        
+        if available_types:
+            # Prefer types not asked yet
+            unused = [t for t in available_types if t not in asked_types]
+            if unused:
+                return unused[0]
+            return available_types[0]
+        
+        # Fallback to any focus area type
+        return focus_areas[0] if focus_areas else "conceptual"
     # =====================================================
     # 🧩 HELPERS
     # =====================================================
@@ -2556,16 +2683,53 @@ def generate_question(req: GenerateQuestionRequest):
         payload.get("resume_summary", "")
     )
     state.hydrate_from_history(history)
-    logger.info(
-    "📊 Section counts | projects=%d, experience=%d, dsa=%d, achievements=%d, conceptual=%d",
-    state.section_counts["projects"],
-    state.section_counts["experience"],
-    state.section_counts["dsa"],
-    state.section_counts["achievements"],
-    state.section_counts["conceptual"],
-)
+    current_q_count = len([h for h in history if not h.get("is_probe", False)]) + 1
+    if state.eliminated:
+        return {
+            "request_id": payload["request_id"],
+            "q_count": current_q_count,
+            "ended": True,
+            "elimination": True,
+            "reason": state.elimination_reason,
+            "current_round": state.current_round,
+            "round_history": state.round_history,
+            "final_decision": {
+                "verdict": "reject",
+                "reason": state.elimination_reason,
+                "confidence": 0.95
+            }
+        }
+    rule_termination = check_termination_rules(history)
+    if rule_termination:
+        return {
+            "request_id": payload["request_id"],
+            "q_count": current_q_count,
+            "ended": True,
+            "elimination": True,
+            "reason": rule_termination["reason"],
+            "final_decision": rule_termination,
+            "parsed": {"question": "Interview Terminated", "type": "info"}
+        }
+    if state.current_round == "complete":
+        decision = call_decision({
+            "resume": payload.get("resume_summary", ""),
+            "question_history": history,
+            "conversation": payload.get("conversation", []),
+            "retrieved_chunks": enforced.get("chunks", [])
+        }, temperature=0.0)
 
-    current_q_count = len(history) + 1
+        return {
+            "request_id": payload["request_id"],
+            "q_count": current_q_count,
+            "ended": True,
+            "elimination": False,
+            "current_round": "complete",
+            "round_history": state.round_history,
+            "final_decision": decision.get("parsed"),
+        }
+    required_type = state.next_question_type()
+    logger.info(f"🎯 Round: {state.current_round} | Required type: {required_type}")
+
 
     # =====================================================
     # 🛑 TERMINATION CHECK (ONLY PLACE IT HAPPENS)
@@ -2763,7 +2927,12 @@ def generate_question(req: GenerateQuestionRequest):
             "required_type": parsed["type"],
             "difficulty": state.difficulty_level,
             "covered_projects": list(state.covered_projects),
-            "section_counts": state.section_counts
+                 "current_round": state.current_round,  # NEW
+            "round_progress": {  # NEW
+                "screening": len(state.round_history["screening"]["questions"]),
+                "technical": len(state.round_history["technical"]["questions"]),
+                "behavioral": len(state.round_history["behavioral"]["questions"])
+            }
         },
         "ended": False
     }
@@ -3210,7 +3379,13 @@ def score_answer(req: ScoreAnswerRequest):
         f"Probe Decision | Q#{current_q_count} | Score: {validated['overall_score']:.2f} | "
         f"Raw Gray Zone: {raw_in_gray_zone} | Final Probe: {final_in_gray_zone}"
     )
-    
+    is_probe = False
+    if len(incoming_history) >= 1:
+        last_q = incoming_history[-1].get("question", "").lower()
+        current_q = payload.get("question_text", "").lower()
+        similarity = compute_similarity(last_q, current_q)
+        if similarity > 0.25:
+            is_probe = True    
     # ========================================================================
     # END ANTI-LOOP MECHANISM
     # ========================================================================
@@ -3224,7 +3399,8 @@ def score_answer(req: ScoreAnswerRequest):
         "parse_ok": parsed is not None,
         "needs_human_review": needs_review,
         "source": used_source,
-        "in_gray_zone": final_in_gray_zone,  # Uses the suppressed value
+        "in_gray_zone": final_in_gray_zone,
+        "is_probe": is_probe,  # Uses the suppressed value
         "redaction_log": redaction_log
     }
 

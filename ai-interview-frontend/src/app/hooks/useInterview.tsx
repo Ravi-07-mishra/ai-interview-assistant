@@ -16,6 +16,8 @@ export type InterviewQuestion = {
   red_flags?: string[];
   action_type?: string;
   confidence?: number;
+    is_probe?: boolean;
+  round?: string;
   // keep index signature so we can attach raw / coding_challenge etc.
   [k: string]: any;
 };
@@ -37,6 +39,14 @@ export type InterviewAnswerResult = {
   decision?: any | null;
   in_gray_zone?: boolean;
   needs_human_review?: boolean;
+  round_info?: {
+    current: string;
+    progress: Record<string, any>;
+    section_counts?: Record<string, number>;
+  };
+  eliminated?: boolean;
+  elimination_reason?: string | null;
+  is_probe?: boolean;
 };
 
 export type PerformanceMetrics = {
@@ -182,7 +192,10 @@ const buildQuestionHistory = useCallback(() => {
         difficulty: existingQuestionData.difficulty || "medium",
         ideal_outline: existingQuestionData.ideal_answer_outline || existingQuestionData.ideal_outline || "",
         red_flags: existingQuestionData.red_flags || [],
-        confidence: existingQuestionData.confidence
+        confidence: existingQuestionData.confidence,
+          is_probe: existingQuestionData.is_probe || false,
+  round: existingQuestionData.round || "screening",
+
       };
 console.log("🧭 CURRENT QUESTION TYPE:", currentQuestion?.type);
 
@@ -252,7 +265,9 @@ console.log("🧭 CURRENT QUESTION TYPE:", currentQuestion?.type);
           difficulty: questionData.difficulty || "medium",
           ideal_outline: questionData.ideal_answer_outline || questionData.ideal_outline || "",
           red_flags: questionData.red_flags || [],
-          confidence: questionData.confidence
+          confidence: questionData.confidence,
+           is_probe: questionData.is_probe || false,
+    round: questionData.round || body.round_info?.current || "screening",
         };
 
         // Preserve raw/coding_challenge so UI can access nested fields like test_cases/starter_code
@@ -282,163 +297,187 @@ console.log("🧭 CURRENT QUESTION TYPE:", currentQuestion?.type);
   }
 
 const submitAnswer = useCallback(
-    async (candidateAnswerOrPayload: any, questionIdArg?: string) => {
-      setError(null);
-      setLastFeedback(null);
+  async (candidateAnswerOrPayload: any, questionIdArg?: string) => {
+    setError(null);
+    setLastFeedback(null);
 
-      if (!token) { setError("Please log in to submit an answer."); return null; }
-      if (!sessionId || !currentQuestion) { setError("Session not initialized or no active question"); return null; }
+    if (!token) { setError("Please log in to submit an answer."); return null; }
+    if (!sessionId || !currentQuestion) { setError("Session not initialized or no active question"); return null; }
 
-      setLoading(true);
-      try {
-        // Normalize incoming arg
-        let candidateAnswer: string;
-        let code_execution_result = null;
-        if (typeof candidateAnswerOrPayload === "string") {
-          candidateAnswer = candidateAnswerOrPayload;
+    setLoading(true);
+    try {
+      // Normalize incoming arg
+      let candidateAnswer: string;
+      let code_execution_result = null;
+      let question_type = "text";
+      
+      if (typeof candidateAnswerOrPayload === "string") {
+        candidateAnswer = candidateAnswerOrPayload;
+      } else {
+        // payload object from page
+        candidateAnswer = candidateAnswerOrPayload.answer || candidateAnswerOrPayload.candidateAnswer || "";
+        code_execution_result = candidateAnswerOrPayload.code_execution_result ?? null;
+        question_type = candidateAnswerOrPayload.question_type || "text";
+      }
+
+      const conv = buildConversationFromHistory();
+      conv.push({ role: "assistant", text: currentQuestion.questionText });
+      conv.push({ role: "user", text: candidateAnswer });
+
+      const questionHistory = buildQuestionHistory();
+
+      const payload = {
+        sessionId,
+        qaId: currentQuestion.questionId,
+        questionId: currentQuestion.questionId,
+        questionText: currentQuestion.questionText,
+        ideal_outline: currentQuestion.ideal_outline || currentQuestion.ideal_answer_outline || "",
+        candidateAnswer,
+        candidate_answer: candidateAnswer,
+        resume_summary: resumeParsed?.summary || "",
+        retrieved_chunks: [],
+        conversation: conv,
+        question_history: questionHistory,
+        allow_pii: false,
+        question_type, // 👈 NEW
+        code_execution_result, // 👈 NEW
+      };
+
+      const res = await fetch(`${API}/interview/answer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+        body: JSON.stringify(payload),
+      });
+
+      const body = await res.json();
+      if (!res.ok) throw new Error(body?.message || body?.error || JSON.stringify(body) || "Answer submit failed");
+
+      // Parse result with multiple fallback paths
+      const rawResult = body.result || body.validated || body;
+
+      const result: InterviewAnswerResult = {
+        score: rawResult.overall_score || rawResult.score,
+        overall_score: rawResult.overall_score || rawResult.score,
+        rubricScores: rawResult.rubric_scores || rawResult.rubricScores,
+        dimension_scores: rawResult.dimension_scores,
+        confidence: rawResult.confidence,
+        verdict: rawResult.verdict,
+        rationale: rawResult.rationale,
+        red_flags_detected: rawResult.red_flags_detected || [],
+        missing_elements: rawResult.missing_elements || [],
+        improvement: rawResult.improvement || rawResult.follow_up_probe,
+        follow_up_probe: rawResult.follow_up_probe,
+        ended: body.ended || rawResult.ended || false,
+        decision: body.final_decision || body.decision || rawResult.decision,
+        in_gray_zone: body.in_gray_zone || rawResult.in_gray_zone || false,
+        needs_human_review: body.needs_human_review || rawResult.needs_human_review || false,
+        
+        // 👇 NEW: Capture round info and elimination
+        round_info: body.round_info,
+        eliminated: body.eliminated || false,
+        elimination_reason: body.elimination_reason || null,
+        is_probe: body.nextQuestion?.is_probe || false,
+      };
+
+      // Capture feedback/improvement suggestions
+      if (result.improvement) {
+        setLastFeedback(result.improvement);
+      } else if (result.follow_up_probe) {
+        setLastFeedback(result.follow_up_probe);
+      }
+
+      // Update performance metrics if provided
+      if (body.performance_metrics) {
+        setPerformanceMetrics(body.performance_metrics);
+      }
+
+      // Add to history
+      setHistory((h) => [...h, { q: currentQuestion, a: candidateAnswer, result }]);
+
+      // 👇 NEW: Handle elimination immediately
+      if (result.eliminated || body.eliminated) {
+        console.log("❌ ELIMINATED:", result.elimination_reason || body.elimination_reason);
+        
+        const eliminationDecision = {
+          verdict: "reject",
+          confidence: 0.95,
+          reason: result.elimination_reason || body.elimination_reason || "Eliminated due to performance",
+          eliminated: true,
+          performanceMetrics: body.round_info?.round_history || body.performance_metrics,
+        };
+        
+        setFinalDecision(eliminationDecision);
+        setCurrentQuestion(null);
+        setStage("done");
+        return result;
+      }
+
+      // Check if interview ended (completion)
+      if (result.ended || body.is_final) {
+        const decision = result.decision || body.final_decision || body.result?.parsed || body.decision;
+        
+        console.log("🏁 Interview Ended. Final Decision Data:", decision);
+        
+        // 👇 NEW: Enhance decision with round history if available
+        if (decision && body.round_info?.round_history) {
+          decision.performanceMetrics = body.round_info.round_history;
+        }
+        
+        setFinalDecision(decision);
+        setCurrentQuestion(null);
+        setStage("done");
+      } else {
+        // Get next question
+        const nextQuestionData = body.nextQuestion || body.next_question || body.parsed;
+
+        if (nextQuestionData && nextQuestionData.question !== "Interview Complete") {
+          const backendId = nextQuestionData.qaId || nextQuestionData.questionId;
+
+          const normalizedNext: InterviewQuestion = {
+            questionId: backendId || `q_${Date.now()}`,
+            questionText: nextQuestionData.question || nextQuestionData.questionText ||
+              nextQuestionData.followup_question || nextQuestionData.follow_up_question || "",
+            type: normalizeType(nextQuestionData.type),
+            target_project: nextQuestionData.target_project,
+            technology_focus: nextQuestionData.technology_focus,
+            expectedAnswerType: nextQuestionData.expected_answer_type || nextQuestionData.expectedAnswerType || "medium",
+            difficulty: nextQuestionData.difficulty || "hard",
+            ideal_outline: nextQuestionData.ideal_answer_outline || nextQuestionData.ideal_outline || "",
+            red_flags: nextQuestionData.red_flags || [],
+            confidence: nextQuestionData.confidence,
+            
+            // 👇 NEW: Preserve probe flag and round info
+            is_probe: nextQuestionData.is_probe || false,
+            round: nextQuestionData.round || body.round_info?.current || "screening",
+          };
+
+          // Preserve raw payload so UI can access nested challenge/testcases
+          setCurrentQuestion({
+            ...normalizedNext,
+            raw: nextQuestionData,
+            coding_challenge: nextQuestionData.coding_challenge || nextQuestionData.challenge || nextQuestionData
+          });
+          setStage("running");
+        } else if (result.ended) {
+          setStage("done");
+          setCurrentQuestion(null);
         } else {
-          // payload object from page
-          candidateAnswer = candidateAnswerOrPayload.answer || candidateAnswerOrPayload.candidateAnswer || "";
-          code_execution_result = candidateAnswerOrPayload.code_execution_result ?? null;
-        }
-
-        const conv = buildConversationFromHistory();
-        conv.push({ role: "assistant", text: currentQuestion.questionText });
-        conv.push({ role: "user", text: candidateAnswer });
-
-        const questionHistory = buildQuestionHistory();
-
-        const payload = {
-          sessionId,
-          qaId: currentQuestion.questionId,
-          questionId: currentQuestion.questionId,
-          questionText: currentQuestion.questionText,
-          ideal_outline: currentQuestion.ideal_outline || currentQuestion.ideal_answer_outline || "",
-          candidateAnswer,
-          candidate_answer: candidateAnswer,
-          resume_summary: resumeParsed?.summary || "",
-          retrieved_chunks: [],
-          conversation: conv,
-          question_history: questionHistory,
-          allow_pii: false,
-          // include code execution result if provided
-          code_execution_result,
-        };
-console.log("🚀 QUESTION HISTORY SENT TO BACKEND:", questionHistory);
-
-        const res = await fetch(`${API}/interview/answer`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", ...getAuthHeaders() },
-          body: JSON.stringify(payload),
-        });
-
-        const body = await res.json();
-        if (!res.ok) throw new Error(body?.message || body?.error || JSON.stringify(body) || "Answer submit failed");
-
-        // Parse result with multiple fallback paths
-        const rawResult = body.result || body.validated || body;
-
-        const result: InterviewAnswerResult = {
-          score: rawResult.overall_score || rawResult.score,
-          overall_score: rawResult.overall_score || rawResult.score,
-          rubricScores: rawResult.rubric_scores || rawResult.rubricScores,
-          dimension_scores: rawResult.dimension_scores,
-          confidence: rawResult.confidence,
-          verdict: rawResult.verdict,
-          rationale: rawResult.rationale,
-          red_flags_detected: rawResult.red_flags_detected || [],
-          missing_elements: rawResult.missing_elements || [],
-          improvement: rawResult.improvement || rawResult.follow_up_probe,
-          follow_up_probe: rawResult.follow_up_probe,
-          ended: body.ended || rawResult.ended || false,
-          
-          // 🚨 FIX 1: Map 'final_decision' from backend to 'decision' in frontend
-          decision: body.final_decision || body.decision || rawResult.decision,
-          
-          in_gray_zone: body.in_gray_zone || rawResult.in_gray_zone || false,
-          needs_human_review: body.needs_human_review || rawResult.needs_human_review || false
-        };
-
-        // Capture feedback/improvement suggestions
-        if (result.improvement) {
-          setLastFeedback(result.improvement);
-        } else if (result.follow_up_probe) {
-          setLastFeedback(result.follow_up_probe);
-        }
-
-        // Update performance metrics if provided
-        if (body.performance_metrics) {
-          setPerformanceMetrics(body.performance_metrics);
-        }
-
-        // Add to history
-        setHistory((h) => [...h, { q: currentQuestion, a: candidateAnswer, result }]);
-
-        // Check if interview ended
-        if (result.ended || body.is_final) {
-          // 🚨 FIX 2: Ensure we capture the decision object correctly here too
-          const decision = result.decision || body.final_decision || body.result?.parsed || body.decision;
-          
-          console.log("🏁 Interview Ended. Final Decision Data:", decision);
-          
-          setFinalDecision(decision);
           setCurrentQuestion(null);
           setStage("done");
-        } else {
-          // Get next question
-          const nextQuestionData = body.nextQuestion || body.next_question || body.parsed;
-
-          // Debug: show raw next question (if any)
-          console.log("🔥 submitAnswer: raw nextQuestionData:", nextQuestionData);
-
-          if (nextQuestionData && nextQuestionData.question !== "Interview Complete") {
-            // FIX: Prioritize 'qaId' for the next question as well
-            const backendId = nextQuestionData.qaId || nextQuestionData.questionId;
-
-            const normalizedNext: InterviewQuestion = {
-              questionId: backendId || `q_${Date.now()}`,
-              questionText: nextQuestionData.question || nextQuestionData.questionText ||
-                nextQuestionData.followup_question || nextQuestionData.follow_up_question || "",
-              type: normalizeType(nextQuestionData.type), // 🔧 FIX
-
-              target_project: nextQuestionData.target_project,
-              technology_focus: nextQuestionData.technology_focus,
-              expectedAnswerType: nextQuestionData.expected_answer_type || nextQuestionData.expectedAnswerType || "medium",
-              difficulty: nextQuestionData.difficulty || "hard",
-              ideal_outline: nextQuestionData.ideal_answer_outline || nextQuestionData.ideal_outline || "",
-              red_flags: nextQuestionData.red_flags || [],
-              confidence: nextQuestionData.confidence
-            };
-
-            // Preserve raw payload so UI can access nested challenge/testcases
-            setCurrentQuestion({
-              ...normalizedNext,
-              raw: nextQuestionData,
-              coding_challenge: nextQuestionData.coding_challenge || nextQuestionData.challenge || nextQuestionData
-            });
-            setStage("running");
-          } else if (result.ended) {
-             // If backend says ended but we fell through here (safety net)
-             setStage("done");
-             setCurrentQuestion(null);
-          } else {
-            // No next question but not ended - treat as done
-            setCurrentQuestion(null);
-            setStage("done");
-          }
         }
-
-        return result;
-
-      } catch (err: any) {
-        setError(err.message || String(err));
-        return null;
-      } finally {
-        setLoading(false);
       }
-    },
-    [sessionId, currentQuestion, buildConversationFromHistory, buildQuestionHistory, resumeParsed, token, getAuthHeaders]
-  );
+
+      return result;
+
+    } catch (err: any) {
+      setError(err.message || String(err));
+      return null;
+    } finally {
+      setLoading(false);
+    }
+  },
+  [sessionId, currentQuestion, buildConversationFromHistory, buildQuestionHistory, resumeParsed, token, getAuthHeaders]
+);
   const endInterview = useCallback(async (reason?: string, markRejected = false) => {
     setError(null);
 

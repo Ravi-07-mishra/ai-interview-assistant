@@ -162,6 +162,9 @@ export default function InterviewPage() {
 const [codeOutput, setCodeOutput] = useState<string | null>(null);
 const [codeStatus, setCodeStatus] = useState<"idle" | "running" | "success" | "error">("idle");
 const [executionResult, setExecutionResult] = useState<any>(null); // Store Piston result here
+const [currentRound, setCurrentRound] = useState<string>("screening");
+const [roundProgress, setRoundProgress] = useState<any>(null);
+const [isProbeQuestion, setIsProbeQuestion] = useState(false);
 const allTestsPassed =
   executionResult?.summary &&
   executionResult.summary.passed === executionResult.summary.total;
@@ -1015,7 +1018,17 @@ const handleStart = useCallback(
         }
 
         console.log("✅ Session created:", serverSessionId);
+if (data?.round_info) {
+  setCurrentRound(data.round_info.current || "screening");
+  setRoundProgress(data.round_info.progress || null);
+}
 
+if (data?.firstQuestion?.is_probe) {
+  setIsProbeQuestion(true);
+  console.log("🔍 First question is a probe");
+} else {
+  setIsProbeQuestion(false);
+}
         await startInterview?.(
           jobTitle,
           difficulty,
@@ -1081,39 +1094,55 @@ const handleStart = useCallback(
       Answer submit handler (unchanged)
       ------------------------- */
 const handleSubmitAnswer = useCallback(async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!answer.trim() || loading || !currentQuestion) return;
+  e.preventDefault();
+  if (!answer.trim() || loading || !currentQuestion) return;
 
-    const answerToSubmit = answer;
-    setAnswer("");
-    const currentQId = currentQuestion.id;
+  const answerToSubmit = answer;
+  setAnswer("");
+  const currentQId = currentQuestion.questionId;
+  
+  const payload: any = { answer: answerToSubmit };
+  
+  if (currentQuestion.expectedAnswerType === "code") {
+    payload.code_execution_result = executionResult;
+    payload.question_type = "code";
+  } else {
+    payload.question_type = "text";
+  }
+
+  try {
+    const result = await submitAnswer(payload, currentQId);
     
-    // 👇 NEW LOGIC 👇
-    const payload: any = { answer: answerToSubmit };
+    if (result?.round_info) {
+      console.log("🔄 Round updated from backend:", result.round_info);
+      setCurrentRound(result.round_info.current || currentRound);
+      setRoundProgress(result.round_info.progress || roundProgress);
+    }
     
-    if (currentQuestion.expectedAnswerType === "code") {
-        // If user didn't run code, force a run or warn them? 
-        // For now, let's just send what we have (or null if they skipped running)
-        payload.code_execution_result = executionResult;
-        payload.question_type = "code";
+    if (result?.nextQuestion) {
+      const isProbe = result.nextQuestion.is_probe || false;
+      setIsProbeQuestion(isProbe);
+      console.log("🔍 Next question probe status:", isProbe);
     } else {
-        payload.question_type = "text";
+      setIsProbeQuestion(false);
     }
-
-    try {
-      // You might need to update your useInterview hook's submitAnswer signature 
-      // to accept this extra payload object instead of just string
-      await submitAnswer(payload, currentQId); 
-      
-      // Reset code state for next question
-      setCodeOutput(null);
-      setCodeStatus("idle");
-      setExecutionResult(null);
-    } catch (e) {
-      console.error("Error submitting answer:", e);
+    
+    if (result?.eliminated) {
+      console.error("❌ CANDIDATE ELIMINATED:", result.elimination_reason);
+      setTerminatedByViolation(true);
+      setViolationReason(result.elimination_reason || "Interview terminated due to performance criteria");
+      stopCamera();
+      return;
     }
-}, [answer, loading, currentQuestion, submitAnswer, executionResult]);
-
+    
+    setCodeOutput(null);
+    setCodeStatus("idle");
+    setExecutionResult(null);
+    
+  } catch (e) {
+    console.error("Error submitting answer:", e);
+  }
+}, [answer, loading, currentQuestion, submitAnswer, executionResult, currentRound, roundProgress, stopCamera]);
   /* -------------------------
       Cleanup effect (unmount) (unchanged)
       ------------------------- */
@@ -1130,6 +1159,46 @@ const handleSubmitAnswer = useCallback(async (e: React.FormEvent) => {
   /* -------------------------
       Fullscreen and Window Event Handlers (unchanged)
       ------------------------- */
+      const EliminationModal = () => {
+  if (!terminatedByViolation || stage !== "running") return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+      <div className="max-w-xl w-full bg-white rounded-xl p-8 shadow-lg">
+        <div className="text-center">
+          <div className="w-20 h-20 bg-rose-100 rounded-full flex items-center justify-center mx-auto mb-4">
+            <XCircle size={40} className="text-rose-600" />
+          </div>
+          
+          <h3 className="text-2xl font-bold mb-2 text-slate-900">
+            Interview Ended
+          </h3>
+          
+          <p className="text-slate-600 mb-4">
+            {violationReason || cameraError || "The interview has been terminated due to multiple integrity violations."}
+          </p>
+
+          <div className="bg-rose-50 border border-rose-200 rounded-lg p-4 mb-6">
+            <div className="text-sm text-rose-800">
+              <strong>Violation Count:</strong> {violationCount}
+            </div>
+          </div>
+
+          <button
+            onClick={() => {
+              stopCamera();
+              window.location.reload();
+            }}
+            className="px-6 py-3 bg-slate-600 text-white rounded-lg hover:bg-slate-700 font-bold"
+          >
+            Return to Start
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
   const handleBeforeUnload = useCallback(
     (event: BeforeUnloadEvent) => {
       if (stage === "running" && !endingRef.current) {
@@ -1231,6 +1300,17 @@ const handleSubmitAnswer = useCallback(async (e: React.FormEvent) => {
       });
     }
   }, [stage, resumeParsed, token, imageStatus, captureReferenceImage]);
+useEffect(() => {
+  if (currentQuestion) {
+    const isProbe = currentQuestion.is_probe || false;
+    const round = currentQuestion.round || "screening";
+    
+    setIsProbeQuestion(isProbe);
+    setCurrentRound(round);
+    
+    console.log(`📋 Question loaded - Round: ${round}, Probe: ${isProbe}, Type: ${currentQuestion.expectedAnswerType}`);
+  }
+}, [currentQuestion]);
 
   /* -------------------------
       Render
@@ -1275,7 +1355,57 @@ useEffect(() => {
   }
   // If you want to always reset on new question uncomment:
   // setAnswer(starter || "");
-}, [currentQuestion?.questionId]); // run when question changes
+}, [currentQuestion?.questionId]);
+ // run when question changes
+ const RoundIndicator = () => {
+  if (stage !== "running" || !currentRound) return null;
+
+  const roundConfig = {
+    screening: { label: "Screening", color: "bg-blue-500", icon: "🎯" },
+    technical: { label: "Technical Deep-Dive", color: "bg-purple-500", icon: "⚙️" },
+    behavioral: { label: "Behavioral", color: "bg-green-500", icon: "💬" },
+    complete: { label: "Complete", color: "bg-emerald-500", icon: "✅" }
+  };
+
+  const config = roundConfig[currentRound as keyof typeof roundConfig] || roundConfig.screening;
+
+  return (
+    <div className="mb-6 bg-white rounded-xl shadow-md border border-slate-200 p-4">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <div className={`${config.color} text-white px-3 py-1 rounded-lg font-bold text-sm flex items-center gap-2`}>
+            <span>{config.icon}</span>
+            <span>{config.label}</span>
+          </div>
+          
+          {isProbeQuestion && (
+            <div className="bg-amber-100 text-amber-800 px-3 py-1 rounded-lg font-bold text-xs border-2 border-amber-300 animate-pulse">
+              🔍 Follow-up Probe
+            </div>
+          )}
+        </div>
+
+        {roundProgress && (
+          <div className="flex items-center gap-4 text-sm">
+            {Object.entries(roundProgress).map(([round, data]: [string, any]) => (
+              <div key={round} className="flex items-center gap-2">
+                <span className="text-slate-600 capitalize">{round}:</span>
+                <span className={`font-bold ${
+                  data.status === "completed" ? "text-green-600" :
+                  data.status === "in_progress" ? "text-blue-600" :
+                  "text-slate-400"
+                }`}>
+                  {data.questions || 0} Q's
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
   return (
     <div className="min-h-screen bg-slate-50 py-12">
       {/* Fixed Camera View (during interview) (unchanged) */}
@@ -1477,6 +1607,8 @@ useEffect(() => {
             </div>
           </div>
         )}
+              <EliminationModal />
+
 
         {/* Header (unchanged) */}
         <div className="mb-8 flex items-center justify-between">
@@ -1591,6 +1723,8 @@ useEffect(() => {
             </div>
           </div>
         )}
+        <RoundIndicator />
+
 
         {/* Not Logged In Warning (unchanged) */}
         {!token && (
@@ -1746,6 +1880,19 @@ useEffect(() => {
                     )}
                   </div>
                 </div>
+                {isProbeQuestion && (
+  <div className="mt-3 p-3 bg-amber-50 border-l-4 border-amber-400 rounded text-sm">
+    <div className="flex items-center gap-2 text-amber-800 font-bold mb-1">
+      <HelpCircle size={16} />
+      <span>Follow-up Question</span>
+    </div>
+    <p className="text-amber-700 text-xs">
+      This is a clarifying question based on your previous answer. 
+      Take your time to provide more detail.
+    </p>
+  </div>
+)}
+
 
                 <h2 className="text-2xl font-bold text-slate-900 leading-snug">
                   {currentQuestion.questionText}
@@ -1991,41 +2138,86 @@ useEffect(() => {
                 </div>
               )}
 
-              {finalDecision ? (
-                <div className="bg-gradient-to-br from-slate-50 to-indigo-50 rounded-2xl p-8 mb-8 text-center border-2 border-slate-200">
-                  <div className="text-sm text-slate-600 uppercase tracking-widest font-black mb-4">
-                    Final Verdict
-                  </div>
-                  <div className="mb-5 transform scale-150 inline-block">
-                    {renderVerdictBadge(finalDecision.verdict)}
-                  </div>
+         {finalDecision ? (
+  <div className="bg-gradient-to-br from-slate-50 to-indigo-50 rounded-2xl p-8 mb-8 border-2 border-slate-200">
+    <div className="text-sm text-slate-600 uppercase tracking-widest font-black mb-4 text-center">
+      Final Verdict
+    </div>
+    <div className="mb-5 transform scale-150 inline-block text-center w-full">
+      {renderVerdictBadge(finalDecision.verdict)}
+    </div>
+             
+    {/* 👇 NEW: Round-by-round breakdown */}
+    {finalDecision.performanceMetrics && (
+      <div className="mt-6 grid grid-cols-1 md:grid-cols-3 gap-4">
+        {Object.entries(finalDecision.performanceMetrics).map(([round, stats]: [string, any]) => (
+          <div key={round} className="bg-white p-4 rounded-lg border border-slate-200">
+            <div className="text-xs uppercase text-slate-500 font-bold mb-2 capitalize">
+              {round} Round
+            </div>
+            <div className="text-2xl font-black text-slate-900">
+              {stats.questions || 0} Questions
+            </div>
+            {stats.average_score !== undefined && (
+              <div className="text-sm text-slate-600 mt-1">
+                Avg: {Math.round(stats.average_score * 100)}%
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    )}
 
-                  {finalDecision.confidence && (
-                    <div className="text-sm text-slate-500 mb-5 font-medium">
-                      Decision Confidence:{" "}
-                      <span className="font-bold text-slate-700">
-                        {(finalDecision.confidence * 100).toFixed(0)}%
-                      </span>
-                    </div>
-                  )}
+    {finalDecision.confidence && (
+      <div className="text-sm text-slate-500 mt-5 font-medium text-center">
+        Decision Confidence:{" "}
+        <span className="font-bold text-slate-700">
+          {(finalDecision.confidence * 100).toFixed(0)}%
+        </span>
+      </div>
+    )}
 
-                  {finalDecision.reason && (
-                    <div className="text-slate-800 font-medium italic max-w-2xl mx-auto text-lg leading-relaxed bg-white p-6 rounded-xl border border-slate-200 shadow-sm">
-                      "{finalDecision.reason}"
-                    </div>
-                  )}
+    {finalDecision.reason && (
+      <div className="text-slate-800 font-medium italic max-w-2xl mx-auto text-lg leading-relaxed bg-white p-6 rounded-xl border border-slate-200 shadow-sm mt-5">
+        "{finalDecision.reason}"
+      </div>
+    )}
 
-                  {finalDecision.recommended_role && (
-                    <div className="mt-5 text-sm text-indigo-600 font-bold">
-                      Recommended Role: {finalDecision.recommended_role}
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <div className="text-center p-8 bg-slate-50 rounded-2xl text-slate-500 mb-8 border-2 border-slate-200">
-                  Processing final results...
-                </div>
-              )}
+    {/* 👇 NEW: Show elimination reason if present */}
+    {finalDecision.critical_weaknesses && finalDecision.critical_weaknesses.length > 0 && (
+      <div className="mt-5 p-4 bg-rose-50 border border-rose-200 rounded-lg">
+        <div className="text-sm font-bold text-rose-800 mb-2">Areas for Improvement:</div>
+        <ul className="text-sm text-rose-700 list-disc list-inside space-y-1">
+          {finalDecision.critical_weaknesses.map((weakness: string, idx: number) => (
+            <li key={idx}>{weakness}</li>
+          ))}
+        </ul>
+      </div>
+    )}
+
+    {finalDecision.key_strengths && finalDecision.key_strengths.length > 0 && (
+      <div className="mt-5 p-4 bg-emerald-50 border border-emerald-200 rounded-lg">
+        <div className="text-sm font-bold text-emerald-800 mb-2">Key Strengths:</div>
+        <ul className="text-sm text-emerald-700 list-disc list-inside space-y-1">
+          {finalDecision.key_strengths.map((strength: string, idx: number) => (
+            <li key={idx}>{strength}</li>
+          ))}
+        </ul>
+      </div>
+    )}
+
+    {finalDecision.recommended_role && (
+      <div className="mt-5 text-sm text-indigo-600 font-bold text-center">
+        Recommended Role: {finalDecision.recommended_role}
+      </div>
+    )}
+  </div>
+) : (
+  <div className="text-center p-8 bg-slate-50 rounded-2xl text-slate-500 mb-8 border-2 border-slate-200">
+    Processing final results...
+  </div>
+)}
+
 
               <div className="flex justify-center gap-4">
                 <button
