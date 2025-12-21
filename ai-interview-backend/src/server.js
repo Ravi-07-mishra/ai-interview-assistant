@@ -840,7 +840,7 @@ const hintUsed = qaRec.metadata?.hint_used || false;
       verdict: validated.verdict || "weak",
       confidence: validated.confidence ?? 0.5,
       rationale: validated.rationale || aiScoreResp.rationale || "",
-      improvement: validated.mentor_tip || validated.follow_up_probe || null,
+      improvement: validated.feedback_for_candidate || validated.mentor_tip || validated.follow_up_probe || null,
       red_flags_detected: validated.red_flags_detected || [],
       missing_elements: validated.missing_elements || [],
       needsHumanReview: aiScoreResp.in_gray_zone || false,
@@ -952,6 +952,7 @@ const hintUsed = qaRec.metadata?.hint_used || false;
               verdict: "reject",
               confidence: 0.95,
               reason: eliminationReason,
+              feedback_summary: "The interview was concluded early based on technical requirements.", // Fallback
               recommended_role: null,
               key_strengths: [],
               critical_weaknesses: [eliminationReason],
@@ -997,6 +998,7 @@ const hintUsed = qaRec.metadata?.hint_used || false;
               verdict: modelDecision.verdict || "hire",
               confidence: modelDecision.confidence || 0.85,
               reason: modelDecision.reason,
+              feedback_summary: modelDecision.feedback_summary,
               recommended_role: modelDecision.recommended_role,
               key_strengths: modelDecision.key_strengths || [],
               critical_weaknesses: modelDecision.critical_weaknesses || [],
@@ -1064,8 +1066,12 @@ const hintUsed = qaRec.metadata?.hint_used || false;
     // ================= RESPONSE =================
     return res.json({
       validated: { overall_score: overallScore, verdict: validated.verdict },
-      result: { score: overallScore, verdict: validated.verdict },
-      nextQuestion,
+result: { 
+          score: overallScore, 
+          verdict: validated.verdict, 
+          improvement: scoreUpdate.improvement, // This now contains the helpful feedback
+          rationale: validated.rationale 
+      },      nextQuestion,
       ended,
       eliminated,
       elimination_reason: eliminationReason,

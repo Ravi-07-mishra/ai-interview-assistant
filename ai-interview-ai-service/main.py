@@ -1789,6 +1789,7 @@ Honesty + reasoning > memorized perfection
   "confidence": 0.0-1.0,
   "verdict": "fail|weak|acceptable|strong|exceptional",
   "rationale": "string",
+  "feedback_for_candidate": "string (Constructive criticism. Tell them specifically what they missed or what they did well)",
   "red_flags_detected": ["list"],
   "missing_elements": ["list"],
   "follow_up_probe": "string or null",
@@ -1817,8 +1818,8 @@ INSTRUCTIONS:
 1. Score using campus-level expectations
 2. Penalize bluffing heavily
 3. Be fair to partial but honest answers
-4. Suggest a FOLLOW-UP only if score is 0.4-0.7
-5. Provide a MENTOR TIP suitable for placement prep
+4. **MANDATORY**: Generate `feedback_for_candidate`. This must be helpful and specific (e.g., "You forgot to handle the edge case where X is null").
+5. **MANDATORY**: If the `overall_score` is between **0.35 and 0.75**, you MUST provide a `follow_up_probe` to check their depth.
 
 OUTPUT JSON:
 {schema}
@@ -1850,21 +1851,12 @@ Answer: {a}
 Score: {score} ({verdict})
 ---"""
     
-    termination_guidance = ""
-    if metrics["consecutive_fails"] >= 2:
-        termination_guidance = "⚠️ CRITICAL: 2+ consecutive fails detected. You MUST reject unless there's exceptional justification."
-    elif metrics["average_score"] < 0.50 and metrics["question_count"] >= 3:
-        termination_guidance = "⚠️ CRITICAL: Average below hiring bar. Recommend reject."
-    elif metrics["consecutive_wins"] >= 3:
-        termination_guidance = "✓ STRONG SIGNAL: Consistent excellence detected. Consider hiring."
-    elif metrics["question_count"] >= 7:
-        termination_guidance = "⏰ TIME LIMIT: Must make final decision now."
-    
     schema = '''{
   "ended": boolean,
   "verdict": "hire|reject|maybe",
   "confidence": 0.0-1.0,
-  "reason": "string (specific, evidence-based)",
+  "reason": "string (Internal hiring justification)",
+  "feedback_summary": "string (A polite, constructive paragraph addressed TO THE CANDIDATE summarizing their performance)",
   "recommended_role": "string|null",
   "key_strengths": ["list"],
   "critical_weaknesses": ["list"]
@@ -1881,18 +1873,15 @@ Score: {score} ({verdict})
     {history_text}
     
     DECISION LOGIC:
-    1. **CONTINUE (ended: false)**: If you are unsure (Confidence < {TERMINATION_RULES['min_confidence_to_end']}) and need to probe more skills.
-    2. **HIRE (ended: true)**: If candidate showed clear expertise across multiple topics.
-    3. **REJECT (ended: true)**: If candidate failed basic questions or was caught bluffing.
+    1. **CONTINUE (ended: false)**: If unsure (Confidence < {TERMINATION_RULES['min_confidence_to_end']}).
+    2. **HIRE (ended: true)**: Strong signals across multiple topics.
+    3. **REJECT (ended: true)**: Failed basic questions or bluffing.
     
-    **CRITICAL**: Do not stop early just to be short. Only stop if you have CONCRETE evidence for a Hire/Reject decision.
+    INSTRUCTIONS:
+    - `reason`: Be blunt and specific for the hiring team (e.g., "Failed basic DSA").
+    - `feedback_summary`: Be professional and helpful for the candidate (e.g., "You showed strong potential in X, but we recommend focusing on Y").
     
-    Output JSON: {{
-      "ended": boolean,
-      "verdict": "hire|reject|maybe",
-      "confidence": 0.0-1.0,
-      "reason": "string"
-    }}
+    Output JSON: {schema}
     """
     return prompt.strip()
 def run_code_in_sandbox(language: str, code: str, stdin: str = "") -> Dict[str, Any]:
@@ -2073,40 +2062,41 @@ def run_code_in_sandbox(language: str, code: str, stdin: str = "") -> Dict[str, 
         "run_stage": None,
         "compile_stage": None
     }
-
 def call_decision(context: dict, temperature: float = 0.0) -> Dict[str, Any]:
     """Make hiring decision with performance-based termination"""
     
-    # 1. First check hard rules (Keep this! It handles catastrophic failure)
+    # 1. First check hard rules
     hard_decision = check_termination_rules(context.get("question_history", []))
     
     if hard_decision:
         hard_decision["ended"] = True
+        # Add default feedback for hard rules
+        if hard_decision.get("verdict") == "reject":
+            hard_decision["feedback_summary"] = "The interview concluded early due to significant gaps in core technical requirements."
+        else:
+            hard_decision["feedback_summary"] = "You demonstrated excellent proficiency and we are happy to move forward."
+            
         return {"ok": True, "parsed": hard_decision, "raw": "hard_rule_triggered"}
 
-    # =========================================================================
-    # 🛡️ SAFETY GUARD: PREVENT PREMATURE MODEL REJECTION (MISSING IN YOUR CODE)
-    # =========================================================================
+    # 2. Safety Guard (Prevent premature rejection on short interviews)
     history = context.get("question_history", [])
-    # We need metrics to check the score
     metrics = calculate_performance_metrics(history) 
     
-    # RULE: If interview is short (< 3 Qs) and score is okay (> 40%), FORCE CONTINUE.
     if len(history) < 3 and metrics["average_score"] > 0.40:
-        logger.info(f"🛡️ Safety Guard Triggered: Forcing CONTINUE (Questions={len(history)}, Score={metrics['average_score']:.2f})")
+        logger.info(f"🛡️ Safety Guard Triggered: Forcing CONTINUE")
         return {
             "ok": True, 
             "parsed": {
                 "ended": False,
                 "verdict": "maybe",
                 "confidence": 1.0,
-                "reason": "Interview is too short to make a final decision. Continuing to gather more signals."
+                "reason": "Interview too short.",
+                "feedback_summary": "Please continue to the next section."
             }, 
             "raw": "safety_guard_triggered"
         }
-    # =========================================================================
 
-    # 2. Otherwise, consult the model (Normal Flow)
+    # 3. Consult AI
     prompt = build_decision_prompt(context)
     resp = llm_call(prompt, temperature=temperature, max_tokens=600)
     
@@ -2115,32 +2105,32 @@ def call_decision(context: dict, temperature: float = 0.0) -> Dict[str, Any]:
     
     parsed = extract_json_from_text(resp["raw"])
     if not parsed:
-        # Fallback decision based on metrics
+        # Fallback
         return {
             "ok": True,
             "parsed": {
                 "ended": metrics["question_count"] >= 6,
                 "verdict": "maybe",
                 "confidence": 0.5,
-                "reason": "Model parse failed, using metrics fallback",
-                "recommended_role": None
+                "reason": "Model parse failed",
+                "feedback_summary": "Review complete. Pending final analysis."
             },
             "raw": resp["raw"]
         }
     
-    # Normalize the parsed decision
+    # Normalize
     normalized = {
         "ended": bool(parsed.get("ended", False)),
         "verdict": parsed.get("verdict", "maybe"),
         "confidence": float(parsed.get("confidence", 0.5)),
         "reason": parsed.get("reason", ""),
+        "feedback_summary": parsed.get("feedback_summary") or "Thank you for completing the interview.",
         "recommended_role": parsed.get("recommended_role"),
         "key_strengths": parsed.get("key_strengths", []),
         "critical_weaknesses": parsed.get("critical_weaknesses", [])
     }
     
-    # Force termination if max questions reached
-    if context.get("question_history") and len(context["question_history"]) >= TERMINATION_RULES["max_questions"]:
+    if len(history) >= TERMINATION_RULES["max_questions"]:
         normalized["ended"] = True
     
     return {"ok": True, "parsed": normalized, "raw": resp["raw"]}
@@ -3483,6 +3473,7 @@ def score_answer(req: ScoreAnswerRequest):
         "confidence": 0.5,
         "verdict": "weak",
         "rationale": "",
+        "feedback_for_candidate": "No feedback provided.", # Default
         "red_flags_detected": [],
         "missing_elements": [],
         "follow_up_probe": None
@@ -3508,6 +3499,7 @@ def score_answer(req: ScoreAnswerRequest):
             validated["confidence"] = max(0.0, min(1.0, float(parsed.get("confidence", 0.5))))
             validated["verdict"] = parsed.get("verdict", "weak")
             validated["rationale"] = parsed.get("rationale", "")
+            validated["feedback_for_candidate"] = parsed.get("feedback_for_candidate") or parsed.get("rationale", "No feedback provided.")
             validated["red_flags_detected"] = parsed.get("red_flags_detected", [])
             validated["missing_elements"] = parsed.get("missing_elements", [])
             validated["follow_up_probe"] = parsed.get("follow_up_probe")
@@ -3570,7 +3562,7 @@ def score_answer(req: ScoreAnswerRequest):
     )
     
     # 2. STRICT PROBE SUPPRESSION LOGIC
-    final_in_gray_zone = False  # Default: NO PROBE
+    final_in_gray_zone = raw_in_gray_zone  # Default: NO PROBE
     
     if raw_in_gray_zone and incoming_history:
         # ====================================================================
@@ -3583,31 +3575,16 @@ def score_answer(req: ScoreAnswerRequest):
             similarity = compute_similarity(last_q, prev_q)
             
             # If questions are >25% similar, we JUST probed. STOP.
-            if similarity > 0.25:
+            if similarity > 0.45:
                 logger.info(f"🛑 Anti-Loop Rule 1: Question similarity {similarity:.2f} > 0.25. NO PROBE.")
                 final_in_gray_zone = False
             
             # ================================================================
             # RULE 2: Check Topic Overlap (Prevent drilling same concept)
             # ================================================================
-            elif similarity <= 0.25:
-                # Extract technical topics from both questions
-                last_topics = extract_question_topics(last_q)
-                prev_topics = extract_question_topics(prev_q)
-                
-                # If >50% topic overlap, we're beating a dead horse
-                if last_topics and prev_topics:
-                    overlap_ratio = len(last_topics & prev_topics) / max(len(last_topics), 1)
-                    if overlap_ratio > 0.5:
-                        logger.info(f"🛑 Anti-Loop Rule 2: Topic overlap {overlap_ratio:.2f} > 0.5. NO PROBE.")
-                        final_in_gray_zone = False
-                    else:
-                        # ONLY allow probe if BOTH similarity AND topic overlap are low
-                        final_in_gray_zone = True
-                        logger.info(f"✅ Probe allowed: similarity={similarity:.2f}, topic_overlap={overlap_ratio:.2f}")
-                else:
-                    # If we can't extract topics, err on the side of NO PROBE
-                    final_in_gray_zone = False
+            elif incoming_history[-1].get("is_probe", False):
+                 logger.info("🛑 Anti-Loop: Last question was already a probe. Suppressing.")
+                 final_in_gray_zone = False
         
         # ====================================================================
         # RULE 3: Check if Previous Answer was ALSO Weak (Consecutive Weakness)
@@ -3627,9 +3604,7 @@ def score_answer(req: ScoreAnswerRequest):
         # ====================================================================
         # RULE 4: Hard Limit - Never Probe After Question 5
         # ====================================================================
-        if final_in_gray_zone and current_q_count > 5:
-            logger.info(f"🛑 Anti-Loop Rule 4: Question #{current_q_count} > 5. NO MORE PROBES.")
-            final_in_gray_zone = False
+
     
     # ========================================================================
     # 3. DEBUGGING LOG (Shows why decision was made)
@@ -3697,20 +3672,17 @@ def probe(req: ProbeRequest):
         "parsed": probe_result.get("parsed"),
         "redaction_log": redaction_log
     }
-
 @app.post("/finalize_decision")
 def finalize_decision(req: DecisionRequest):
     """Make final hiring decision with performance-based termination"""
     payload = req.dict()
     
-    # PII redaction
     if not payload.get("allow_pii") and payload.get("resume_summary"):
         r = redact_pii(payload["resume_summary"])
         payload["resume_summary"] = r["redacted"]
     
     enforced = enforce_budget(payload)
     
-    # ✅ Calculate metrics FIRST (fixes bug)
     metrics = calculate_performance_metrics(payload.get("question_history", []))
     
     context = {
@@ -3722,9 +3694,6 @@ def finalize_decision(req: DecisionRequest):
     
     result = call_decision(context, temperature=0.0)
     
-    # -------------------------------------------------
-    # FINALITY LOGIC (RULE-FIRST, MODEL-SECOND)
-    # -------------------------------------------------
     is_final = False
     
     if result.get("ok") and result.get("parsed"):
@@ -3732,16 +3701,11 @@ def finalize_decision(req: DecisionRequest):
         verdict = decision.get("verdict")
         confidence = decision.get("confidence", 0.0)
 
-        # 🔒 HARD RULES ALWAYS FINAL
         if result.get("raw") == "hard_rule_triggered":
             is_final = True
-
-        # 🔒 CLEAR MODEL DECISION
         elif payload.get("accept_model_final", True):
             if verdict in ("hire", "reject") and confidence >= 0.75:
                 is_final = True
-
-            # 🔒 LOW AVERAGE + REJECT = FINAL
             elif verdict == "reject" and metrics["average_score"] < 0.45:
                 is_final = True
 
@@ -3752,7 +3716,6 @@ def finalize_decision(req: DecisionRequest):
         "performance_metrics": metrics,
         "termination_rule_triggered": result.get("raw") == "hard_rule_triggered"
     }
-
 
 @app.post("/parse_resume")
 async def parse_resume(

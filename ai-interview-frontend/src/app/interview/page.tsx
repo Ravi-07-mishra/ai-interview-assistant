@@ -2725,7 +2725,14 @@ if (excalidrawAPI) {
                                 </div>
                               )}
                             </div>
-
+{h.result.improvement && (
+  <div className="text-sm bg-emerald-50 p-4 rounded-lg border-l-4 border-emerald-500 text-emerald-900 mb-3">
+    <span className="font-bold flex items-center gap-2 mb-1">
+      <Lightbulb size={16} /> Feedback & Improvements:
+    </span>
+    {h.result.improvement}
+  </div>
+)}
                             {h.result.rationale && (
                               <div className="text-xs text-slate-600 bg-blue-50 p-3 rounded-lg border border-blue-100">
                                 <span className="font-bold text-blue-900">

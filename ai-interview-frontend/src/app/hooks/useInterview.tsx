@@ -331,6 +331,9 @@ const submitAnswer = useCallback(
       let candidateAnswer: string;
       let code_execution_result = null;
       let question_type = "text";
+      let whiteboard_elements = null;        // 🆕 Added
+        let user_time_complexity = null;       // 🆕 Added
+        let user_space_complexity = null;      // 🆕 Added
       
       if (typeof candidateAnswerOrPayload === "string") {
         candidateAnswer = candidateAnswerOrPayload;
@@ -339,6 +342,9 @@ const submitAnswer = useCallback(
         candidateAnswer = candidateAnswerOrPayload.answer || candidateAnswerOrPayload.candidateAnswer || "";
         code_execution_result = candidateAnswerOrPayload.code_execution_result ?? null;
         question_type = candidateAnswerOrPayload.question_type || "text";
+        whiteboard_elements = candidateAnswerOrPayload.whiteboard_elements || null;
+          user_time_complexity = candidateAnswerOrPayload.user_time_complexity || null;
+          user_space_complexity = candidateAnswerOrPayload.user_space_complexity || null;
       }
 
       const conv = buildConversationFromHistory();
@@ -362,6 +368,9 @@ const submitAnswer = useCallback(
         allow_pii: false,
         question_type, // 👈 NEW
         code_execution_result, // 👈 NEW
+        whiteboard_elements,
+          user_time_complexity,
+          user_space_complexity
       };
 
       const res = await fetch(`${API}/interview/answer`, {
