@@ -117,26 +117,25 @@ INTERVIEW_ROUNDS = {
     "screening": {
         "name": "Screening Round",
         "focus": ["experience", "resume_basics", "fundamentals"],
-        "min_questions": 1,   # Minimum 1 question to start
-        "max_questions": 3,   # Hard limit of 3
+        "min_questions": 1,
+        "max_questions": 2,
         "pass_threshold": 0.55,
         "elimination": True
     },
     "technical": {
         "name": "Technical Round",
-        "focus": ["project_discussion", "coding_challenge", "system_design"],
-        # ✅ UPDATED: Enforces 3 to 4 questions strictly
-        "min_questions": 3,   
-        "max_questions": 4,   
+        "focus": ["project_discussion", "coding_challenge", "system_design"], # <--- Included here
+        "min_questions": 3, 
+        "max_questions": 5, # Increased max to allow for a design question
         "pass_threshold": 0.60,
         "elimination": True
     },
     "behavioral": {
         "name": "Behavioral Round",
-        "focus": ["achievement", "ownership", "collaboration"],
+        "focus": ["achievement", "collaboration", "ownership"],
         "min_questions": 1,
-        "max_questions": 2,   
-        "pass_threshold": 0.65,
+        "max_questions": 2,
+        "pass_threshold": 0.5,
         "elimination": True
     }
 }
@@ -153,8 +152,9 @@ QUESTION_TYPE_TO_ROUND = {
     # --- Technical (Projects & Coding) ---
     "project_discussion": "technical",  # <--- Moved to Technical
     "coding_challenge": "technical",
-    "debugging": "technical",
     "system_design": "technical",
+        "debugging": "technical",
+
 
     # --- Behavioral (Achievements & HR) ---
     "achievement": "behavioral",
@@ -171,7 +171,7 @@ TERMINATION_RULES = {
     "excellence_count": 3,
     
     # 👇 ADD THIS LINE (Fixes the 500 Crash) 👇
-    "max_questions": len(INTERVIEW_FLOW) + 3,
+    "max_questions": 10,
 
     "min_confidence_to_end": 0.85,
     "max_questions_soft_limit": 9,
@@ -212,23 +212,22 @@ INTERVIEW_MODE = {
         "practical_implementation"
     ]
 }
-
 SCORING_DIMENSIONS = {
     "technical_accuracy": {
-        "weight": 0.40,
-        "description": "Correctness of technical facts, algorithms, and concepts"
+        "weight": 0.50,  # ⬆️ Increased from 0.40
+        "description": "Correctness of code, logic, complexity analysis, and algorithms"
     },
     "depth_of_understanding": {
         "weight": 0.30,
-        "description": "Ability to explain 'why' and 'how', not just 'what'"
+        "description": "Ability to explain 'why' (trade-offs, edge cases, optimizations)"
     },
     "practical_experience": {
-        "weight": 0.20,
-        "description": "Evidence of real implementation, debugging, trade-offs"
+        "weight": 0.15,
+        "description": "Evidence of real implementation, debugging, and clean code standards"
     },
     "communication_clarity": {
-        "weight": 0.10,
-        "description": "Ability to articulate complex ideas clearly"
+        "weight": 0.05,  # ⬇️ Reduced from 0.10 (Behavioral impact lowered)
+        "description": "Ability to articulate ideas (less critical than code correctness)"
     }
 }
 # ALLOWED_GROQ_MODELS = [
@@ -679,6 +678,38 @@ def normalize_overall_score(validated: dict, history: List[Dict[str, Any]]) -> f
         score -= 0.05
 
     return max(0.0, min(1.0, score))
+# Locate the existing function and REPLACE it with this robust version
+def extract_whiteboard_keywords(scene_elements: List[Dict[str, Any]]) -> str:
+    """
+    Parses Excalidraw JSON to find what the user wrote.
+    CRITICAL: Filters out deleted elements so AI doesn't see erased text.
+    """
+    if not scene_elements:
+        return "Whiteboard is empty."
+
+    found_text = []
+    
+    for el in scene_elements:
+        # 1. Skip deleted elements (Excalidraw soft-deletes)
+        if el.get("isDeleted", False):
+            continue
+
+        # 2. Extract text from 'text' elements
+        if el.get("type") == "text" and "text" in el:
+            clean_txt = el["text"].strip()
+            if len(clean_txt) > 1: 
+                found_text.append(clean_txt)
+                
+        # 3. Extract text from labeled arrows/shapes
+        if "label" in el and el["label"] and "text" in el["label"]:
+             clean_txt = str(el["label"]["text"]).strip()
+             if len(clean_txt) > 1:
+                found_text.append(clean_txt)
+
+    if not found_text:
+        return "Whiteboard contains shapes but NO text labels."
+
+    return "Items drawn on whiteboard: " + ", ".join(found_text)
 def derive_verdict_from_score(score: float) -> str:
     """
     Calibrated grading scale for technical interviews.
@@ -1284,7 +1315,7 @@ def build_generate_question_prompt(
     # 1. Build STRICT history context with Status Tags
     # This helps the LLM see if the previous topic was a failure
     recent_q_text_list = []
-    for i, h in enumerate(history[-6:]):
+    for i, h in enumerate(history[-5:]):
         score = h.get("score", 1.0)
         status = "PASSED" if score >= 0.5 else "FAILED"
         recent_q_text_list.append(f"Q{i+1} [{status}]: {h.get('question','')[:120]}")
@@ -1376,6 +1407,18 @@ Pass Threshold: {round_config['pass_threshold'] * 100}%
 - Create a solvable problem (not just theory)
 - **CRITICAL**: This MUST be a coding problem with test cases, NOT a conceptual question
 """
+    elif required_type == "system_design":
+        project_focus = f"""
+🎯 FOCUS: SYSTEM DESIGN (WHITEBOARD SESSION)
+- The candidate has indicated backend/architecture skills.
+- Ask a High-Level Design (HLD) question appropriate for a fresher/intern.
+- **Classic Examples**: Design a URL Shortener, Design a Chat App, Design a Parking Lot, Design an Image Upload Service.
+- **Constraints**:
+  1. Ask for High Level Architecture (API, DB, Key Components).
+  2. Do NOT ask for code. Ask for the *Structure*.
+  3. Mention: "You can use the whiteboard to draw your components."
+- Difficulty: {difficulty_level}
+"""    
         
     elif required_type == "experience":
         # ✅ CHECK: Does resume have work experience?
@@ -1420,6 +1463,33 @@ Pass Threshold: {round_config['pass_threshold'] * 100}%
 - Pick the MOST impressive entry
 - Ask about the TECHNICAL challenge solved or skill acquired
 - Example: "What algorithmic approach won you [Competition Name]?" or "How did you apply [Certification skill] in practice?"
+"""
+    elif required_type == "collaboration":
+        project_focus = """
+🎯 FOCUS: TEAMWORK & CONFLICT RESOLUTION (Behavioral)
+- Ask about a time the candidate faced a disagreement or conflict in a team.
+- Focus on: Communication, Empathy, and Resolution.
+- Example: "Tell me about a time you disagreed with a teammate's technical decision. How did you resolve it?"
+- **Constraint**: Do NOT ask about technical details, ask about the *interaction*.
+"""
+
+    # 🟢 NEW BLOCK 2: OWNERSHIP / LEADERSHIP
+    elif required_type == "ownership":
+        project_focus = """
+🎯 FOCUS: OWNERSHIP & INITIATIVE (Behavioral)
+- Ask about a time the candidate went above and beyond or took responsibility for a failure.
+- Focus on: Accountability, Proactivity, and Learning.
+- Example: "Tell me about a mistake you made in a project. How did you fix it and what did you learn?"
+- **Constraint**: Look for "I" statements, not just "We".
+"""
+
+    # 🟢 NEW BLOCK 3: CATCH-ALL BEHAVIORAL (Safety Net)
+    elif required_type == "behavioral" or required_type == "hr":
+        project_focus = """
+🎯 FOCUS: GENERAL BEHAVIORAL / CULTURE FIT
+- Ask a standard behavioral question using the STAR method.
+- Topics: Adaptability, Time Management, or Motivation.
+- Example: "Describe a situation where you had to learn a new technology very quickly."
 """
 
     elif required_type == "project_discussion" and target_project:
@@ -1500,12 +1570,19 @@ OUTPUT FORMAT (JSON ONLY, NO MARKDOWN):
 # SCORING SYSTEM
 # ==========================================
 
-def build_score_prompt(question_text: str, ideal_outline: str, candidate_answer: str, context: dict = None) -> str:
+def build_score_prompt(
+    question_text: str, 
+    ideal_outline: str, 
+    candidate_answer: str, 
+    context: Optional[Dict[str, Any]] = None,
+    user_time_complexity: Optional[str] = None,
+    user_space_complexity: Optional[str] = None
+) -> str:
     """
     CAMPUS-LEVEL MULTI-DIMENSIONAL SCORING
     - Designed for Intern / Fresher / Placement interviews
     - Harsh on bluffing, fair on partial understanding
-    - Supports TEXT and CODE modes
+    - Supports TEXT, CODE, and SYSTEM DESIGN modes
     """
     context = context or {}
     resume = context.get("resume", "")
@@ -1527,13 +1604,28 @@ def build_score_prompt(question_text: str, ideal_outline: str, candidate_answer:
     ])
 
     # =========================================================
-    # CODE SCORING (Campus-Friendly)
+    # 1. CODE SCORING (Campus-Friendly)
     # =========================================================
     if question_type == "coding_challenge":
         passed = exec_result.get("passed", False)
         output_log = exec_result.get("output", "No output captured")
         error_type = exec_result.get("error", "None")
+        complexity_check_block = ""
+        if user_time_complexity or user_space_complexity:
+            complexity_check_block = f"""
+        📜 COMPLEXITY AUDIT (CRITICAL):
+        The user CLAIMS:
+        - Time: {user_time_complexity if user_time_complexity else "NOT PROVIDED"}
+        - Space: {user_space_complexity if user_space_complexity else "NOT PROVIDED"}
 
+        YOUR TASK:
+        1. Analyze the 'CANDIDATE ANSWER' code yourself. Determine the ACTUAL Time/Space complexity.
+        2. Compare ACTUAL vs CLAIMED.
+        3. SCORING RULES:
+           - If Claim is Missing: Deduct 0.10 from 'technical_accuracy'.
+           - If Claim is WRONG (e.g. claimed O(n) but code is O(n^2)): Deduct 0.20 from 'technical_accuracy'. Mark as Weak.
+           - If Claim is CORRECT: Award Bonus points.
+        """ 
         system = f"""
 You are a CAMPUS PLACEMENT CODE EVALUATOR.
 
@@ -1545,9 +1637,11 @@ EXECUTION STATUS:
 - Passed: {passed}
 - Error Type: {error_type}
 
+
 EXECUTION LOG:
 {output_log[:800]}
 
+{complexity_check_block}
 CODE SCORING RULES (IMPORTANT):
 1. IF TESTS FAILED:
    - MAX SCORE = 0.5
@@ -1555,15 +1649,19 @@ CODE SCORING RULES (IMPORTANT):
    - Logical misunderstanding → < 0.3
 
 2. IF TESTS PASSED:
-   - BASE SCORE = 0.65
+   - BASE SCORE = 0.7
    - +0.1 to +0.25 for:
      • clean logic
      • readable variable names
      • handling edge cases
      • correct use of data structures
+     • CORRECT COMPLEXITY ANALYSIS (if provided)
    - Do NOT expect optimal Big-O unless resume claims it
-
-3. STRICT CHEATING CHECK:
+3. **OPTIMIZATION & QUALITY (Multipliers)**:
+   - **Brute Force vs Optimal**: If the problem can be solved in O(n) but user wrote O(n^2), score CANNOT exceed 0.75, even if tests pass.
+   - **Code Style**: Penalize for single-letter variables (except i, j, n), lack of comments, or deep nesting.
+   - **Edge Cases**: Did they handle empty inputs/nulls in the code logic?
+4. STRICT CHEATING CHECK:
    - Hardcoded outputs → score = 0.0
    - Printing expected values → score = 0.0
 
@@ -1576,7 +1674,53 @@ CAMPUS CONTEXT:
 """
 
     # =========================================================
-    # TEXT SCORING (Campus Recruiter Mode)
+    # 2. SYSTEM DESIGN SCORING (Whiteboard Consistency)
+    # =========================================================
+    elif question_type == "system_design":
+        # Extract the text labels found in the diagram
+        wb_summary = context.get("whiteboard_text_summary", "No whiteboard usage detected")
+        
+        system = f"""
+You are a SENIOR SOFTWARE ARCHITECT evaluating a System Design interview.
+
+CANDIDATE LEVEL: Intern / Entry Level
+- Expect basic component knowledge (Load Balancer, DB, API, Cache).
+- Do NOT expect complex distributed locking or CAP theorem nuance unless they bring it up.
+
+INPUT DATA:
+- **Verbal Explanation**: See 'CANDIDATE ANSWER' below.
+- **Whiteboard Text Labels**: {wb_summary}
+
+🕵️ WHITEBOARD LOGIC CHECK:
+1. **Completeness**: Does the whiteboard list contain the 'Holy Trinity' of Web Apps?
+   - Frontend/Client
+   - Backend/API/Server
+   - Database/Storage
+   *If any of these 3 are missing from the text labels, CAP score at 0.6.*
+
+2. **Specifics vs Generics**:
+   - "Database" = Weak
+   - "PostgreSQL" / "MongoDB" = Strong
+   - "Cache" = Weak
+   - "Redis" / "CDN" = Strong
+
+3. **Scalability Indicators**:
+   - Look for keywords: "Load Balancer", "Kafka", "Queue", "Sharding", "Replica".
+   - If prompt asked for scaling and these are missing -> Deduct 'depth_of_understanding'.
+
+SCORING CRITERIA:
+- **0.0 - 0.4 (Fail)**: Whiteboard empty or completely disconnected from verbal answer.
+- **0.5 - 0.6 (Weak)**: Generic boxes ("App", "DB") without specific technologies.
+- **0.7 - 0.8 (Pass)**: Standard architecture present. Components connect logically.
+- **0.9 - 1.0 (Strong)**: Specific tech choices (e.g., "S3 for images"), Scalability components (LBs, Queues), and clear data flow.
+SCORING DIMENSIONS:
+{dimensions_text}
+OUTPUT GUIDANCE:
+- If they drew nothing, mention "Candidate failed to utilize whiteboard" in the rationale.
+"""
+        
+    # =========================================================
+    # 3. TEXT SCORING (Standard / Fallback)
     # =========================================================
     else:
         system = f"""
@@ -1604,19 +1748,19 @@ WEAK (0.3-0.5):
 • Avoids specifics
 • Sounds memorized
 
-ACCEPTABLE (0.5-0.7):
+ACCEPTABLE (0.7-0.8):
 • Understands core idea
 • Explains basic implementation
 • Minor gaps are OK
 • Typical intern-level answer
 
-STRONG (0.7-0.85):
+STRONG (0.8-0.9):
 • Explains HOW and WHY
 • Mentions challenges faced
 • Talks about trade-offs
 • Clearly built it themselves
 
-EXCEPTIONAL (0.85-1.0):
+EXCEPTIONAL (0.9-1.0):
 • Discusses debugging, edge cases, metrics
 • Compares approaches
 • Shows placement-ready confidence
@@ -1680,7 +1824,6 @@ OUTPUT JSON:
 {schema}
 """
     return prompt.strip()
-
 
 # ==========================================
 # DECISION ENGINE
@@ -2313,6 +2456,7 @@ class HintRequest(BaseModel):
     session_id: str
     question: str
     context_type: str = "conceptual"
+    current_answer: Optional[str] = ""
 class InterviewState:
     """
     Stateless Interview Manager.
@@ -2339,7 +2483,13 @@ class InterviewState:
         # Difficulty control
         self.difficulty_level = "medium"
         self.recent_scores: List[float] = []
+        design_keywords = [
+    'backend', 'architecture', 'scalable', 'microservices', 
+    'distributed', 'api', 'database', 'system', 'design',
+    'aws', 'cloud', 'docker', 'server', 'deployment','system_design'
+]
 
+        self.has_system_design_skills = any(kw in resume_text.lower() for kw in design_keywords)
         # Resume signals
         self.has_work_experience = any(
             kw in resume_text.lower()
@@ -2525,9 +2675,28 @@ class InterviewState:
         # Get questions already asked in current round (excluding probes)
         round_questions = self.round_history[self.current_round]["questions"]
         asked_types = [q.get("type") for q in round_questions if not q.get("is_probe", False)]
-        
-        # Try to pick diverse question type from focus areas
-        available_types = [t for t in focus_areas if asked_types.count(t) < 2]
+        valid_focus_areas = []
+        for t in focus_areas:
+            # Only allow system_design if resume supports it
+            if t == "system_design" and not self.has_system_design_skills:
+                continue
+            # Only allow experience/achievement if applicable (existing logic)
+            if t == "experience" and not self.has_work_experience:
+                continue
+            if t == "achievement" and not self.has_achievements:
+                continue
+            valid_focus_areas.append(t)
+        if not valid_focus_areas:
+            valid_focus_areas = ["conceptual", "coding_challenge"]
+
+        # 2. Pick a type we haven't asked much yet
+        # Try to ensure we ask at least 1 coding challenge in technical
+        if self.current_round == "technical":
+            if "coding_challenge" not in asked_types:
+                return "coding_challenge"
+
+        # General rotation logic
+        available_types = [t for t in valid_focus_areas if asked_types.count(t) < 2]
         
         if available_types:
             # Prefer types not asked yet
@@ -2536,8 +2705,10 @@ class InterviewState:
                 return unused[0]
             return available_types[0]
         
-        # Fallback to any focus area type
-        return focus_areas[0] if focus_areas else "conceptual"
+        # Fallback
+        return valid_focus_areas[0]    
+        # Try to pick diverse question type from focus areas
+      
     # =====================================================
     # 🧩 HELPERS
     # =====================================================
@@ -2580,6 +2751,9 @@ class ScoreAnswerRequest(BaseModel):
     question_type: Optional[str] = "text" 
     code_execution_result: Optional[Dict[str, Any]] = None 
     hint_used: Optional[bool] = False
+    whiteboard_elements: Optional[List[Dict[str, Any]]] = None
+    user_time_complexity: Optional[str] = None   # e.g. "O(n)"
+    user_space_complexity: Optional[str] = None  # e.g. "O(1)"
 
 # Update this class in main.py
 class CodeSubmissionRequest(BaseModel):
@@ -3171,25 +3345,68 @@ async def register_face(request: FaceRegisterRequest):
 @app.post("/generate_hint")
 def generate_hint(req: HintRequest):
     """
-    Generates a helpful nudge without revealing the answer.
+    Context-Aware Socratic Hint. 
+    Analyzes the user's partial answer to give specific, unblocking advice.
     """
+    q_type = req.context_type
+    partial = req.current_answer.strip() if req.current_answer else ""
+    partial = safe_truncate(partial, 1500) # prevent context overflow
+
+    # 1. Define Persona & Strategy
+    if q_type == "coding_challenge":
+        system_instruction = """
+        You are a Senior Engineer mentoring a student.
+        The candidate is writing code but is stuck.
+        
+        ANALYSIS STRATEGY:
+        1. If 'PARTIAL CODE' is empty: Suggest a high-level approach or Data Structure (e.g., "Try a Hash Map").
+        2. If 'PARTIAL CODE' has syntax errors: Point them out gently.
+        3. If 'PARTIAL CODE' has bad logic (e.g., O(n^2)): Hint at optimization.
+        4. If they are almost done: Suggest checking edge cases.
+        
+        DO NOT write the corrected code. Nudge them.
+        """
+    elif q_type == "system_design":
+        system_instruction = """
+        You are a System Architect.
+        The candidate is designing a system on a whiteboard.
+        
+        ANALYSIS STRATEGY:
+        1. If empty: Suggest starting with Functional Requirements or API definition.
+        2. If they have components but no DB: "How will you store the data?"
+        3. If they have a DB but no Scale: "How will this handle 1M users?"
+        """
+    else:
+        system_instruction = """
+        You are an Interviewer.
+        The candidate is answering a conceptual question.
+        If they are off-track, guide them back. If they are stuck, give an analogy.
+        """
+
     prompt = f"""
-    You are a technical interviewer. The candidate is stuck on this question:
+    SYSTEM: {system_instruction}
+    
+    INTERVIEW QUESTION:
     "{req.question}"
     
-    Provide a brief, helpful hint. 
-    - If coding: Suggest a data structure (e.g. HashMap, Heap) or pattern (Two Pointers).
-    - If system design: Suggest which component to start with.
-    - DO NOT write code or give the full solution.
-    - Keep it under 1 sentence.
+    CANDIDATE'S CURRENT PARTIAL WORK:
+    ```
+    {partial if partial else "(Candidate has not started yet)"}
+    ```
+    
+    OUTPUT:
+    Provide a single, specific hint (max 2 short sentences).
     """
     
     try:
-        resp = llm_call(prompt, temperature=0.3, max_tokens=100)
+        # Temperature 0.3 for helpful, consistent advice
+        resp = llm_call(prompt, temperature=0.3, max_tokens=150)
+        
         if not resp.get("ok"):
              raise HTTPException(status_code=502, detail="AI hint generation failed")
         
-        return {"hint": resp["raw"].strip()}
+        raw_hint = resp["raw"].strip().replace('"', '')
+        return {"hint": raw_hint}
     except Exception as e:
         logger.error(f"Hint error: {e}")
         raise HTTPException(status_code=500, detail=str(e))    
@@ -3209,20 +3426,27 @@ def score_answer(req: ScoreAnswerRequest):
         redaction_log = r["redaction_log"]
     
     enforced = enforce_budget(payload)
-    
+    whiteboard_context = ""
+    if payload.get("question_type") == "system_design":
+        elements = payload.get("whiteboard_elements", [])
+        whiteboard_context = extract_whiteboard_keywords(elements)
+        logger.info(f"🎨 Whiteboard Analysis: {whiteboard_context}")
     # 2. Build Context & Prompt
     context = {
         "resume": enforced.get("resume", ""),
         "chunks": enforced.get("chunks", []),
         "question_type": payload.get("question_type", "text"),
-        "code_execution_result": payload.get("code_execution_result")
+        "code_execution_result": payload.get("code_execution_result"),
+        "whiteboard_text_summary": whiteboard_context
     }
     
     prompt = build_score_prompt(
         payload.get("question_text", ""),
         payload.get("ideal_outline", ""),
         payload.get("candidate_answer", ""),
-        context
+        context=context,
+        user_time_complexity=payload.get("user_time_complexity"),
+        user_space_complexity=payload.get("user_space_complexity")
     )
     
     # 3. FAST PATH: Try Groq First (Llama 3.3)

@@ -92,7 +92,7 @@ const upload = multer({
 // ---------- AI CLIENT (axios instance) ----------
 const aiClient = axios.create({
   baseURL: AI_URL,
-  timeout: 30000,
+  timeout: 60000,
   headers: AI_API_KEY ? { Authorization: `Bearer ${AI_API_KEY}` } : {}
 });
 
@@ -126,7 +126,7 @@ async function callWithRetry(path, payload, opts = {}, attempts = 2, backoffMs =
           console.warn(`   → payload.${imgField} sample: ${sample}... (len=${String(payload[imgField]).length})`);
         } catch (e) { /* ignore sample logging errors */ }
       }
-      const resp = await aiClient.post(path, payload, { timeout: opts.timeout || 30000 });
+      const resp = await aiClient.post(path, payload, { timeout: opts.timeout || 60000 });
       return resp.data;
     } catch (err) {
       lastErr = err;
@@ -668,10 +668,9 @@ const metadata = aiResp.metadata || {};
 
         const questionText = parsed.question || parsed.questionText ||
             "Tell me about the most technically challenging project on your resume. What specific problem did you solve, and how did you approach it?";
-let normalizedType = parsed.type || "medium";
-        if (normalizedType === "coding_challenge") {
-            normalizedType = "code";
-        }
+let normalizedType = parsed.type || "text";
+        if (normalizedType === "coding_challenge") normalizedType = "code";
+        if (normalizedType === "system_design") normalizedType = "system_design";
         const semanticType = inferSemanticType(parsed);
 
         const qaMetadata = {
@@ -772,11 +771,15 @@ app.post("/interview/answer", requireAuth, async (req, res) => {
     let candidateAnswer = "";
     let questionType = req.body.question_type || "text";
     let codeExecutionResult = req.body.code_execution_result || null;
-
+let whiteboardData = req.body.whiteboard_data || req.body.whiteboardElements || null;
+let userTimeComplexity = req.body.user_time_complexity || req.body.userTimeComplexity || null;
+    let userSpaceComplexity = req.body.user_space_complexity || req.body.userSpaceComplexity || null;
     if (typeof candidateAnswerRaw === "object" && candidateAnswerRaw !== null) {
       candidateAnswer = candidateAnswerRaw.answer || candidateAnswerRaw.candidateAnswer || "";
       if (candidateAnswerRaw.question_type) questionType = candidateAnswerRaw.question_type;
       if (candidateAnswerRaw.code_execution_result) codeExecutionResult = candidateAnswerRaw.code_execution_result;
+      if (candidateAnswerRaw.user_time_complexity) userTimeComplexity = candidateAnswerRaw.user_time_complexity;
+      if (candidateAnswerRaw.user_space_complexity) userSpaceComplexity = candidateAnswerRaw.user_space_complexity;
     } else {
       candidateAnswer = String(candidateAnswerRaw || "");
     }
@@ -815,8 +818,12 @@ const hintUsed = qaRec.metadata?.hint_used || false;
       options: { temperature: 0.0 },
       question_type: questionType,
       code_execution_result: codeExecutionResult,
+      whiteboard_elements: whiteboardData,
       hint_used: hintUsed,
+      user_time_complexity: userTimeComplexity,
+      user_space_complexity: userSpaceComplexity
     };
+    console.log(`📤 Sending Score Payload. Type: ${questionType}, Has Whiteboard: ${!!whiteboardData}`);
 
     const aiScoreResp = await callAiScoreAnswer(scorePayload);
     const validated = aiScoreResp.validated || aiScoreResp.validation || {};
@@ -1018,12 +1025,14 @@ const hintUsed = qaRec.metadata?.hint_used || false;
           }
 
           const parsedNext = genResp.parsed || {};
-          
+          let nextType = parsedNext.type || "text";
+            if (nextType === "coding_challenge") nextType = "code";
+            if (nextType === "system_design") nextType = "system_design";
           const newQa = await createQARecordDB(
             sessionId,
             parsedNext.question,
             parsedNext.ideal_answer_outline || "",
-            parsedNext.type === "coding_challenge" ? "code" : "text",
+            nextType,
             parsedNext.difficulty || "medium",
             userId,
             {
@@ -1189,7 +1198,7 @@ app.post("/interview/violation", requireAuth, async (req, res) => {
 // --- REPLACE YOUR EXISTING /interview/hint ROUTE WITH THIS ---
 app.post("/interview/hint", requireAuth, async (req, res) => {
   try {
-    const { sessionId, questionId, questionText, type } = req.body;
+    const { sessionId, questionId, questionText, type,currentAnswer } = req.body;
     
     // Validation
     if (!sessionId || !questionId || !questionText) {
@@ -1207,7 +1216,8 @@ app.post("/interview/hint", requireAuth, async (req, res) => {
     const aiPayload = {
         session_id: sessionId,      // mapped from req.body.sessionId
         question: questionText,     // mapped from req.body.questionText
-        type: type || "conceptual"
+        type: type || "conceptual",
+        current_answer: currentAnswer || ""
     };
 
     try {

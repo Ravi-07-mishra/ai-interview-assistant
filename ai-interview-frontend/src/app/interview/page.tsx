@@ -6,6 +6,8 @@ import { useInterview } from "../hooks/useInterview";
 import { useAuth } from "../context/AuthContext";
 import Link from "next/link";
 import jsPDF from "jspdf";
+import "@excalidraw/excalidraw/index.css";
+
 import autoTable from "jspdf-autotable";
 import Editor from "@monaco-editor/react";
 import {
@@ -24,7 +26,8 @@ import {
   Lightbulb,
   Loader2,
   FileText, // <--- NEW
-  ArrowRight // <--- NEW // Added for loading indicator
+  ArrowRight,
+  LayoutTemplate, // <--- NEW // Added for loading indicator
 } from "lucide-react";
 
 /* -------------------------
@@ -136,7 +139,19 @@ const renderTrendIcon = (trend: string) => {
       return <Minus size={24} className="text-slate-600" />;
   }
 };
-
+import dynamic from "next/dynamic";
+// Replace your current ExcalidrawWrapper import (around line 109) with:
+const ExcalidrawWrapper = dynamic(
+  () => import("@excalidraw/excalidraw").then((mod) => mod.Excalidraw),
+  { 
+    ssr: false,
+    loading: () => (
+      <div className="flex items-center justify-center h-full bg-slate-50">
+        <Loader2 className="animate-spin text-indigo-600" size={32} />
+      </div>
+    )
+  }
+);
 /* -------------------------
     Main component
     ------------------------- */
@@ -164,6 +179,8 @@ export default function InterviewPage() {
   const { token } = useAuth();
   const [answer, setAnswer] = useState("");
   const [showReport, setShowReport] = useState(false);
+  const [timeComplexity, setTimeComplexity] = useState("");
+const [spaceComplexity, setSpaceComplexity] = useState("");
 const [codeOutput, setCodeOutput] = useState<string | null>(null);
 const [codeStatus, setCodeStatus] = useState<"idle" | "running" | "success" | "error">("idle");
 const [executionResult, setExecutionResult] = useState<any>(null); // Store Piston result here
@@ -172,6 +189,8 @@ const [roundProgress, setRoundProgress] = useState<any>(null);
 const [isProbeQuestion, setIsProbeQuestion] = useState(false);
 const [showRoundModal, setShowRoundModal] = useState(false);
   const [nextRoundName, setNextRoundName] = useState("");
+  const [whiteboardElements, setWhiteboardElements] = useState<any[]>([]);
+  const [excalidrawAPI, setExcalidrawAPI] = useState<any>(null);
 const allTestsPassed =
   executionResult?.summary &&
   executionResult.summary.passed === executionResult.summary.total;
@@ -188,6 +207,7 @@ const allTestsPassed =
   const previewCanvasRef = useRef<HTMLCanvasElement | null>(null); // for reference capture
   const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const inFlightRef = useRef(false);
+const whiteboardElementsRef = useRef<readonly unknown[]>([]);
 
   const [cameraActive, setCameraActive] = useState(false);
   // referenceImage is now the source of truth for successful client-side capture
@@ -725,7 +745,8 @@ const captureReferenceImage = useCallback(async () => {
   
   setCameraActive(false);
   setReferenceImage(null);
-  
+ 
+
   const errorMessage = lastError?.message || "Camera capture failed after multiple attempts";
   setCameraError(errorMessage);
   setImageStatus("error");
@@ -1107,16 +1128,43 @@ if (data?.firstQuestion?.is_probe) {
       ------------------------- */
 const handleSubmitAnswer = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!answer.trim() || loading || !currentQuestion) return;
+    const isWhiteboard = currentQuestion?.expectedAnswerType === "system_design";
+if ((!answer.trim() && !isWhiteboard) || loading || !currentQuestion) return;
+let finalWhiteboardData: any[] = [];
 
+  if (isWhiteboard) {
+    // STRATEGY 1: Force Get from API (Most Reliable)
+    if (excalidrawAPI && typeof excalidrawAPI.getSceneElements === 'function') {
+      const allElements = excalidrawAPI.getSceneElements();
+      // Only send non-deleted elements to save bandwidth and backend parsing
+      finalWhiteboardData = allElements.filter((el: any) => !el.isDeleted);
+      console.log("🎨 Source: API | Elements:", finalWhiteboardData.length);
+    } 
+    // STRATEGY 2: Fallback to Ref (If API failed)
+    else if (whiteboardElementsRef.current && whiteboardElementsRef.current.length > 0) {
+      finalWhiteboardData = [...whiteboardElementsRef.current];
+      console.log("🎨 Source: Ref Backup | Elements:", finalWhiteboardData.length);
+    } else {
+      console.warn("⚠️ Warning: No whiteboard data found via API or Ref.");
+    }
+  }
+  console.log("🚀 Submitting Payload:", {
+    question_type: isWhiteboard ? "system_design" : "text",
+    whiteboard_count: finalWhiteboardData.length
+  });
     const payload: any = { 
         answer, 
         question_type: "text", 
-        code_execution_result: executionResult 
+        code_execution_result: executionResult ,
+        whiteboard_elements: finalWhiteboardData,
+        user_time_complexity: timeComplexity, 
+        user_space_complexity: spaceComplexity
     };
     
     if (currentQuestion.expectedAnswerType === "code") {
         payload.question_type = "code";
+    } else if (isWhiteboard) {
+        payload.question_type = "system_design";
     }
 
     try {
@@ -1124,7 +1172,12 @@ const handleSubmitAnswer = async (e: React.FormEvent) => {
       setAnswer("");
       setCodeOutput(null);
       setExecutionResult(null);
-
+      setTimeComplexity(""); 
+        setSpaceComplexity("");
+setWhiteboardElements([]);
+      if (excalidrawAPI) {
+          excalidrawAPI.resetScene();
+      }
       // --- ROUND TRANSITION LOGIC ---
       const newRoundData = result?.round_info || result?.metadata;
       const incomingRound = newRoundData?.current || newRoundData?.current_round;
@@ -1255,7 +1308,19 @@ const RoundTransitionModal = () => {
     },
     [stage, reportViolationWrapper]
   );
+const handleExcalidrawChange = useCallback((elements: readonly any[]) => {
+  const activeElements = elements.filter((el) => !el.isDeleted);
+  // Store in ref without triggering re-renders
+  whiteboardElementsRef.current = activeElements;
+  console.log(`📝 Whiteboard updated: ${activeElements.length} elements`);
+}, []);
 
+const handleExcalidrawAPI = useCallback((api: any) => {
+  if (api) {
+    console.log("✅ Excalidraw API linked successfully");
+    setExcalidrawAPI(api);
+  }
+}, []);
   const handleVisibilityChange = useCallback(() => {
     if (stage === "running" && document.visibilityState === "hidden") {
       reportViolationWrapper("Switched to another tab or minimized window.");
@@ -1329,23 +1394,24 @@ const RoundTransitionModal = () => {
   /* --------------------------------------------------------------------------
       Auto-capture reference image when ready (only on idle)
       -------------------------------------------------------------------------- */
-  useEffect(() => {
-    // Only run if the environment is ready AND we haven't already captured a valid image
-    if (
-        stage === "idle" &&
-        resumeParsed &&
-        token &&
-        imageStatus === "pending" && // Only run if status is pending
-        previewVideoRef.current &&
-        previewCanvasRef.current
-    ) {
-      // Attempt auto-capture to ensure the image is ready for the user click
-      captureReferenceImage().catch((e) => {
-        console.warn("Auto-capture failed:", e?.message || e);
-        // captureReferenceImage already sets the error state and imageStatus to 'error'
-      });
-    }
-  }, [stage, resumeParsed, token, imageStatus, captureReferenceImage]);
+ const autoCaptureDoneRef = useRef(false);
+
+useEffect(() => {
+  if (autoCaptureDoneRef.current) return;
+
+  if (
+    stage === "idle" &&
+    resumeParsed &&
+    token &&
+    imageStatus === "pending" &&
+    previewVideoRef.current &&
+    previewCanvasRef.current
+  ) {
+    autoCaptureDoneRef.current = true;
+    captureReferenceImage().catch(() => {});
+  }
+}, [stage, resumeParsed, token, imageStatus, captureReferenceImage]);
+
 useEffect(() => {
   if (currentQuestion) {
     const isProbe = currentQuestion.is_probe || false;
@@ -1515,7 +1581,7 @@ useEffect(() => {
      
      setLoadingHint(true);
      // Pass question type to get better context-aware hints
-     const h = await fetchHint(currentQuestion?.questionText || "", currentQuestion?.type || "conceptual");
+     const h = await fetchHint(currentQuestion?.questionText || "", currentQuestion?.type || "conceptual",answer);
      setHint(h);
      setLoadingHint(false);
   };
@@ -2229,7 +2295,101 @@ const RoundIndicator = () => {
       </div>
     </div>
   </div>
-) : (
+) :currentQuestion.expectedAnswerType === "system_design" ? (
+  /* ============ SYSTEM DESIGN WHITEBOARD - WORKING VERSION ============ */
+  <div className="flex flex-col border-2 border-slate-300 rounded-xl overflow-hidden bg-white shadow-sm">
+    
+    {/* Header */}
+    <div className="bg-slate-100 p-3 flex justify-between items-center border-b border-slate-300 shrink-0">
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-bold text-slate-600 uppercase bg-indigo-100 text-indigo-700 px-2 py-1 rounded flex items-center gap-1">
+          <LayoutTemplate size={14} /> System Design
+        </span>
+        <span className="text-xs text-slate-500">
+          Draw your architecture using the left toolbar ⬅️
+        </span>
+      </div>
+      
+      {/* Clear and Center buttons */}
+      <div className="flex gap-2">
+        <button
+          type="button"
+          onClick={() => {
+            if (excalidrawAPI) {
+              excalidrawAPI.scrollToContent();
+              excalidrawAPI.updateScene({
+                appState: { zoom: { value: 1 } }
+              });
+              console.log("🎯 Canvas centered");
+            }
+          }}
+          className="text-xs px-3 py-1 bg-blue-100 text-blue-700 rounded hover:bg-blue-200 font-medium"
+        >
+          🎯 Center
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            if (excalidrawAPI) {
+              excalidrawAPI.resetScene();
+              whiteboardElementsRef.current = [];
+              console.log("Canvas cleared");
+            }
+          }}
+          className="text-xs px-3 py-1 bg-rose-100 text-rose-700 rounded hover:bg-rose-200 font-medium"
+        >
+          🗑️ Clear
+        </button>
+      </div>
+    </div>
+
+    {/* ✅ WORKING CANVAS - Critical fixes applied */}
+    <div
+      style={{
+        width: "100%",
+        height: "500px",
+        position: "relative",
+        isolation: "isolate",
+      }}
+    >
+      <ExcalidrawWrapper
+        onChange={handleExcalidrawChange}
+        excalidrawAPI={handleExcalidrawAPI}
+        viewModeEnabled={false}         // ✅ Prevents lock icon
+        zenModeEnabled={false}           // ✅ Shows toolbar
+        gridModeEnabled={true}           // ✅ Visual feedback
+        initialData={{
+          appState: {
+            viewBackgroundColor: "#ffffff",
+            currentItemStrokeColor: "#1e88e5",
+            currentItemBackgroundColor: "#e3f2fd",
+            currentItemStrokeWidth: 2,
+            zoom: { value: 1 },
+            scrollX: 0,
+            scrollY: 0,
+          },
+          elements: [],
+        }}
+      />
+    </div>
+
+    {/* Text Explanation Area */}
+    <div className="p-4 bg-slate-50 border-t border-slate-200 shrink-0">
+      <label className="block text-xs font-bold text-slate-500 uppercase mb-2">
+        Verbal Explanation (Describe your architecture)
+      </label>
+      <textarea
+        value={answer}
+        onChange={(e) => setAnswer(e.target.value)}
+        rows={3}
+        placeholder="Explain your system design: components, data flow, scalability, databases..."
+        className="w-full p-3 text-sm bg-white text-slate-800 rounded-lg border border-slate-300 focus:ring-2 focus:ring-indigo-500 outline-none resize-none"
+      />
+    </div>
+  </div>
+
+     
+  ) : (
   /* --- STANDARD TEXT AREA FOR NON-CODE QUESTIONS --- */
   <textarea
     value={answer}
@@ -2240,6 +2400,34 @@ const RoundIndicator = () => {
   />
 )}
 
+{currentQuestion.expectedAnswerType === "code" && (
+  <div className="mt-4 grid grid-cols-2 gap-4 animate-in fade-in slide-in-from-bottom-2">
+    <div className="bg-white p-3 rounded-xl border-2 border-slate-200">
+      <label className="block text-xs font-bold text-slate-500 uppercase mb-1">
+        Time Complexity (Big O)
+      </label>
+      <input
+        type="text"
+        placeholder="e.g. O(n log n)"
+        value={timeComplexity}
+        onChange={(e) => setTimeComplexity(e.target.value)}
+        className="w-full text-sm font-mono text-slate-800 outline-none bg-transparent placeholder:text-slate-400"
+      />
+    </div>
+    <div className="bg-white p-3 rounded-xl border-2 border-slate-200">
+      <label className="block text-xs font-bold text-slate-500 uppercase mb-1">
+        Space Complexity (Big O)
+      </label>
+      <input
+        type="text"
+        placeholder="e.g. O(1)"
+        value={spaceComplexity}
+        onChange={(e) => setSpaceComplexity(e.target.value)}
+        className="w-full text-sm font-mono text-slate-800 outline-none bg-transparent placeholder:text-slate-400"
+      />
+    </div>
+  </div>
+)}
   <div className="mt-5 flex items-center justify-between">
     <button
       type="button"
@@ -2247,6 +2435,12 @@ const RoundIndicator = () => {
         setAnswer("");
         setCodeOutput(null);
         setCodeStatus("idle");
+        setTimeComplexity("");
+      setSpaceComplexity("");
+        setWhiteboardElements([]);
+if (excalidrawAPI) {
+    excalidrawAPI.resetScene();
+}
       }}
       className="text-slate-500 text-sm font-medium hover:text-slate-700 transition-colors px-3 py-2 hover:bg-slate-100 rounded-lg"
     >

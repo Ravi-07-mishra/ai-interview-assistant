@@ -9,7 +9,7 @@ export type InterviewQuestion = {
   questionText: string;
   target_project?: string;
   technology_focus?: string;
-  expectedAnswerType?: "short" | "medium" | "code" | "architectural";
+  expectedAnswerType?: "short" | "medium" | "code" | "architectural" | "system_design";
   difficulty?: "easy" | "medium" | "hard" | "expert";
   ideal_outline?: string;
   ideal_answer_outline?: string;
@@ -295,7 +295,7 @@ console.log("🧭 CURRENT QUESTION TYPE:", currentQuestion?.type);
   function question_data_or_default(q: any) {
     return q.expected_answer_type || q.expectedAnswerType || "medium";
   }
-const fetchHint = useCallback(async (questionText: string, type: string) => {
+const fetchHint = useCallback(async (questionText: string, type: string,currentAnswer: string = "") => {
     if (!sessionId || !token || !currentQuestion?.questionId) return null;
     
     try {
@@ -306,7 +306,8 @@ const fetchHint = useCallback(async (questionText: string, type: string) => {
             sessionId, 
             questionId: currentQuestion.questionId,
             questionText,
-            type 
+            type ,
+            currentAnswer
         })
       });
       const data = await res.json();

@@ -27,3 +27,44 @@ body {
 .btn-ghost {
   @apply inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-slate-200 bg-white text-slate-700;
 }
+/* .excalidraw canvas {
+  position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.excalidraw {
+  position: relative !important;
+} */
+ .excalidraw {
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.excalidraw__canvas {
+  max-width: none !important;
+  max-height: none !important;
+  touch-action: none !important;
+}
+
+.excalidraw-wrapper {
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.excalidraw canvas {
+  position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+}
+
+/* Ensure Excalidraw toolbar is visible and interactive */
+.excalidraw .App-menu_top {
+  z-index: 10 !important;
+}
+
+.excalidraw .layer-ui__wrapper {
+  z-index: 5 !important;
+}
