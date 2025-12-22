@@ -3840,22 +3840,21 @@ async def parse_resume(
         }
     
     try:
-        parsed = ai_parse_resume(raw_text)
-  
-
-        job_description = (job_description or "").strip()
-
-        jd_result = (
-                    match_resume_with_jd(parsed, job_description)
-                    if job_description
-                    else None
-                    )
+     parsed = ai_parse_resume(raw_text)
+     if job_description and job_description.strip():
+       jd_result = match_resume_with_jd(parsed, job_description)
+     else:
+       jd_result = None
         
     except Exception as e:
         logger.exception(f"Resume parsing failed: {e}")
         parsed = regex_parse_resume(raw_text)
-    
-    return {"parsed": parsed, "raw_text_length": len(raw_text)}
+        jd_result = None
+    return {
+     "parsed": parsed,
+     "jd_result": jd_result,
+     "raw_text_length": len(raw_text)
+    }
 
 @app.get("/performance_metrics")
 def get_performance_metrics(session_id: str):
