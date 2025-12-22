@@ -2338,79 +2338,207 @@ def ai_parse_resume(text: str) -> dict:
 
     return parsed
 
-def match_resume_with_jd(parsed_resume: Dict, job_description: str) -> Dict:
-    """
-    Compares parsed resume data with job description
-    and returns score, verdict, missing elements, improvements
-    """
+def clean_text(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r'[^a-z0-9\s]', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
 
-    # ---- Extract resume info safely ----
-    resume_skills = set(
-        skill.lower()
-        for skill in parsed_resume.get("skills", [])
-    )
+def semantic_similarity(text1: str, text2: str) -> float:
+    if not text1 or not text2:
+        return 0.0
 
-    resume_experience = parsed_resume.get("experience", "")
-    resume_projects = parsed_resume.get("projects", "")
+    vectorizer = TfidfVectorizer(stop_words="english")
+    vectors = vectorizer.fit_transform([text1, text2])
 
-    # ---- Extract JD keywords ----
-    jd_keywords = set(
-        word.lower()
-        for word in job_description.split()
-        if len(word) > 3
-    )
+    similarity = cosine_similarity(vectors[0:1], vectors[1:2])[0][0]
+    return round(similarity, 3)
 
-    # ---- Skill matching ----
-    matched_skills = resume_skills.intersection(jd_keywords)
-    missing_skills = jd_keywords.difference(resume_skills)
+def skill_match_score(resume_skills: list, jd_text: str) -> tuple:
+    jd_words = set(clean_text(jd_text).split())
+    resume_skills_clean = set(s.lower() for s in resume_skills)
 
-    # ---- Scoring ----
-    if len(jd_keywords) == 0:
-        match_percentage = 0
-    else:
-        match_percentage = round(
-            (len(matched_skills) / len(jd_keywords)) * 100, 2
+    matched = resume_skills_clean.intersection(jd_words)
+    missing = resume_skills_clean.symmetric_difference(matched)
+
+    if not jd_words:
+        return 0.0, [], []
+
+    score = len(matched) / max(len(resume_skills_clean), 1)
+    return round(score, 3), list(matched), list(missing)
+    
+def project_relevance_score(projects: list, jd_text: str) -> float:
+    if not projects:
+        return 0.0
+
+    jd_text = clean_text(jd_text)
+    scores = []
+
+    for p in projects:
+        project_text = clean_text(
+            f"{p.get('title','')} {p.get('description','')} {' '.join(p.get('technologies', []))}"
         )
+        scores.append(semantic_similarity(project_text, jd_text))
 
-    # ---- Threshold verdict ----
-    if match_percentage >= 75:
-        verdict = "Strong match"
-    elif match_percentage >= 50:
-        verdict = "Moderate match"
+    return round(sum(scores) / len(scores), 3)
+
+def experience_score(work_experience: list) -> float:
+    if not work_experience:
+        return 0.2  # fresher baseline
+
+    text = " ".join(
+        w.get("role", "") + " " + w.get("description", "")
+        for w in work_experience
+    )
+    return min(1.0, len(text.split()) / 200)
+
+def match_resume_with_jd(parsed_resume: dict, job_description: str) -> dict:
+    resume_text = clean_text(
+        parsed_resume.get("full_context_for_prompt", "") or
+        parsed_resume.get("summary", "")
+    )
+    jd_text = clean_text(job_description)
+
+    # ---- Component Scores ----
+    skill_score, matched_skills, missing_skills = skill_match_score(
+        parsed_resume.get("skills", []),
+        jd_text
+    )
+
+    semantic_score = semantic_similarity(resume_text, jd_text)
+
+    project_score = project_relevance_score(
+        parsed_resume.get("projects", []),
+        jd_text
+    )
+
+    exp_score = experience_score(
+        parsed_resume.get("work_experience", [])
+    )
+
+    # ---- Weighted Final Score ----
+    final_score = (
+        0.40 * skill_score +
+        0.30 * semantic_score +
+        0.20 * project_score +
+        0.10 * exp_score
+    )
+
+    final_score = round(final_score * 100, 2)
+
+    # ---- Verdict Threshold ----
+    THRESHOLD = 60.0
+
+    if final_score >= THRESHOLD:
+        verdict = "PASS"
+        passed = True
     else:
-        verdict = "Weak match"
+        verdict = "REJECT"
+        passed = False
 
     # ---- Improvements ----
     improvements = []
+
     if missing_skills:
         improvements.append(
-            f"Add or highlight these skills: {', '.join(list(missing_skills)[:10])}"
+            f"Add or highlight these skills: {', '.join(missing_skills[:8])}"
         )
 
-    if not resume_projects:
-        improvements.append("Add relevant projects related to the job description")
+    if project_score < 0.4:
+        improvements.append("Add projects aligned with the job role")
 
-    if not resume_experience:
-        improvements.append("Add more relevant work experience")
+    if exp_score < 0.3:
+        improvements.append("Include clearer role responsibilities or internships")
 
-    if match_percentage >= 75:
-     verdict = "Strong match"
-     passed = True
-    elif match_percentage >= 50:
-     verdict = "Moderate match"
-     passed = True
-    else:
-     verdict = "Rejected – Resume does not match JD"
-     passed = False
-
+    # ---- Final Response ----
     return {
-        "match_percentage": match_percentage,
+        "overall_relevance_score": final_score,
         "verdict": verdict,
         "passed": passed,
-        "matched_skills": list(matched_skills),
-        "missing_skills": list(missing_skills),
+        "breakdown": {
+            "skill_match": round(skill_score * 100, 2),
+            "semantic_similarity": round(semantic_score * 100, 2),
+            "project_relevance": round(project_score * 100, 2),
+            "experience_alignment": round(exp_score * 100, 2)
+        },
+        "matched_skills": matched_skills,
+        "missing_skills": missing_skills,
         "improvements": improvements
     }
+
+# def match_resume_with_jd(parsed_resume: Dict, job_description: str) -> Dict:
+#     """
+#     Compares parsed resume data with job description
+#     and returns score, verdict, missing elements, improvements
+#     """
+
+#     # ---- Extract resume info safely ----
+#     resume_skills = set(
+#         skill.lower()
+#         for skill in parsed_resume.get("skills", [])
+#     )
+
+#     resume_experience = parsed_resume.get("experience", "")
+#     resume_projects = parsed_resume.get("projects", "")
+
+#     # ---- Extract JD keywords ----
+#     jd_keywords = set(
+#         word.lower()
+#         for word in job_description.split()
+#         if len(word) > 3
+#     )
+
+#     # ---- Skill matching ----
+#     matched_skills = resume_skills.intersection(jd_keywords)
+#     missing_skills = jd_keywords.difference(resume_skills)
+
+#     # ---- Scoring ----
+#     if len(jd_keywords) == 0:
+#         match_percentage = 0
+#     else:
+#         match_percentage = round(
+#             (len(matched_skills) / len(jd_keywords)) * 100, 2
+#         )
+
+#     # ---- Threshold verdict ----
+#     if match_percentage >= 75:
+#         verdict = "Strong match"
+#     elif match_percentage >= 50:
+#         verdict = "Moderate match"
+#     else:
+#         verdict = "Weak match"
+
+#     # ---- Improvements ----
+#     improvements = []
+#     if missing_skills:
+#         improvements.append(
+#             f"Add or highlight these skills: {', '.join(list(missing_skills)[:10])}"
+#         )
+
+#     if not resume_projects:
+#         improvements.append("Add relevant projects related to the job description")
+
+#     if not resume_experience:
+#         improvements.append("Add more relevant work experience")
+
+#     if match_percentage >= 75:
+#      verdict = "Strong match"
+#      passed = True
+#     elif match_percentage >= 50:
+#      verdict = "Moderate match"
+#      passed = True
+#     else:
+#      verdict = "Rejected – Resume does not match JD"
+#      passed = False
+
+#     return {
+#         "match_percentage": match_percentage,
+#         "verdict": verdict,
+#         "passed": passed,
+#         "matched_skills": list(matched_skills),
+#         "missing_skills": list(missing_skills),
+#         "improvements": improvements
+#     }
    
 
 def regex_parse_resume(text: str) -> dict:
