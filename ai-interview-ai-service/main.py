@@ -14,7 +14,8 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel, ConfigDict
 from typing import Any, Dict, List, Optional
-
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 from groq import Groq
 from google import genai
 from google.genai import types
