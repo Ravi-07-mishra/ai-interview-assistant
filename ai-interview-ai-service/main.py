@@ -2338,6 +2338,68 @@ def ai_parse_resume(text: str) -> dict:
 
     return parsed
 
+def match_resume_with_jd(parsed_resume: Dict, job_description: str) -> Dict:
+    """
+    Compares parsed resume data with job description
+    and returns score, verdict, missing elements, improvements
+    """
+
+    # ---- Extract resume info safely ----
+    resume_skills = set(
+        skill.lower()
+        for skill in parsed_resume.get("skills", [])
+    )
+
+    resume_experience = parsed_resume.get("experience", "")
+    resume_projects = parsed_resume.get("projects", "")
+
+    # ---- Extract JD keywords ----
+    jd_keywords = set(
+        word.lower()
+        for word in job_description.split()
+        if len(word) > 3
+    )
+
+    # ---- Skill matching ----
+    matched_skills = resume_skills.intersection(jd_keywords)
+    missing_skills = jd_keywords.difference(resume_skills)
+
+    # ---- Scoring ----
+    if len(jd_keywords) == 0:
+        match_percentage = 0
+    else:
+        match_percentage = round(
+            (len(matched_skills) / len(jd_keywords)) * 100, 2
+        )
+
+    # ---- Threshold verdict ----
+    if match_percentage >= 75:
+        verdict = "Strong match"
+    elif match_percentage >= 50:
+        verdict = "Moderate match"
+    else:
+        verdict = "Weak match"
+
+    # ---- Improvements ----
+    improvements = []
+    if missing_skills:
+        improvements.append(
+            f"Add or highlight these skills: {', '.join(list(missing_skills)[:10])}"
+        )
+
+    if not resume_projects:
+        improvements.append("Add relevant projects related to the job description")
+
+    if not resume_experience:
+        improvements.append("Add more relevant work experience")
+
+    return {
+        "match_percentage": match_percentage,
+        "verdict": verdict,
+        "matched_skills": list(matched_skills),
+        "missing_skills": list(missing_skills),
+        "improvements": improvements
+    }
 
 def regex_parse_resume(text: str) -> dict:
     """Robust regex-based resume parser"""
@@ -2407,6 +2469,8 @@ def regex_parse_resume(text: str) -> dict:
         "work_experience": [],
         "summary": safe_truncate(text.replace('\n', ' ').strip(), 300)
     }
+
+
 
 # ==========================================
 # API MODELS
@@ -3776,6 +3840,7 @@ async def parse_resume(
     
     try:
         parsed = ai_parse_resume(raw_text)
+        
     except Exception as e:
         logger.exception(f"Resume parsing failed: {e}")
         parsed = regex_parse_resume(raw_text)
