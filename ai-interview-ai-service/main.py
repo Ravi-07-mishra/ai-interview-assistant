@@ -758,6 +758,97 @@ def llm_call(prompt: str, temperature=0.3, max_tokens=1200) -> dict:
     # If we reach here, all models failed
     return {"ok": False, "error": "all_models_failed"}
 
+# ==========================================
+# RESUME ↔ JOB DESCRIPTION MATCHING
+# ==========================================
+
+def compute_jd_resume_match(resume_text: str, jd_text: str) -> Dict[str, Any]:
+    """
+    Compares resume against job description using TF-IDF + skill overlap.
+    Returns score, verdict, missing skills, and improvement suggestions.
+    """
+
+    if not resume_text or not jd_text:
+        return {
+            "match_score": 0,
+            "verdict": "reject",
+            "reason": "Empty resume or job description"
+        }
+
+    # -----------------------------
+    # 1. Text Similarity (TF-IDF)
+    # -----------------------------
+    vectorizer = TfidfVectorizer(stop_words="english")
+    tfidf = vectorizer.fit_transform([resume_text, jd_text])
+    similarity = cosine_similarity(tfidf[0:1], tfidf[1:2])[0][0]
+
+    similarity_score = round(similarity * 100, 2)
+
+    # -----------------------------
+    # 2. Skill Extraction
+    # -----------------------------
+    COMMON_SKILLS = [
+        "python", "java", "javascript", "react", "node", "django", "flask",
+        "sql", "postgresql", "mongodb", "aws", "docker", "kubernetes",
+        "machine learning", "deep learning", "nlp", "fastapi", "rest api",
+        "git", "linux", "data structures", "algorithms"
+    ]
+
+    resume_lower = resume_text.lower()
+    jd_lower = jd_text.lower()
+
+    resume_skills = {s for s in COMMON_SKILLS if s in resume_lower}
+    jd_skills = {s for s in COMMON_SKILLS if s in jd_lower}
+
+    matched_skills = sorted(resume_skills & jd_skills)
+    missing_skills = sorted(jd_skills - resume_skills)
+
+    # -----------------------------
+    # 3. Final Score (Weighted)
+    # -----------------------------
+    skill_score = (
+        len(matched_skills) / max(len(jd_skills), 1)
+    ) * 100
+
+    final_score = round((0.6 * similarity_score) + (0.4 * skill_score), 2)
+
+    # -----------------------------
+    # 4. Verdict Logic
+    # -----------------------------
+    if final_score >= 70:
+        verdict = "shortlist"
+    elif final_score >= 50:
+        verdict = "borderline"
+    else:
+        verdict = "reject"
+
+    # -----------------------------
+    # 5. Improvements
+    # -----------------------------
+    improvements = []
+    if missing_skills:
+        improvements.append(
+            f"Add hands-on experience or projects using: {', '.join(missing_skills[:5])}"
+        )
+    if similarity_score < 50:
+        improvements.append(
+            "Resume wording does not align with job description. Rephrase using JD keywords."
+        )
+    if not improvements:
+        improvements.append("Resume aligns well with the job description.")
+
+    return {
+        "match_score": final_score,
+        "text_similarity": similarity_score,
+        "skill_match_score": round(skill_score, 2),
+        "verdict": verdict,
+        "matched_skills": matched_skills,
+        "missing_skills": missing_skills,
+        "improvements": improvements,
+        "summary": f"Resume matches {final_score}% with the job description."
+    }
+
+
 
 # ==========================================
 # PERFORMANCE ANALYTICS
