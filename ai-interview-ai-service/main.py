@@ -3788,7 +3788,8 @@ async def parse_resume(
     file: UploadFile = File(None),
     s3_url: Optional[str] = Form(None),
     text: Optional[str] = Form(None),
-    resume_id: Optional[str] = Form(None)
+    resume_id: Optional[str] = Form(None),
+    job_description: Optional[str] = Form(None) 
 ):
     """Parse resume into structured format with AI + fallback"""
     raw_text = ""
@@ -3840,6 +3841,15 @@ async def parse_resume(
     
     try:
         parsed = ai_parse_resume(raw_text)
+  
+
+        job_description = (job_description or "").strip()
+
+        jd_result = (
+                    match_resume_with_jd(parsed, job_description)
+                    if job_description
+                    else None
+                    )
         
     except Exception as e:
         logger.exception(f"Resume parsing failed: {e}")
