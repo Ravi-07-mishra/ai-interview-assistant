@@ -150,15 +150,22 @@ async function callAiRegisterFace(payload) {
 }
 
 // ---------------- DB ----------------
+// ---------------- DB ----------------
 async function connectDB() {
-  const uri = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/interviewdb";
-  try {
-    await mongoose.connect(uri, { autoIndex: false });
-    console.log("✅ Connected to MongoDB:", uri);
-  } catch (error) {
-    console.error("❌ MongoDB connection failed:", error);
-    throw error;
-  }
+  const uri = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/interviewdb";
+  try {
+    await mongoose.connect(uri, { 
+      autoIndex: false,             // Don't build indexes on every boot (prod best practice)
+      maxPoolSize: 10,              // Maintain up to 10 socket connections
+      minPoolSize: 2,               // Keep at least 2 connections open
+      serverSelectionTimeoutMS: 5000, // Keep trying to send operations for 5 seconds
+      socketTimeoutMS: 45000,       // Close sockets after 45 seconds of inactivity
+    });
+    console.log("✅ Connected to MongoDB:", uri);
+  } catch (error) {
+    console.error("❌ MongoDB connection failed:", error);
+    process.exit(1);
+  }
 }
 
 // DB helpers (kept largely as-is)
@@ -216,7 +223,6 @@ async function updateQARecordDB(qaId, patch) {
 async function getQAByQaId(qaId) {
   return QA.findOne({ qaId }).lean();
 }
-
 async function buildQuestionHistory(sessionId, excludeQaId = null) {
   try {
     const query = { sessionId: sessionId };
@@ -225,15 +231,18 @@ async function buildQuestionHistory(sessionId, excludeQaId = null) {
         query.qaId = { $ne: excludeQaId };
     }
 
+    // 👇 OPTIMIZATION: Select only fields needed for context
     const qaDocs = await QA.find(query)
+      .select("questionText candidateAnswer score verdict ideal_outline metadata.target_project metadata.type metadata.is_probe metadata.round expectedAnswerType askedAt")
       .sort({ askedAt: 1 })
       .lean();
 
-    console.log(`📜 History built for ${sessionId}: ${qaDocs.length} items found (excluded: ${excludeQaId}).`);
+    console.log(`📜 History built for ${sessionId}: ${qaDocs.length} items.`);
 
     return qaDocs.map(r => {
       let qType = r.metadata?.type;
       
+      // Fallback inference (kept from your logic)
       if (!qType || qType === "conceptual") {
         const text = (r.questionText || "").toLowerCase();
         if (r.expectedAnswerType === "code" || text.includes("function") || text.includes("code")) {
@@ -245,14 +254,14 @@ async function buildQuestionHistory(sessionId, excludeQaId = null) {
 
       return {
         question: r.questionText,
-        questionText: r.questionText,
         answer: r.candidateAnswer || "",
         score: typeof r.score === "number" ? r.score : 0,
         verdict: r.verdict || null,
         ideal_outline: r.ideal_outline || "",
         type: qType || "conceptual",
         target_project: r.metadata?.target_project || r.target_project || null,
-        is_probe: r.metadata?.is_probe || false // 👈 NEW: Preserve probe flag
+        is_probe: r.metadata?.is_probe || false,
+        round: r.metadata?.round || null // Pass round info to python
       };
     });
   } catch (error) {
@@ -772,6 +781,7 @@ app.post("/interview/answer", requireAuth, async (req, res) => {
     let questionType = req.body.question_type || "text";
     let codeExecutionResult = req.body.code_execution_result || null;
 let whiteboardData = req.body.whiteboard_data || req.body.whiteboardElements || null;
+let whiteboardSnapshot = req.body.whiteboard_snapshot || null;
 let userTimeComplexity = req.body.user_time_complexity || req.body.userTimeComplexity || null;
     let userSpaceComplexity = req.body.user_space_complexity || req.body.userSpaceComplexity || null;
     if (typeof candidateAnswerRaw === "object" && candidateAnswerRaw !== null) {
@@ -819,6 +829,7 @@ const hintUsed = qaRec.metadata?.hint_used || false;
       question_type: questionType,
       code_execution_result: codeExecutionResult,
       whiteboard_elements: whiteboardData,
+      whiteboard_snapshot: whiteboardSnapshot,
       hint_used: hintUsed,
       user_time_complexity: userTimeComplexity,
       user_space_complexity: userSpaceComplexity
@@ -940,6 +951,7 @@ const hintUsed = qaRec.metadata?.hint_used || false;
              });
           }
 
+ // CASE 1: ELIMINATION (Hard Reject)
           if (genResp.elimination) {
             eliminated = true;
             eliminationReason = genResp.reason;
@@ -948,11 +960,11 @@ const hintUsed = qaRec.metadata?.hint_used || false;
             const decisionDoc = await Decision.create({
               decisionId: uuidv4(),
               sessionId,
-              decidedBy: "system",
+              decidedBy: "model",
               verdict: "reject",
               confidence: 0.95,
               reason: eliminationReason,
-              feedback_summary: "The interview was concluded early based on technical requirements.", // Fallback
+              feedback_summary: "The interview was concluded early based on technical requirements.",
               recommended_role: null,
               key_strengths: [],
               critical_weaknesses: [eliminationReason],
@@ -970,16 +982,12 @@ const hintUsed = qaRec.metadata?.hint_used || false;
             return res.json({
               validated: { overall_score: overallScore, verdict: validated.verdict },
               result: { score: overallScore, verdict: validated.verdict },
-              nextQuestion: null,
+              nextQuestion: null, 
               ended: true,
               eliminated: true,
               elimination_reason: eliminationReason,
               is_final: true,
-              final_decision: {
-                  verdict: "reject",
-                  reason: eliminationReason
-              },
-              // Return the updated info
+              final_decision: decisionDoc,
               round_info: {
                 current: roundInfo.current_round,
                 progress: roundInfo.round_progress
@@ -987,21 +995,35 @@ const hintUsed = qaRec.metadata?.hint_used || false;
             });
           }
 
-          if (genResp.ended && genResp.current_round === "complete") {
+          // CASE 2: NATURAL COMPLETION OR TIME LIMIT
+          // If Python says ended=true, we use Python's verdict.
+          else if (genResp.ended) {
             ended = true;
-            modelDecision = genResp.final_decision || { verdict: "hire", reason: "Completed" };
+            
+            // Extract decision directly from Python payload
+            const pyDecision = genResp.final_decision || {};
+            
+            modelDecision = { 
+                verdict: pyDecision.verdict || "maybe",
+                confidence: pyDecision.confidence || 0.85,
+                reason: pyDecision.reason || genResp.reason || "Interview concluded.",
+                feedback_summary: pyDecision.feedback_summary,
+                recommended_role: pyDecision.recommended_role,
+                key_strengths: pyDecision.key_strengths || [],
+                critical_weaknesses: pyDecision.critical_weaknesses || []
+            };
             
             const decisionDoc = await Decision.create({
               decisionId: uuidv4(),
               sessionId,
               decidedBy: "model",
-              verdict: modelDecision.verdict || "hire",
-              confidence: modelDecision.confidence || 0.85,
+              verdict: modelDecision.verdict,
+              confidence: modelDecision.confidence,
               reason: modelDecision.reason,
               feedback_summary: modelDecision.feedback_summary,
               recommended_role: modelDecision.recommended_role,
-              key_strengths: modelDecision.key_strengths || [],
-              critical_weaknesses: modelDecision.critical_weaknesses || [],
+              key_strengths: modelDecision.key_strengths,
+              critical_weaknesses: modelDecision.critical_weaknesses,
               rawModelOutput: genResp,
               performanceMetrics: genResp.round_history || {},
               decidedAt: new Date()
@@ -1009,7 +1031,9 @@ const hintUsed = qaRec.metadata?.hint_used || false;
 
             await markSessionCompletedDB(sessionId, {
               finalDecisionRef: decisionDoc._id,
-              performanceMetrics: genResp.round_history
+              performanceMetrics: genResp.round_history,
+              status: "completed",
+              endedReason: modelDecision.reason
             });
 
             return res.json({
@@ -1018,44 +1042,48 @@ const hintUsed = qaRec.metadata?.hint_used || false;
               nextQuestion: null,
               ended: true,
               is_final: true,
-              final_decision: modelDecision,
+              final_decision: decisionDoc,
               round_info: {
-                current: "complete",
+                current: "complete", 
                 progress: roundInfo.round_progress
               }
             });
           }
 
-          const parsedNext = genResp.parsed || {};
-          let nextType = parsedNext.type || "text";
-            if (nextType === "coding_challenge") nextType = "code";
-            if (nextType === "system_design") nextType = "system_design";
-          const newQa = await createQARecordDB(
-            sessionId,
-            parsedNext.question,
-            parsedNext.ideal_answer_outline || "",
-            nextType,
-            parsedNext.difficulty || "medium",
-            userId,
-            {
-              target_project: parsedNext.target_project,
-              technology_focus: parsedNext.technology_focus,
-              type: inferSemanticType(parsedNext),
-              is_probe: false,
-              round: roundInfo.current_round
-            }
-          );
+          // CASE 3: CONTINUE (Generate Next Question)
+          else {
+             const parsedNext = genResp.parsed || {};
+             let nextType = parsedNext.type || "text";
+             if (nextType === "coding_challenge") nextType = "code";
+             if (nextType === "system_design") nextType = "system_design";
+             
+             const newQa = await createQARecordDB(
+                sessionId,
+                parsedNext.question,
+                parsedNext.ideal_answer_outline || "",
+                nextType,
+                parsedNext.difficulty || "medium",
+                userId,
+                {
+                  target_project: parsedNext.target_project,
+                  technology_focus: parsedNext.technology_focus,
+                  type: inferSemanticType(parsedNext),
+                  is_probe: false,
+                  round: roundInfo.current_round
+                }
+              );
 
-          nextQuestion = {
-            qaId: newQa.qaId,
-            questionId: newQa.questionId,
-            questionText: newQa.questionText,
-            expectedAnswerType: newQa.expectedAnswerType,
-            coding_challenge: parsedNext.coding_challenge || null,
-            is_probe: false,
-            round: roundInfo.current_round,
-            difficulty: newQa.difficulty
-          };
+              nextQuestion = {
+                qaId: newQa.qaId,
+                questionId: newQa.questionId,
+                questionText: newQa.questionText,
+                expectedAnswerType: newQa.expectedAnswerType,
+                coding_challenge: parsedNext.coding_challenge || null,
+                is_probe: false,
+                round: roundInfo.current_round,
+                difficulty: newQa.difficulty
+              };
+          }
         }
       } catch (e) {
         console.warn("⚠️ Next question generation failed:", e.message);
@@ -1066,12 +1094,13 @@ const hintUsed = qaRec.metadata?.hint_used || false;
     // ================= RESPONSE =================
     return res.json({
       validated: { overall_score: overallScore, verdict: validated.verdict },
-result: { 
+      result: { 
           score: overallScore, 
           verdict: validated.verdict, 
-          improvement: scoreUpdate.improvement, // This now contains the helpful feedback
+          improvement: scoreUpdate.improvement, 
           rationale: validated.rationale 
-      },      nextQuestion,
+      },
+      nextQuestion,
       ended,
       eliminated,
       elimination_reason: eliminationReason,
@@ -1080,10 +1109,8 @@ result: {
       needs_human_review: scoreUpdate.needsHumanReview,
       in_gray_zone: scoreUpdate.metadata.in_gray_zone,
       
-      // ✅ FINAL FIX: Ensure this structure matches what React expects
       round_info: {
         current: roundInfo.current_round || roundInfo.current,
-        // React expects 'progress' to contain the objects { questions: N, status: S }
         progress: roundInfo.round_progress || roundInfo.progress,
         section_counts: roundInfo.section_counts
       },
@@ -1098,7 +1125,6 @@ result: {
     return res.status(500).json({ error: "internal_server_error", message: err.message });
   }
 });
-
 // Record a violation
 // Record a violation (safer termination decision)
 app.post("/interview/violation", requireAuth, async (req, res) => {
@@ -1132,7 +1158,7 @@ app.post("/interview/violation", requireAuth, async (req, res) => {
     console.log(`⚠️ Violation recorded for session ${sessionId}: ${ev.reason} (count=${currentCount}, action=${ev.action})`);
 
     // Decide whether to terminate. Use a threshold (2) OR explicit terminate flag after sanity-check.
-    const THRESHOLD = 2;
+    const THRESHOLD = 1000;
     const explicitlyTerminate = action === "terminate";
     const shouldTerminate = (currentCount >= THRESHOLD) || explicitlyTerminate;
 
@@ -1242,72 +1268,184 @@ app.post("/interview/hint", requireAuth, async (req, res) => {
 });
 // Interview end
 app.post("/interview/end", requireAuth, async (req, res) => {
-  try {
-    console.log("🏁 Ending interview:", req.body.sessionId);
-    const { sessionId, reason, terminated_by_violation } = req.body || {};
-    if (!sessionId) return res.status(400).json({ error: "missing sessionId" });
+  try {
+    console.log("🏁 Ending interview:", req.body.sessionId);
+    const { sessionId, reason, terminated_by_violation } = req.body || {};
+    if (!sessionId) return res.status(400).json({ error: "missing sessionId" });
 
-    const s = await getSessionByIdDB(sessionId);
-    if (!s) return res.status(404).json({ error: "session_not_found" });
+    const s = await getSessionByIdDB(sessionId);
+    if (!s) return res.status(404).json({ error: "session_not_found" });
 
-    const recs = await QA.find({ sessionId }).lean();
-    const scores = recs.map(r => r.score).filter(v => v !== null && v !== undefined && !isNaN(v));
-    const avgScore = scores.length ? (scores.reduce((a, b) => a + b, 0) / scores.length) : null;
+    // 1. Gather Data
+    const history = await buildQuestionHistory(sessionId);
+    const scores = history.map(r => r.score).filter(v => typeof v === 'number');
+    const avgScore = scores.length ? (scores.reduce((a, b) => a + b, 0) / scores.length) : 0;
 
-    const extras = {};
-    if (reason) extras.endedReason = reason;
-    if (terminated_by_violation) {
-      extras.terminatedByViolation = true;
-      extras.finalVerdict = "reject";
-      extras.finalReason = reason || "screen-change violation";
-    }
+    let decisionDoc = null;
+    let extras = { endedAt: new Date(), status: "completed" };
 
-    const updatedSession = await markSessionCompletedDB(sessionId, extras);
+    if (reason) extras.endedReason = reason;
 
-    let decisionDoc = null;
-    if (terminated_by_violation) {
-      try {
-        decisionDoc = await Decision.create({
-          decisionId: uuidv4(),
-          sessionId,
-          decidedBy: "system",
-          verdict: "reject",
-          confidence: 1.0,
-          reason: extras.finalReason,
-          recommended_role: null,
-          key_strengths: [],
-          critical_weaknesses: [],
-          rawModelOutput: { terminated_by_violation: true, reason: extras.finalReason },
-          performanceMetrics: { averageScore: avgScore },
-          decidedAt: new Date()
-        });
+    // --- CASE A: VIOLATION (Hard Reject) ---
+    if (terminated_by_violation) {
+      extras.terminatedByViolation = true;
+      extras.finalVerdict = "reject";
+      extras.finalReason = reason || "Integrity violation";
 
-        await Session.findOneAndUpdate({ sessionId }, { $set: { finalDecisionRef: decisionDoc._id } });
-      } catch (e) {
-        console.warn("⚠️ Failed to create Decision for violation end:", e.message);
-      }
-    }
+      decisionDoc = await Decision.create({
+        decisionId: uuidv4(),
+        sessionId,
+        decidedBy: "system",
+        verdict: "reject",
+        confidence: 1.0,
+        reason: extras.finalReason,
+        critical_weaknesses: ["Integrity violation suspected"],
+        rawModelOutput: { terminated: true },
+        performanceMetrics: { average_score: avgScore },
+        decidedAt: new Date()
+      });
+    } 
+    // --- CASE B: MANUAL FINISH (Ask AI for Verdict) ---
+    else {
+      // 👇 NEW: Call AI to get Strengths/Weaknesses even for partial interviews
+      try {
+        const decisionPayload = {
+             request_id: uuidv4(),
+             session_id: sessionId,
+             user_id: req.userId,
+             resume_summary: "", // Optional: fetch if needed
+             conversation: [],   // Optional
+             question_history: history,
+             token_budget: 2000,
+             accept_model_final: true 
+        };
 
-    console.log("✅ Interview ended successfully", { sessionId, terminated_by_violation: !!terminated_by_violation });
+        // Call Python Backend
+        const aiDecisionResp = await callAiFinalizeDecision(decisionPayload);
+        const aiData = aiDecisionResp.result?.parsed || {};
 
-    return res.json({
-      ok: true,
-      sessionId,
-      finalScore: avgScore !== null ? Math.round(avgScore * 1000) / 10 : null,
-      totalQuestions: recs.length,
-      terminated_by_violation: !!terminated_by_violation,
-      finalDecisionRef: decisionDoc ? decisionDoc._id : null,
-      session: updatedSession
-    });
-  } catch (err) {
-    console.error("❌ Interview end error:", err?.message || err);
-    return res.status(500).json({
-      error: "failed_to_end_session",
-      details: process.env.NODE_ENV === "production" ? undefined : err?.message
-    });
-  }
+        decisionDoc = await Decision.create({
+            decisionId: uuidv4(),
+            sessionId,
+            decidedBy: "model",
+            verdict: aiData.verdict || (avgScore > 0.6 ? "hire" : "reject"), // Fallback to score
+            confidence: aiData.confidence || 0.5,
+            reason: aiData.reason || reason || "Candidate ended interview manually.",
+            feedback_summary: aiData.feedback_summary,
+            recommended_role: aiData.recommended_role,
+            key_strengths: aiData.key_strengths || [],
+            critical_weaknesses: aiData.critical_weaknesses || [],
+            performanceMetrics: aiDecisionResp.performance_metrics || { average_score: avgScore },
+            decidedAt: new Date()
+        });
+
+        extras.finalVerdict = decisionDoc.verdict;
+      } catch (aiErr) {
+        console.warn("⚠️ Manual end AI decision failed:", aiErr.message);
+        // Fallback if AI fails
+        decisionDoc = await Decision.create({
+            decisionId: uuidv4(),
+            sessionId,
+            decidedBy: "fallback",
+            verdict: avgScore > 0.6 ? "hire" : "reject",
+            confidence: 0.5,
+            reason: "Manual end (AI analysis unavailable)",
+            performanceMetrics: { average_score: avgScore },
+            decidedAt: new Date()
+        });
+      }
+    }
+
+    // 2. Update Session
+    extras.finalDecisionRef = decisionDoc._id;
+    const updatedSession = await markSessionCompletedDB(sessionId, extras);
+
+    console.log("✅ Interview ended. Verdict:", decisionDoc.verdict);
+
+    return res.json({
+      ok: true,
+      sessionId,
+      finalScore: avgScore,
+      totalQuestions: history.length,
+      terminated_by_violation: !!terminated_by_violation,
+      finalDecisionRef: decisionDoc._id,
+      // Send the actual decision data so frontend can display immediately
+      finalDecision: decisionDoc, 
+      session: updatedSession
+    });
+
+  } catch (err) {
+    console.error("❌ Interview end error:", err?.message || err);
+    return res.status(500).json({ error: "failed_to_end_session" });
+  }
 });
+app.get("/interview/session/:sessionId", requireAuth, async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    if (!sessionId) return res.status(400).json({ error: "Missing sessionId" });
 
+    // 1. Get Session
+    const session = await Session.findOne({ sessionId }).lean();
+    if (!session) return res.status(404).json({ error: "Session not found" });
+
+    // 2. Get Full History
+    const history = await buildQuestionHistory(sessionId);
+
+    // 3. Find the "Current" (Unanswered) Question
+    const allQAs = await QA.find({ sessionId }).sort({ askedAt: -1 }).lean();
+    const latestQA = allQAs[0];
+    
+    let currentQuestion = null;
+    let stage = "idle";
+
+    if (session.status === "completed") {
+      stage = "done";
+    } else if (latestQA && !latestQA.candidateAnswer) {
+      // Unanswered question found -> Resume "running"
+      stage = "running";
+      
+      // Infer metadata for frontend
+      let qType = latestQA.metadata?.type;
+      if (!qType) {
+         if (latestQA.expectedAnswerType === "code") qType = "coding_challenge";
+         else if (latestQA.target_project) qType = "project_discussion";
+         else qType = "conceptual";
+      }
+
+      currentQuestion = {
+        qaId: latestQA.qaId,
+        questionId: latestQA.questionId,
+        questionText: latestQA.questionText,
+        expectedAnswerType: latestQA.expectedAnswerType,
+        difficulty: latestQA.difficulty,
+        ideal_outline: latestQA.ideal_outline,
+        type: qType,
+        target_project: latestQA.metadata?.target_project,
+        coding_challenge: latestQA.metadata?.coding_challenge || null,
+        is_probe: latestQA.metadata?.is_probe || false,
+        round: latestQA.metadata?.round || session.metadata?.current_round || "screening"
+      };
+    } else {
+      // Session active but no open question (rare)
+      stage = "running"; 
+    }
+
+    return res.json({
+      sessionId: session.sessionId,
+      stage,
+      currentQuestion,
+      history, 
+      round_info: {
+         current: session.metadata?.current_round || "screening",
+         progress: session.metadata?.round_progress || {}
+      }
+    });
+
+  } catch (err) {
+    console.error("❌ Resume session error:", err);
+    return res.status(500).json({ error: "resume_failed" });
+  }
+});
 // Admin route
 app.get("/admin/session/:id", requireAuth, async (req, res) => {
   try {

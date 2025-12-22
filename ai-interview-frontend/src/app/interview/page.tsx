@@ -7,7 +7,7 @@ import { useAuth } from "../context/AuthContext";
 import Link from "next/link";
 import jsPDF from "jspdf";
 import "@excalidraw/excalidraw/index.css";
-
+// import { exportToBlob } from "@excalidraw/excalidraw";
 import autoTable from "jspdf-autotable";
 import Editor from "@monaco-editor/react";
 import {
@@ -173,6 +173,7 @@ export default function InterviewPage() {
     endInterview,
     reportViolation,
     sessionId,
+    resumeSession,
     fetchHint
   } = useInterview();
 
@@ -245,7 +246,15 @@ const [hint, setHint] = useState<string | null>(null);
   // Synchronous refs to avoid races when multiple DOM events fire
   const violationRef = useRef(0); // immediate counter
   const endingRef = useRef(false); // prevents duplicate terminations
-
+useEffect(() => {
+    // Attempt resume if logged in, idle, and no session active yet
+    if (token && stage === "idle" && !sessionId) {
+      const savedId = localStorage.getItem("active_interview_session");
+      if (savedId) {
+        resumeSession(savedId);
+      }
+    }
+  }, [token, stage, sessionId, resumeSession]);
   /* -------------------------
       Helper: stop camera stream
       ------------------------- */
@@ -434,7 +443,7 @@ const handleRunCode = async () => {
   /* -------------------------
       Violation wrapper (unchanged behavior)
       ------------------------- */
-const VIOLATION_THRESHOLD = 2;
+const VIOLATION_THRESHOLD = 1000;
 
 const reportViolationWrapper = useCallback(
   async (reason: string, isTerminal: boolean = false) => {
@@ -1126,85 +1135,110 @@ if (data?.firstQuestion?.is_probe) {
   /* -------------------------
       Answer submit handler (unchanged)
       ------------------------- */
-const handleSubmitAnswer = async (e: React.FormEvent) => {
+
+  const handleSubmitAnswer = async (e: React.FormEvent) => {
     e.preventDefault();
     const isWhiteboard = currentQuestion?.expectedAnswerType === "system_design";
-if ((!answer.trim() && !isWhiteboard) || loading || !currentQuestion) return;
-let finalWhiteboardData: any[] = [];
 
-  if (isWhiteboard) {
-    // STRATEGY 1: Force Get from API (Most Reliable)
-    if (excalidrawAPI && typeof excalidrawAPI.getSceneElements === 'function') {
-      const allElements = excalidrawAPI.getSceneElements();
-      // Only send non-deleted elements to save bandwidth and backend parsing
-      finalWhiteboardData = allElements.filter((el: any) => !el.isDeleted);
-      console.log("🎨 Source: API | Elements:", finalWhiteboardData.length);
-    } 
-    // STRATEGY 2: Fallback to Ref (If API failed)
-    else if (whiteboardElementsRef.current && whiteboardElementsRef.current.length > 0) {
-      finalWhiteboardData = [...whiteboardElementsRef.current];
-      console.log("🎨 Source: Ref Backup | Elements:", finalWhiteboardData.length);
-    } else {
-      console.warn("⚠️ Warning: No whiteboard data found via API or Ref.");
+    if ((!answer.trim() && !isWhiteboard) || loading || !currentQuestion) return;
+
+    let finalWhiteboardData: any[] = [];
+    let whiteboardImageBase64: string | null = null;
+
+    if (isWhiteboard) {
+      // 1. Get JSON Elements
+      if (excalidrawAPI && typeof excalidrawAPI.getSceneElements === "function") {
+        const allElements = excalidrawAPI.getSceneElements();
+        finalWhiteboardData = allElements.filter((el: any) => !el.isDeleted);
+        
+        // 2. 📸 CAPTURE IMAGE SNAPSHOT
+        if (finalWhiteboardData.length > 0) {
+          try {
+            console.log("📸 Generating whiteboard snapshot...");
+            
+            // 👇 FIX: Dynamic Import here!
+            // This prevents the "window is not defined" error on the server
+            const { exportToBlob } = await import("@excalidraw/excalidraw");
+
+            const blob = await exportToBlob({
+              elements: finalWhiteboardData,
+              mimeType: "image/jpeg",
+              appState: {
+                ...excalidrawAPI.getAppState(),
+                exportWithDarkMode: false,
+              },
+              files: excalidrawAPI.getFiles(),
+            });
+
+            // Convert Blob to Base64 String
+            whiteboardImageBase64 = await new Promise((resolve) => {
+              const reader = new FileReader();
+              reader.onloadend = () => resolve(reader.result as string);
+              reader.readAsDataURL(blob);
+            });
+            console.log("✅ Snapshot generated (len: " + whiteboardImageBase64?.length + ")");
+          } catch (err) {
+            console.error("❌ Failed to generate whiteboard image:", err);
+          }
+        }
+      } else if (whiteboardElementsRef.current && whiteboardElementsRef.current.length > 0) {
+        finalWhiteboardData = [...whiteboardElementsRef.current];
+      }
     }
-  }
-  console.log("🚀 Submitting Payload:", {
-    question_type: isWhiteboard ? "system_design" : "text",
-    whiteboard_count: finalWhiteboardData.length
-  });
-    const payload: any = { 
-        answer, 
-        question_type: "text", 
-        code_execution_result: executionResult ,
-        whiteboard_elements: finalWhiteboardData,
-        user_time_complexity: timeComplexity, 
-        user_space_complexity: spaceComplexity
+
+    console.log("🚀 Submitting Payload:", {
+      question_type: isWhiteboard ? "system_design" : "text",
+      whiteboard_count: finalWhiteboardData.length,
+      has_snapshot: !!whiteboardImageBase64
+    });
+
+    const payload: any = {
+      answer,
+      question_type: "text",
+      code_execution_result: executionResult,
+      whiteboard_elements: finalWhiteboardData,
+      whiteboard_snapshot: whiteboardImageBase64, 
+      user_time_complexity: timeComplexity,
+      user_space_complexity: spaceComplexity,
     };
-    
+
     if (currentQuestion.expectedAnswerType === "code") {
-        payload.question_type = "code";
+      payload.question_type = "code";
     } else if (isWhiteboard) {
-        payload.question_type = "system_design";
+      payload.question_type = "system_design";
     }
 
     try {
       const result = await submitAnswer(payload, currentQuestion.questionId);
+      
       setAnswer("");
       setCodeOutput(null);
       setExecutionResult(null);
-      setTimeComplexity(""); 
-        setSpaceComplexity("");
-setWhiteboardElements([]);
+      setTimeComplexity("");
+      setSpaceComplexity("");
+      setWhiteboardElements([]);
       if (excalidrawAPI) {
-          excalidrawAPI.resetScene();
+        excalidrawAPI.resetScene();
       }
-      // --- ROUND TRANSITION LOGIC ---
+
       const newRoundData = result?.round_info || result?.metadata;
       const incomingRound = newRoundData?.current || newRoundData?.current_round;
 
-      // 1. Detect Round Change (and it's not the end of interview)
       if (incomingRound && incomingRound !== currentRound && incomingRound !== "complete" && result?.nextQuestion) {
-          console.log(`🔀 Round Transition: ${currentRound} -> ${incomingRound}`);
-          
-          setNextRoundName(incomingRound); // Store next round name
-          setShowRoundModal(true);         // Trigger the Modal
-          
-          // Update progress in background, but keep currentRound same until user clicks "Start"
-          if (newRoundData.progress) setRoundProgress(newRoundData.progress);
-          return; 
+        setNextRoundName(incomingRound);
+        setShowRoundModal(true);
+        if (newRoundData.progress) setRoundProgress(newRoundData.progress);
+        return;
       }
 
-      // 2. Standard Update (Same round)
       if (newRoundData) {
-         setCurrentRound(incomingRound || currentRound);
-         if (newRoundData.progress) setRoundProgress(newRoundData.progress);
+        setCurrentRound(incomingRound || currentRound);
+        if (newRoundData.progress) setRoundProgress(newRoundData.progress);
       }
-
-    } catch (e) { 
-        console.error("Submit error:", e); 
+    } catch (e) {
+      console.error("Submit error:", e);
     }
   };
-
   // Helper for the modal button
   const handleNextRound = () => {
       setShowRoundModal(false);

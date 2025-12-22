@@ -157,10 +157,11 @@ QUESTION_TYPE_TO_ROUND = {
 
 
     # --- Behavioral (Achievements & HR) ---
+  "behavioral": "behavioral", 
     "achievement": "behavioral",
     "ownership": "behavioral",
     "collaboration": "behavioral",
-    "reflection": "behavioral"
+    "hr": "behavioral"
 }
 
 TERMINATION_RULES = {
@@ -183,7 +184,7 @@ TERMINATION_RULES = {
 # ==========================================
 FALLBACK_QUESTIONS = {
     "coding_challenge": {
-        "question": "Write a Python function to check if a string is a valid palindrome, considering only alphanumeric characters and ignoring case.",
+        "question": "Write a Python function to check if a string is a valid palindrome...",
         "type": "coding_challenge",
         "coding_challenge": {
             "language": "python",
@@ -195,12 +196,17 @@ FALLBACK_QUESTIONS = {
         }
     },
     "project_discussion": {
-        "question": "Can you walk me through the most challenging bug you encountered in your recent project? How did you debug and resolve it?",
+        "question": "Can you walk me through the most challenging bug you encountered in your recent project?",
         "type": "project_discussion"
     },
     "conceptual": {
-        "question": "Explain the difference between a process and a thread in an operating system. When would you choose one over the other?",
+        "question": "Explain the difference between a process and a thread in an operating system.",
         "type": "conceptual"
+    },
+    # 👇 ADD THIS SECTION 👇
+    "behavioral": {
+        "question": "Tell me about a time you faced a difficult challenge at work or school. How did you handle it?",
+        "type": "behavioral"
     }
 }
 INTERVIEW_MODE = {
@@ -618,28 +624,51 @@ def safe_truncate(s: str, max_chars: int) -> str:
     if not s or len(s) <= max_chars:
         return s or ""
     return s[:max_chars-3] + "..."
-
 def enforce_budget(payload: dict) -> dict:
-    """Intelligent context truncation while preserving key information"""
-    token_budget = int(payload.get("token_budget") or DEFAULT_TOKEN_BUDGET)
-    char_limit = token_budget * 4
+    """
+    CRITICAL FIX: Aggressively truncates context to prevent token explosion.
+    - Limits RAG chunks to top 3 (saves ~1000 tokens)
+    - Limits Conversation History to last 6 turns (saves ~infinite tokens)
+    - Truncates individual text fields
+    """
+    # 1. Default Token Budget Safety Net
+    token_budget = int(payload.get("token_budget") or 4000)
     
-    resume = safe_truncate(payload.get("resume_summary",""), 1200)
-    chunks = payload.get("retrieved_chunks",[])[:8]
+    # 2. Limit Resume (Strict 1500 chars ~ 375 tokens)
+    # Enough for key skills/projects, prevents bloating
+    resume = safe_truncate(payload.get("resume_summary",""), 1500)
+    
+    # 3. Limit RAG Chunks (Top 3 is sufficient for context)
+    # Reduced from 5 to 3 to save money/tokens
+    raw_chunks = payload.get("retrieved_chunks", []) or []
+    chunks = raw_chunks[:3]
     chunks = [
         {
             "doc_id": c.get("doc_id"),
             "chunk_id": c.get("chunk_id"),
-            "snippet": safe_truncate(c.get("snippet",""), 600),
+            # Truncate content to 500 chars (~125 tokens) per chunk
+            "snippet": safe_truncate(c.get("snippet",""), 500),
             "score": c.get("score", 0)
         }
         for c in chunks
     ]
     
-    conv = payload.get("conversation", [])[-8:]
-    conv = [{"role": t.get("role"), "text": safe_truncate(t.get("text",""), 500)} for t in conv]
+    # 4. Limit Conversation History (Last 3 pairs = 6 turns)
+    # This prevents the "infinite history" bug
+    raw_conv = payload.get("conversation", []) or []
+    conv = raw_conv[-6:] # Strict slice
     
-    question = safe_truncate(payload.get("question",""), 1500)
+    # Sanitize each turn to prevent massive user pastes or system prompt leaks
+    conv = [
+        {
+            "role": t.get("role"), 
+            "text": safe_truncate(t.get("text",""), 600) # Max 600 chars per message
+        } 
+        for t in conv
+    ]
+    
+    # 5. Question Truncation
+    question = safe_truncate(payload.get("question",""), 1000)
     
     return {
         "resume": resume,
@@ -710,6 +739,67 @@ def extract_whiteboard_keywords(scene_elements: List[Dict[str, Any]]) -> str:
         return "Whiteboard contains shapes but NO text labels."
 
     return "Items drawn on whiteboard: " + ", ".join(found_text)
+def analyze_whiteboard_image(base64_img: str) -> str:
+    """
+    Analyze a whiteboard image using available Groq multimodal models.
+    Falls back gracefully if vision models are unavailable.
+    """
+    if not base64_img or not groq_client:
+        return ""
+
+    # Ordered by preference (newest / recommended first)
+    VISION_MODELS = [
+        "meta-llama/llama-4-scout-17b-16e-instruct",
+        "meta-llama/llama-4-maverick-17b-128e-instruct",
+    ]
+
+    # Strip base64 header if present
+    if "base64," in base64_img:
+        base64_img = base64_img.split("base64,", 1)[1]
+
+    for model in VISION_MODELS:
+        try:
+            resp = groq_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Describe this system design architecture diagram. "
+                                    "List the main components (e.g., Load Balancer, API, DB, Cache) "
+                                    "and explain how they connect. Be concise."
+                                ),
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{base64_img}"
+                                },
+                            },
+                        ],
+                    }
+                ],
+                temperature=0.1,
+                max_tokens=500,
+            )
+
+            return resp.choices[0].message.content or ""
+
+        except Exception as e:
+            logger.warning(
+                f"Vision model failed ({model}), trying fallback. Error: {e}"
+            )
+            continue
+
+    # ---- FINAL FALLBACK (TEXT-ONLY MODE) ----
+    logger.error(
+        "All vision models unavailable. Falling back to text-only interview flow."
+    )
+    return ""
+
 def derive_verdict_from_score(score: float) -> str:
     """
     Calibrated grading scale for technical interviews.
@@ -847,7 +937,6 @@ def calculate_performance_metrics(history: List[Dict]) -> Dict[str, Any]:
 # ==========================================
 # TERMINATION LOGIC
 # ==========================================
-
 def check_termination_rules(history: List[Dict]) -> Optional[Dict[str, Any]]:
     """
     BALANCED termination logic for campus / fresher interviews.
@@ -866,7 +955,6 @@ def check_termination_rules(history: List[Dict]) -> Optional[Dict[str, Any]]:
     # --------------------------------------------------
     # RULE 1: Catastrophic Failure (Immediate Reject)
     # --------------------------------------------------
-    # Candidate clearly doesn't know their own resume
     if last is not None and last < rules["instant_fail_threshold"]:
         return {
             "ended": True,
@@ -874,7 +962,11 @@ def check_termination_rules(history: List[Dict]) -> Optional[Dict[str, Any]]:
             "confidence": 0.95,
             "reason": f"Catastrophic failure (score {last:.2f}). Candidate lacks basic understanding.",
             "recommended_role": None,
-            "trigger": "instant_fail"
+            "trigger": "instant_fail",
+            "elimination": True,
+            "key_strengths": [],
+            "critical_weaknesses": [],
+            "feedback_summary": ""
         }
 
     # --------------------------------------------------
@@ -887,7 +979,11 @@ def check_termination_rules(history: List[Dict]) -> Optional[Dict[str, Any]]:
             "confidence": 0.90,
             "reason": f"Failed {metrics['consecutive_fails']} consecutive questions.",
             "recommended_role": None,
-            "trigger": "consecutive_fails"
+            "trigger": "consecutive_fails",
+            "elimination": True,
+            "key_strengths": [],
+            "critical_weaknesses": [],
+            "feedback_summary": ""
         }
 
     # --------------------------------------------------
@@ -900,11 +996,15 @@ def check_termination_rules(history: List[Dict]) -> Optional[Dict[str, Any]]:
     ):
         return {
             "ended": True,
-            "verdict": "hisre",
+            "verdict": "hire",
             "confidence": 0.95,
             "reason": f"Consistent excellence across {qn} questions.",
             "recommended_role": "SDE-1 / Entry-Level",
-            "trigger": "proven_excellence"
+            "trigger": "proven_excellence",
+            "elimination": False,
+            "key_strengths": [],
+            "critical_weaknesses": [],
+            "feedback_summary": ""
         }
 
     # --------------------------------------------------
@@ -921,7 +1021,11 @@ def check_termination_rules(history: List[Dict]) -> Optional[Dict[str, Any]]:
                 "confidence": 0.88,
                 "reason": f"Below minimum bar in {weak_answers}/{qn} questions.",
                 "recommended_role": None,
-                "trigger": "chronic_underperformance"
+                "trigger": "chronic_underperformance",
+                "elimination": True,
+                "key_strengths": [],
+            "critical_weaknesses": [],
+            "feedback_summary": ""
             }
 
     # --------------------------------------------------
@@ -944,25 +1048,47 @@ def check_termination_rules(history: List[Dict]) -> Optional[Dict[str, Any]]:
                     f"Final decision based on average score {avg:.2f}."
                 ),
                 "recommended_role": "Intern" if verdict == "hire" else None,
-                "trigger": "gray_zone_timeout"
+                "trigger": "gray_zone_timeout",
+                "elimination": verdict == "reject"
             }
 
     # --------------------------------------------------
-    # RULE 6: Hard Safety Limit (Never Infinite)
+    # RULE 6: Hard Safety Limit (Neutral Completion)
     # --------------------------------------------------
-    if qn >= rules.get("max_questions", 12):
-        verdict = "hire" if avg >= 0.60 else "reject"
+    # FIX: Don't treat reaching the limit as a "failure".
+    if qn >= rules.get("max_questions", 10):
+        final_average = avg
+        
+        # Lower threshold to standard pass (0.55)
+        passed = final_average >= 0.55
+        HIRE_THRESHOLD = 0.60   # > 60% = Hire
+        REJECT_THRESHOLD = 0.45 # < 45% = Reject
+        
+        # Use 'maybe' instead of 'reject' for borderline cases at time limit
+# Logic: Python decides the verdict based on math
+        if final_average >= HIRE_THRESHOLD:
+            verdict = "hire"
+            summary = f"Completed with strong performance. Average: {final_average:.0%}"
+        elif final_average < REJECT_THRESHOLD:
+            verdict = "reject"
+            summary = f"Did not meet technical bar. Average: {final_average:.0%}"
+        else:
+            verdict = "maybe"
+            summary = f"Borderline performance. Average: {final_average:.0%}"
+        
         return {
             "ended": True,
-            "verdict": verdict,
-            "confidence": 0.80,
-            "reason": "Interview reached maximum allowed questions.",
-            "recommended_role": "Entry-Level" if verdict == "hire" else None,
-            "trigger": "max_questions"
+            "elimination": False, # Keep False so it shows "Completed" screen, not "Eliminated"
+            "verdict": verdict,   # <--- Python sends the actual decision here
+            "confidence": 0.90, 
+            "reason": summary,
+            "recommended_role": "SDE-1" if verdict == "hire" else None,
+            "trigger": "max_questions",
+            "key_strengths": [],
+            "critical_weaknesses": [],
+            "feedback_summary": summary
         }
-
     return None  # Continue interview
-
 # ==========================================
 # QUESTION GENERATION
 # ==========================================
@@ -2742,6 +2868,7 @@ class ScoreAnswerRequest(BaseModel):
     code_execution_result: Optional[Dict[str, Any]] = None 
     hint_used: Optional[bool] = False
     whiteboard_elements: Optional[List[Dict[str, Any]]] = None
+    whiteboard_snapshot: Optional[str] = None
     user_time_complexity: Optional[str] = None   # e.g. "O(n)"
     user_space_complexity: Optional[str] = None  # e.g. "O(1)"
 
@@ -2867,57 +2994,62 @@ def generate_question(req: GenerateQuestionRequest):
                 "confidence": 0.95
             }
         }
+# =====================================================
+    # 🛑 TERMINATION CHECK (UPDATED WITH AI FEEDBACK)
+    # =====================================================
     rule_termination = check_termination_rules(history)
+    
     if rule_termination:
+        logger.info(f"🛑 Rule Triggered: {rule_termination['trigger']}")
+        
+        # 1. Ask AI to generate qualitative feedback (Strengths/Weaknesses)
+        #    even though a hard rule decided the verdict.
+        try:
+            decision_context = {
+                "resume": payload.get("resume_summary", ""),
+                "question_history": history,
+                "conversation": payload.get("conversation", []),
+                "retrieved_chunks": enforced.get("chunks", [])
+            }
+            
+            # Use low temp for consistent analysis
+            ai_decision_resp = call_decision(decision_context, temperature=0.1)
+            ai_data = ai_decision_resp.get("parsed") or {}
+
+            # 2. Merge AI insights into the Hard Rule decision
+            #    We keep the Rule's VERDICT (e.g. "hire"/"maybe") but add AI details
+            rule_termination["key_strengths"] = ai_data.get("key_strengths", [])
+            rule_termination["critical_weaknesses"] = ai_data.get("critical_weaknesses", [])
+            
+            # Combine reasons if useful
+            ai_reason = ai_data.get("reason", "")
+            if ai_reason and len(ai_reason) > 10:
+                 rule_termination["feedback_summary"] = ai_data.get("feedback_summary", rule_termination.get("reason"))
+            else:
+                 rule_termination["feedback_summary"] = rule_termination.get("reason")
+            
+            # If the rule didn't specify a role, use the AI's suggestion
+            if not rule_termination.get("recommended_role"):
+                rule_termination["recommended_role"] = ai_data.get("recommended_role")
+
+        except Exception as e:
+            logger.error(f"Failed to generate AI feedback for termination: {e}")
+            # Fallbacks in case AI fails
+            rule_termination["key_strengths"] = []
+            rule_termination["critical_weaknesses"] = []
+            rule_termination["feedback_summary"] = rule_termination.get("reason", "Interview concluded.")
+
+        # 3. Return the Final Decision
         return {
             "request_id": payload["request_id"],
             "q_count": current_q_count,
             "ended": True,
-            "elimination": True,
+            # Use 'elimination' flag from the rule (False for Rule 6, True for others)
+            "elimination": rule_termination.get("elimination", False),
             "reason": rule_termination["reason"],
-            "final_decision": rule_termination,
-            "parsed": {"question": "Interview Terminated", "type": "info"}
+            "final_decision": rule_termination, 
+            "parsed": {"question": "Interview Complete", "type": "info"}
         }
-    if state.current_round == "complete":
-        decision = call_decision({
-            "resume": payload.get("resume_summary", ""),
-            "question_history": history,
-            "conversation": payload.get("conversation", []),
-            "retrieved_chunks": enforced.get("chunks", [])
-        }, temperature=0.0)
-
-        return {
-            "request_id": payload["request_id"],
-            "q_count": current_q_count,
-            "ended": True,
-            "elimination": False,
-            "current_round": "complete",
-            "round_history": state.round_history,
-            "final_decision": decision.get("parsed"),
-        }
-    required_type = state.next_question_type()
-    logger.info(f"🎯 Round: {state.current_round} | Required type: {required_type}")
-
-
-    # =====================================================
-    # 🛑 TERMINATION CHECK (ONLY PLACE IT HAPPENS)
-    # =====================================================
-    if len(history) >= TERMINATION_RULES["max_questions"]:
-        decision = call_decision({
-            "resume": payload.get("resume_summary", ""),
-            "question_history": history,
-            "conversation": payload.get("conversation", []),
-            "retrieved_chunks": enforced.get("chunks", [])
-        }, temperature=0.0)
-
-        return {
-            "request_id": payload["request_id"],
-            "q_count": current_q_count,
-            "ended": True,
-            "final_decision": decision.get("parsed"),
-            "parsed": {"question": "Interview Complete", "type": "info"},
-        }
-
     # =====================================================
     # 2. DETERMINE REQUIRED TYPE (ONCE)
     # =====================================================
@@ -3024,7 +3156,11 @@ def generate_question(req: GenerateQuestionRequest):
     # 4. FALLBACK (RARE, SAFE)
     # =====================================================
     if parsed is None:
-        parsed = FALLBACK_QUESTIONS["conceptual"].copy()
+        if required_type in FALLBACK_QUESTIONS:
+            parsed = FALLBACK_QUESTIONS[required_type].copy()
+        else:
+            # Default to conceptual if specific type missing
+            parsed = FALLBACK_QUESTIONS["conceptual"].copy()
         parsed["type"] = "conceptual"
         parsed["_is_fallback"] = True
         chosen_raw = "FALLBACK_TRIGGERED"
@@ -3418,10 +3554,19 @@ def score_answer(req: ScoreAnswerRequest):
     enforced = enforce_budget(payload)
     whiteboard_context = ""
     if payload.get("question_type") == "system_design":
-        elements = payload.get("whiteboard_elements", [])
-        whiteboard_context = extract_whiteboard_keywords(elements)
-        logger.info(f"🎨 Whiteboard Analysis: {whiteboard_context}")
-    # 2. Build Context & Prompt
+        # 1. Try Vision Analysis first (Best for diagrams)
+        if payload.get("whiteboard_snapshot"):
+            logger.info("🎨 Analyzing Whiteboard Snapshot with Vision Model...")
+            vision_desc = analyze_whiteboard_image(payload["whiteboard_snapshot"])
+            if vision_desc:
+                whiteboard_context = f"AI VISION ANALYSIS OF DIAGRAM:\n{vision_desc}"
+        
+        # 2. Fallback to JSON keywords if Vision failed or no snapshot was provided
+        if not whiteboard_context:
+            elements = payload.get("whiteboard_elements", [])
+            whiteboard_context = extract_whiteboard_keywords(elements)
+            
+        logger.info(f"🎨 Final Whiteboard Context: {whiteboard_context[:100]}...")
     context = {
         "resume": enforced.get("resume", ""),
         "chunks": enforced.get("chunks", []),
