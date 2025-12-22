@@ -2393,13 +2393,25 @@ def match_resume_with_jd(parsed_resume: Dict, job_description: str) -> Dict:
     if not resume_experience:
         improvements.append("Add more relevant work experience")
 
+    if match_percentage >= 75:
+      verdict = "Strong match"
+      passed = True
+   elif match_percentage >= 50:
+     verdict = "Moderate match"
+     passed = True
+   else:
+    verdict = "Rejected – Resume does not match JD"
+    passed = False
+
     return {
         "match_percentage": match_percentage,
         "verdict": verdict,
+        "passed": passed,
         "matched_skills": list(matched_skills),
         "missing_skills": list(missing_skills),
         "improvements": improvements
     }
+   
 
 def regex_parse_resume(text: str) -> dict:
     """Robust regex-based resume parser"""
