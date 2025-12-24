@@ -27,6 +27,13 @@ const QASchema = new mongoose.Schema({
   confidence: { type: Number, min: 0, max: 1 },
   rationale: { type: String },
   improvement: { type: String },
+  playback_history: [
+    {
+      timestamp: Number,
+      code: String,
+      trigger: String
+    }
+  ],
   
   // Flags & Metadata
   needsHumanReview: { type: Boolean, default: false },

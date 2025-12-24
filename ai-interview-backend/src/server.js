@@ -232,7 +232,7 @@ async function getQAByQaId(qaId) {
 
     // ✅ FIX: Added 'improvement' and 'rationale' to the selection string
     const qaDocs = await QA.find(query)
-      .select("questionText candidateAnswer score verdict ideal_outline improvement rationale metadata.target_project metadata.type metadata.is_probe metadata.round expectedAnswerType askedAt")
+      .select("questionText candidateAnswer score verdict ideal_outline improvement rationale metadata.target_project metadata.type metadata.is_probe metadata.round expectedAnswerType askedAt playback_history")
       .sort({ askedAt: 1 })
       .lean();
 
@@ -263,7 +263,8 @@ async function getQAByQaId(qaId) {
         round: r.metadata?.round || null,
         // ✅ These fields will now be populated with actual data
         improvement: r.improvement || r.metadata?.improvement || "", 
-        rationale: r.rationale || ""
+        rationale: r.rationale || "",
+        playback_history: r.playback_history || []
       };
     });
   } catch (error) {
@@ -814,12 +815,14 @@ let whiteboardData = req.body.whiteboard_data || req.body.whiteboardElements || 
 let whiteboardSnapshot = req.body.whiteboard_snapshot || null;
 let userTimeComplexity = req.body.user_time_complexity || req.body.userTimeComplexity || null;
     let userSpaceComplexity = req.body.user_space_complexity || req.body.userSpaceComplexity || null;
+    let playbackHistory = req.body.playback_history || [];
     if (typeof candidateAnswerRaw === "object" && candidateAnswerRaw !== null) {
       candidateAnswer = candidateAnswerRaw.answer || candidateAnswerRaw.candidateAnswer || "";
       if (candidateAnswerRaw.question_type) questionType = candidateAnswerRaw.question_type;
       if (candidateAnswerRaw.code_execution_result) codeExecutionResult = candidateAnswerRaw.code_execution_result;
       if (candidateAnswerRaw.user_time_complexity) userTimeComplexity = candidateAnswerRaw.user_time_complexity;
       if (candidateAnswerRaw.user_space_complexity) userSpaceComplexity = candidateAnswerRaw.user_space_complexity;
+      if (candidateAnswerRaw.playback_history) playbackHistory = candidateAnswerRaw.playback_history;
     } else {
       candidateAnswer = String(candidateAnswerRaw || "");
     }
@@ -837,6 +840,7 @@ let userTimeComplexity = req.body.user_time_complexity || req.body.userTimeCompl
     await updateQARecordDB(qaRec.qaId, {
       candidateAnswer,
       answeredAt: new Date(),
+      playback_history: playbackHistory
     });
 
     // Build history (excluding current)
@@ -862,7 +866,8 @@ const hintUsed = qaRec.metadata?.hint_used || false;
       whiteboard_snapshot: whiteboardSnapshot,
       hint_used: hintUsed,
       user_time_complexity: userTimeComplexity,
-      user_space_complexity: userSpaceComplexity
+      user_space_complexity: userSpaceComplexity,
+      playback_history: playbackHistory
     };
     console.log(`📤 Sending Score Payload. Type: ${questionType}, Has Whiteboard: ${!!whiteboardData}`);
 

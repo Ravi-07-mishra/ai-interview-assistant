@@ -35,8 +35,7 @@ import {
   Code,
   Layout,
   ExternalLink,
-  Zap
-   // <--- NEW // Added for loading indicator
+  Zap   // <--- NEW // Added for loading indicator
 } from "lucide-react";
 
 /* -------------------------
@@ -164,7 +163,227 @@ const ExcalidrawWrapper = dynamic(
 /* -------------------------
     Main component
     ------------------------- */
+const RoadmapDisplay = ({ plan }: { plan: any }) => {
+  if (!plan) return null;
 
+  // 🔍 DEBUG: Log exactly what the frontend is seeing
+  console.log("🔍 Roadmap Data Received:", plan);
+
+  // 🛠️ HELPER: Recursively find the 'weekly_plan' array
+  // This fixes issues where AI returns { roadmap: { weekly_plan: ... } }
+  // or { WeeklyPlan: ... } or other variations.
+  const findSchedule = (obj: any): any[] => {
+    if (!obj || typeof obj !== 'object') return [];
+    
+    // 1. Direct match (case insensitive)
+    const keys = Object.keys(obj);
+    const planKey = keys.find(k => k.toLowerCase().includes('weekly') && k.toLowerCase().includes('plan'));
+    if (planKey && Array.isArray(obj[planKey])) {
+      return obj[planKey];
+    }
+
+    // 2. Check for 'roadmap' wrapper
+    if (obj.roadmap && typeof obj.roadmap === 'object') {
+        return findSchedule(obj.roadmap);
+    }
+
+    return [];
+  };
+ 
+  const schedule = findSchedule(plan);
+  
+  // Extract other fields safely
+  const assessment = plan.overall_assessment || plan.roadmap?.overall_assessment || plan.assessment || "Your personalized recovery plan.";
+  const radar = plan.skill_radar || plan.roadmap?.skill_radar || plan.skills || null;
+  const projects = plan.recommended_projects || plan.roadmap?.recommended_projects || [];
+
+  return (
+    <div className="mt-10 animate-in fade-in slide-in-from-bottom-6 duration-700">
+      <div className="bg-white rounded-3xl border-2 border-indigo-100 shadow-xl overflow-hidden">
+        
+        {/* Header */}
+        <div className="bg-gradient-to-r from-indigo-600 to-blue-600 p-8 text-white">
+          <div className="flex items-center gap-3 mb-2">
+            <Map className="text-indigo-200" size={28} />
+            <h2 className="text-2xl font-black uppercase tracking-wide">4-Week Recovery Plan</h2>
+          </div>
+          <p className="text-indigo-100 text-lg font-medium leading-relaxed max-w-3xl">
+            {assessment}
+          </p>
+        </div>
+
+        <div className="p-8">
+          {/* Skill Radar */}
+          {radar && (
+            <div className="mb-10 p-6 bg-slate-50 rounded-2xl border border-slate-200">
+              <h3 className="font-bold text-slate-700 mb-4 flex items-center gap-2">
+                <Target size={18} /> Skill Gap Analysis
+              </h3>
+              <div className="space-y-4 grid grid-cols-1 md:grid-cols-2 gap-6">
+                {Object.entries(radar).map(([skill, score]: [string, any]) => (
+                  <div key={skill}>
+                    <div className="flex justify-between text-xs font-bold uppercase text-slate-500 mb-1">
+                      <span>{skill.replace(/_/g, " ")}</span>
+                      <span>{Math.round(Number(score) * 100)}%</span>
+                    </div>
+                    <div className="h-2 w-full bg-slate-200 rounded-full overflow-hidden">
+                      <div 
+                        className={`h-full rounded-full ${score > 0.7 ? 'bg-emerald-500' : score > 0.4 ? 'bg-amber-500' : 'bg-rose-500'}`} 
+                        style={{ width: `${Number(score) * 100}%` }} 
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Weekly Timeline */}
+          <div className="space-y-8">
+            <h3 className="font-bold text-xl text-slate-900 flex items-center gap-2 border-b pb-4">
+              <Calendar size={20} className="text-indigo-600" /> Actionable Schedule
+            </h3>
+            
+            {schedule.length === 0 ? (
+               <div className="text-center p-8 bg-slate-50 rounded-xl border border-slate-200 text-slate-500 italic">
+                 <p>No specific schedule generated.</p>
+                 <p className="text-xs mt-2 text-slate-400">(Debug: Check console for 'Roadmap Data Received')</p>
+               </div>
+            ) : (
+              <div className="relative border-l-2 border-indigo-100 ml-3 space-y-8 pb-4">
+                {schedule.map((week: any, wIdx: number) => (
+                  <div key={wIdx} className="relative pl-8">
+                    <div className="absolute -left-[9px] top-0 w-5 h-5 bg-indigo-600 rounded-full border-4 border-white shadow-sm" />
+                    
+                    <div className="mb-4">
+                      <h4 className="text-lg font-bold text-slate-800">Week {week.week}: {week.theme}</h4>
+                      <div className="flex flex-wrap gap-2 mt-2">
+                        {week.goals?.map((g: string, i: number) => (
+                          <span key={i} className="text-xs font-medium px-2 py-0.5 bg-green-50 text-green-700 rounded-md border border-green-200">
+                            🎯 {g}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 gap-4">
+                      {week.daily_tasks?.map((task: any, dIdx: number) => (
+                        <div key={dIdx} className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm hover:shadow-md transition-shadow">
+                          <div className="flex justify-between items-start mb-2">
+                            <span className="text-xs font-bold bg-slate-100 text-slate-600 px-2 py-1 rounded uppercase tracking-wider">
+                              {task.day}
+                            </span>
+                          </div>
+                          <p className="font-medium text-slate-800 mb-3">{task.activity}</p>
+                          
+                          <div className="space-y-2">
+                            {task.resources?.map((res: any, rIdx: number) => (
+                              <a 
+                                key={rIdx} 
+                                href={res.url} 
+                                target="_blank" 
+                                rel="noopener noreferrer"
+                                className="flex items-center gap-3 p-2 rounded-lg bg-slate-50 hover:bg-indigo-50 border border-slate-100 hover:border-indigo-200 transition-colors group"
+                              >
+                                <div className="shrink-0">
+                                  {res.type === 'video' ? <Video size={16} className="text-red-500" /> : <BookOpen size={16} className="text-blue-500" />}
+                                </div>
+                                <div className="flex-1 min-w-0">
+                                  <div className="text-sm font-medium text-slate-700 group-hover:text-indigo-700 truncate">
+                                    {res.title}
+                                  </div>
+                                </div>
+                                <ExternalLink size={14} className="text-slate-400 group-hover:text-indigo-400" />
+                              </a>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+ const CodeReplayPlayer = ({ history }: { history: any[] }) => {
+  const [index, setIndex] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+
+  useEffect(() => {
+    let interval: any;
+    if (isPlaying && index < history.length - 1) {
+      interval = setInterval(() => {
+        setIndex((prev) => prev + 1);
+      }, 500); // 0.5s per frame
+    } else if (index >= history.length - 1) {
+      setIsPlaying(false);
+    }
+    return () => clearInterval(interval);
+  }, [isPlaying, index, history.length]);
+
+  const frame = history[index];
+  if (!frame) return <div className="text-slate-400 text-xs italic p-2">No playback data available.</div>;
+
+  return (
+    <div className="mt-4 border-2 border-slate-200 rounded-xl overflow-hidden bg-white shadow-sm">
+      {/* Player Toolbar */}
+      <div className="bg-slate-100 p-2 flex items-center justify-between border-b border-slate-200">
+        <div className="flex items-center gap-3">
+          <button 
+            onClick={() => setIsPlaying(!isPlaying)}
+            className="flex items-center gap-1 px-3 py-1 bg-white border border-slate-300 rounded hover:bg-slate-50 text-xs font-bold transition-colors"
+          >
+            {isPlaying ? <><Minus size={12} /> Pause</> : <><Play size={12} /> Replay</>}
+          </button>
+          
+          <input 
+            type="range" 
+            min="0" 
+            max={history.length - 1} 
+            value={index} 
+            onChange={(e) => setIndex(Number(e.target.value))}
+            className="w-32 md:w-48 h-2 bg-slate-300 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+          />
+          
+          <span className="text-xs text-slate-500 font-mono">
+            {new Date(frame.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit'})}
+          </span>
+        </div>
+
+        {/* Event Badge */}
+        <div className={`text-[10px] font-bold px-2 py-1 rounded uppercase tracking-wider ${
+          frame.trigger === 'paste' ? 'bg-rose-100 text-rose-700 border border-rose-200' : 
+          frame.trigger === 'run' ? 'bg-indigo-100 text-indigo-700 border border-indigo-200' : 
+          'bg-slate-200 text-slate-600 border border-slate-300'
+        }`}>
+          {frame.trigger}
+        </div>
+      </div>
+
+      {/* Read-Only Editor View */}
+      <div className="h-64 opacity-90 pointer-events-none relative"> 
+        <Editor 
+          height="100%" 
+          defaultLanguage="python" 
+          value={frame.code} 
+          theme="vs-light" 
+          options={{ 
+            minimap: { enabled: false }, 
+            readOnly: true, 
+            lineNumbers: "off",
+            folding: false,
+            scrollBeyondLastLine: false
+          }}
+        />
+      </div>
+    </div>
+  );
+};
 export default function InterviewPage() {
   const {
     stage,
@@ -256,6 +475,34 @@ const [hint, setHint] = useState<string | null>(null);
   // Synchronous refs to avoid races when multiple DOM events fire
   const violationRef = useRef(0); // immediate counter
   const endingRef = useRef(false); // prevents duplicate terminations
+  interface CodeSnapshot {
+  timestamp: number;
+  code: string;
+  trigger: 'auto' | 'run' | 'paste' | 'initial';
+}
+  const playbackHistory = useRef<CodeSnapshot[]>([]);
+
+const captureSnapshot = useCallback((trigger: CodeSnapshot['trigger']) => {
+    // Only capture for code questions
+    if (currentQuestion?.expectedAnswerType !== "code") return;
+
+    // Avoid duplicates for auto-timer to save memory
+    const currentCode = answer; 
+    const lastCode = playbackHistory.current[playbackHistory.current.length - 1]?.code;
+
+    if (trigger === 'auto' && (!currentCode || currentCode === lastCode)) return;
+
+    playbackHistory.current.push({
+      timestamp: Date.now(),
+      code: currentCode, 
+      trigger
+    });
+    
+    // Debug log
+    if (trigger !== 'auto') {
+        console.log(`📹 Snapshot [${trigger}]: ${playbackHistory.current.length} frames`);
+    }
+  }, [answer, currentQuestion]);
 useEffect(() => {
     // Attempt resume if logged in, idle, and no session active yet
     if (token && stage === "idle" && !sessionId) {
@@ -265,6 +512,32 @@ useEffect(() => {
       }
     }
   }, [token, stage, sessionId, resumeSession]);
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (stage === "running" && currentQuestion?.expectedAnswerType === "code") {
+      interval = setInterval(() => {
+        captureSnapshot('auto');
+      }, 5000); // Snapshot every 5 seconds
+    }
+    return () => { if (interval) clearInterval(interval); };
+  }, [stage, currentQuestion, captureSnapshot]);
+
+  // 2. Reset on New Question
+  useEffect(() => {
+    playbackHistory.current = [];
+    if (currentQuestion?.expectedAnswerType === "code") {
+       // Capture initial state after a brief delay to ensure answer is populated
+       setTimeout(() => captureSnapshot('initial'), 200);
+    }
+  }, [currentQuestion?.questionId]);
+
+  // 3. Handle Paste Events (Anti-Cheat)
+  const handleEditorDidMount = (editor: any) => {
+    editor.onDidPaste(() => {
+        console.warn("⚠️ Paste detected in editor");
+        captureSnapshot('paste');
+    });
+  };
   /* -------------------------
       Helper: stop camera stream
       ------------------------- */
@@ -309,6 +582,7 @@ useEffect(() => {
       setLoadingRoadmap(false);
     }
   },[sessionId, token, API, roadmap, loadingRoadmap])
+  
 // --------------------- Helper: normalize testcases ---------------------
 const buildTestCasesFromChallenge = (challenge: any) => {
   const candidateLists = [
@@ -386,6 +660,7 @@ useEffect(() => {
 const handleRunCode = async () => {
   console.log("🔍 handleRunCode called");
   console.trace();
+  captureSnapshot('run');
 
   const codeToRun = answer.trim();
   if (!codeToRun) return;
@@ -1224,7 +1499,9 @@ if (data?.firstQuestion?.is_probe) {
       whiteboard_count: finalWhiteboardData.length,
       has_snapshot: !!whiteboardImageBase64
     });
-
+if (currentQuestion?.expectedAnswerType === "code") {
+        captureSnapshot('auto');
+    }
     const payload: any = {
       answer,
       question_type: "text",
@@ -1233,6 +1510,7 @@ if (data?.firstQuestion?.is_probe) {
       whiteboard_snapshot: whiteboardImageBase64, 
       user_time_complexity: timeComplexity,
       user_space_complexity: spaceComplexity,
+      playback_history: playbackHistory.current
     };
 
     if (currentQuestion.expectedAnswerType === "code") {
@@ -1331,153 +1609,8 @@ if (data?.firstQuestion?.is_probe) {
       </div>
     </div>
   );
-};const RoadmapDisplay = ({ plan }: { plan: any }) => {
-  if (!plan) return null;
-
-  // 🔍 DEBUG: Log exactly what the frontend is seeing
-  console.log("🔍 Roadmap Data Received:", plan);
-
-  // 🛠️ HELPER: Recursively find the 'weekly_plan' array
-  // This fixes issues where AI returns { roadmap: { weekly_plan: ... } }
-  // or { WeeklyPlan: ... } or other variations.
-  const findSchedule = (obj: any): any[] => {
-    if (!obj || typeof obj !== 'object') return [];
-    
-    // 1. Direct match (case insensitive)
-    const keys = Object.keys(obj);
-    const planKey = keys.find(k => k.toLowerCase().includes('weekly') && k.toLowerCase().includes('plan'));
-    if (planKey && Array.isArray(obj[planKey])) {
-      return obj[planKey];
-    }
-
-    // 2. Check for 'roadmap' wrapper
-    if (obj.roadmap && typeof obj.roadmap === 'object') {
-        return findSchedule(obj.roadmap);
-    }
-
-    return [];
-  };
-
-  const schedule = findSchedule(plan);
-  
-  // Extract other fields safely
-  const assessment = plan.overall_assessment || plan.roadmap?.overall_assessment || plan.assessment || "Your personalized recovery plan.";
-  const radar = plan.skill_radar || plan.roadmap?.skill_radar || plan.skills || null;
-  const projects = plan.recommended_projects || plan.roadmap?.recommended_projects || [];
-
-  return (
-    <div className="mt-10 animate-in fade-in slide-in-from-bottom-6 duration-700">
-      <div className="bg-white rounded-3xl border-2 border-indigo-100 shadow-xl overflow-hidden">
-        
-        {/* Header */}
-        <div className="bg-gradient-to-r from-indigo-600 to-blue-600 p-8 text-white">
-          <div className="flex items-center gap-3 mb-2">
-            <Map className="text-indigo-200" size={28} />
-            <h2 className="text-2xl font-black uppercase tracking-wide">4-Week Recovery Plan</h2>
-          </div>
-          <p className="text-indigo-100 text-lg font-medium leading-relaxed max-w-3xl">
-            {assessment}
-          </p>
-        </div>
-
-        <div className="p-8">
-          {/* Skill Radar */}
-          {radar && (
-            <div className="mb-10 p-6 bg-slate-50 rounded-2xl border border-slate-200">
-              <h3 className="font-bold text-slate-700 mb-4 flex items-center gap-2">
-                <Target size={18} /> Skill Gap Analysis
-              </h3>
-              <div className="space-y-4 grid grid-cols-1 md:grid-cols-2 gap-6">
-                {Object.entries(radar).map(([skill, score]: [string, any]) => (
-                  <div key={skill}>
-                    <div className="flex justify-between text-xs font-bold uppercase text-slate-500 mb-1">
-                      <span>{skill.replace(/_/g, " ")}</span>
-                      <span>{Math.round(Number(score) * 100)}%</span>
-                    </div>
-                    <div className="h-2 w-full bg-slate-200 rounded-full overflow-hidden">
-                      <div 
-                        className={`h-full rounded-full ${score > 0.7 ? 'bg-emerald-500' : score > 0.4 ? 'bg-amber-500' : 'bg-rose-500'}`} 
-                        style={{ width: `${Number(score) * 100}%` }} 
-                      />
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Weekly Timeline */}
-          <div className="space-y-8">
-            <h3 className="font-bold text-xl text-slate-900 flex items-center gap-2 border-b pb-4">
-              <Calendar size={20} className="text-indigo-600" /> Actionable Schedule
-            </h3>
-            
-            {schedule.length === 0 ? (
-               <div className="text-center p-8 bg-slate-50 rounded-xl border border-slate-200 text-slate-500 italic">
-                 <p>No specific schedule generated.</p>
-                 <p className="text-xs mt-2 text-slate-400">(Debug: Check console for 'Roadmap Data Received')</p>
-               </div>
-            ) : (
-              <div className="relative border-l-2 border-indigo-100 ml-3 space-y-8 pb-4">
-                {schedule.map((week: any, wIdx: number) => (
-                  <div key={wIdx} className="relative pl-8">
-                    <div className="absolute -left-[9px] top-0 w-5 h-5 bg-indigo-600 rounded-full border-4 border-white shadow-sm" />
-                    
-                    <div className="mb-4">
-                      <h4 className="text-lg font-bold text-slate-800">Week {week.week}: {week.theme}</h4>
-                      <div className="flex flex-wrap gap-2 mt-2">
-                        {week.goals?.map((g: string, i: number) => (
-                          <span key={i} className="text-xs font-medium px-2 py-0.5 bg-green-50 text-green-700 rounded-md border border-green-200">
-                            🎯 {g}
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-1 gap-4">
-                      {week.daily_tasks?.map((task: any, dIdx: number) => (
-                        <div key={dIdx} className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm hover:shadow-md transition-shadow">
-                          <div className="flex justify-between items-start mb-2">
-                            <span className="text-xs font-bold bg-slate-100 text-slate-600 px-2 py-1 rounded uppercase tracking-wider">
-                              {task.day}
-                            </span>
-                          </div>
-                          <p className="font-medium text-slate-800 mb-3">{task.activity}</p>
-                          
-                          <div className="space-y-2">
-                            {task.resources?.map((res: any, rIdx: number) => (
-                              <a 
-                                key={rIdx} 
-                                href={res.url} 
-                                target="_blank" 
-                                rel="noopener noreferrer"
-                                className="flex items-center gap-3 p-2 rounded-lg bg-slate-50 hover:bg-indigo-50 border border-slate-100 hover:border-indigo-200 transition-colors group"
-                              >
-                                <div className="shrink-0">
-                                  {res.type === 'video' ? <Video size={16} className="text-red-500" /> : <BookOpen size={16} className="text-blue-500" />}
-                                </div>
-                                <div className="flex-1 min-w-0">
-                                  <div className="text-sm font-medium text-slate-700 group-hover:text-indigo-700 truncate">
-                                    {res.title}
-                                  </div>
-                                </div>
-                                <ExternalLink size={14} className="text-slate-400 group-hover:text-indigo-400" />
-                              </a>
-                            ))}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
-    </div>
-  );
 };
+
 const RoundTransitionModal = () => {
   if (!showRoundModal) return null;
 
@@ -2435,6 +2568,7 @@ const RoundIndicator = () => {
   value={answer}                          // <- controlled
   // defaultValue removed
   onChange={(val) => setAnswer(val || "")}
+  onMount={handleEditorDidMount}
   theme="vs-dark"
   options={{ minimap: { enabled: false }, fontSize: 14, scrollBeyondLastLine: false, automaticLayout: true }}
 />
@@ -2932,6 +3066,16 @@ if (excalidrawAPI) {
                         <div className="bg-slate-50 p-4 rounded-xl text-slate-700 text-sm mb-4 border-2 border-slate-100 font-mono">
                           {String(h.a)}
                         </div>
+                        {((h.result as any)?.playback_history?.length > 0 || (h as any).playback_history?.length > 0) && (
+   <div className="mb-6 animate-in fade-in slide-in-from-bottom-2">
+     <div className="text-xs font-bold text-slate-500 uppercase mb-1 flex items-center gap-1">
+       <Video size={14} className="text-indigo-600" /> Code Process Replay
+     </div>
+     <CodeReplayPlayer 
+        history={(h.result as any)?.playback_history || (h as any).playback_history} 
+     />
+   </div>
+)}
 
                         {h.result && (
                           <div className="space-y-3">

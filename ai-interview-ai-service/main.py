@@ -1719,7 +1719,49 @@ OUTPUT FORMAT (JSON ONLY, NO MARKDOWN):
 # ==========================================
 # SCORING SYSTEM
 # ==========================================
+def analyze_coding_behavior(playback: List[Dict[str, Any]]) -> str:
+    """
+    Analyzes coding history for behavioral signals (Paste Detection, Debugging, Timing).
+    """
+    if not playback:
+        return "No playback data available."
 
+    signals = []
+    
+    # 1. Check for Massive Paste (Anti-Cheat)
+    max_jump = 0
+    prev_len = 0
+    for snap in playback:
+        curr_len = len(snap.get("code", ""))
+        jump = curr_len - prev_len
+        # Ignore initial load or small edits
+        if jump > 50 and snap.get("trigger") != 'initial': 
+            max_jump = max(max_jump, jump)
+        prev_len = curr_len
+    
+    if max_jump > 300:
+        signals.append(f"⚠️ MAJOR RED FLAG: Detected huge paste of {max_jump} chars in <5s. Likely copied solution.")
+    elif max_jump > 100:
+        signals.append(f"⚠️ Warning: Detected large paste of {max_jump} chars.")
+
+    # 2. Check Debugging (Process)
+    run_count = sum(1 for snap in playback if snap.get("trigger") == 'run')
+    if run_count == 0:
+        signals.append("🤔 Suspicious: User never ran the code. Wrote perfectly in one go?")
+    elif run_count > 3:
+        signals.append(f"✅ Good Process: User tested code {run_count} times, showing iterative debugging.")
+
+    # 3. Time
+    if len(playback) > 1:
+        try:
+            start = float(playback[0].get('timestamp', 0))
+            end = float(playback[-1].get('timestamp', 0))
+            duration = (end - start) / 60000
+            signals.append(f"⏱️ Coding Time: {duration:.1f} minutes.")
+        except:
+            pass
+
+    return "\n".join(signals)
 def build_score_prompt(
     question_text: str, 
     ideal_outline: str, 
@@ -1735,8 +1777,12 @@ def build_score_prompt(
     - Supports TEXT, CODE, and SYSTEM DESIGN modes
     """
     context = context or {}
+    playback_summary =  " "
     resume = context.get("resume", "")
     chunks = context.get("chunks", [])
+    playback_summary = ""
+    if context.get("playback_history"):
+        playback_summary = analyze_coding_behavior(context["playback_history"])
     
     question_type = context.get("question_type", "text")
     exec_result = context.get("code_execution_result", {})
@@ -1814,7 +1860,18 @@ CODE SCORING RULES (IMPORTANT):
 4. STRICT CHEATING CHECK:
    - Hardcoded outputs → score = 0.0
    - Printing expected values → score = 0.0
+🕵️ CODING BEHAVIOR ANALYSIS (AUTO-GENERATED):
+{playback_summary}
 
+SCORING ADJUSTMENTS BASED ON BEHAVIOR:
+1. If "MAJOR RED FLAG" (Paste) is present:
+   - Set 'confidence' to < 0.3
+   - Mention "Possible Plagiarism (Large Paste)" in 'red_flags_detected'
+   - Cap the overall score at 0.5 (Code is correct but process is invalid)
+
+2. If "Good Process" (Active Debugging) is present:
+   - Boost 'practical_experience' score by +0.15
+   - Mention "Good iterative debugging" in feedback
 SCORING DIMENSIONS:
 {dimensions_text}
 
@@ -2895,6 +2952,7 @@ class ScoreAnswerRequest(BaseModel):
     whiteboard_snapshot: Optional[str] = None
     user_time_complexity: Optional[str] = None   # e.g. "O(n)"
     user_space_complexity: Optional[str] = None  # e.g. "O(1)"
+    playback_history: Optional[List[Dict[str, Any]]] = []
 
 # Update this class in main.py'
 class RoadmapRequest(BaseModel):
@@ -3780,7 +3838,8 @@ def score_answer(req: ScoreAnswerRequest):
         "chunks": enforced.get("chunks", []),
         "question_type": payload.get("question_type", "text"),
         "code_execution_result": payload.get("code_execution_result"),
-        "whiteboard_text_summary": whiteboard_context
+        "whiteboard_text_summary": whiteboard_context,
+        "playback_history": payload.get("playback_history", [])
     }
     
     prompt = build_score_prompt(
