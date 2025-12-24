@@ -1,5 +1,6 @@
 // server.js - Revised: unified AI client, normalized fields, small bugfixes & logging
 require("dotenv").config();
+const { getProfileDashboard } = require("../Controller/profile");
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
@@ -267,6 +268,11 @@ function requireAuth(req, res, next) {
 }
 
 // ---------- ROUTES ----------
+
+//ProfileDashboard
+// ================= PROFILE DASHBOARD =================
+
+app.get("/profile/dashboard", requireAuth, getProfileDashboard);
 
 // Health
 app.get("/health", (req, res) => {
