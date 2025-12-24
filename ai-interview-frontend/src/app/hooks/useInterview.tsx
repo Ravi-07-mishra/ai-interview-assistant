@@ -9,7 +9,7 @@ export type InterviewQuestion = {
   questionText: string;
   target_project?: string;
   technology_focus?: string;
-  expectedAnswerType?: "short" | "medium" | "code" | "architectural";
+  expectedAnswerType?: "short" | "medium" | "code" | "architectural" | "system_design";
   difficulty?: "easy" | "medium" | "hard" | "expert";
   ideal_outline?: string;
   ideal_answer_outline?: string;
@@ -243,7 +243,7 @@ console.log("🧭 CURRENT QUESTION TYPE:", currentQuestion?.type);
       }
 
       setSessionId(body.sessionId || body.session_id || null);
-
+if (body.sessionId) localStorage.setItem("active_interview_session", body.sessionId);
       // Handle different response formats
       const questionData = body.firstQuestion || body.question || body.data?.question || body.parsed;
 
@@ -295,7 +295,7 @@ console.log("🧭 CURRENT QUESTION TYPE:", currentQuestion?.type);
   function question_data_or_default(q: any) {
     return q.expected_answer_type || q.expectedAnswerType || "medium";
   }
-const fetchHint = useCallback(async (questionText: string, type: string) => {
+const fetchHint = useCallback(async (questionText: string, type: string,currentAnswer: string = "") => {
     if (!sessionId || !token || !currentQuestion?.questionId) return null;
     
     try {
@@ -306,7 +306,8 @@ const fetchHint = useCallback(async (questionText: string, type: string) => {
             sessionId, 
             questionId: currentQuestion.questionId,
             questionText,
-            type 
+            type ,
+            currentAnswer
         })
       });
       const data = await res.json();
@@ -330,6 +331,10 @@ const submitAnswer = useCallback(
       let candidateAnswer: string;
       let code_execution_result = null;
       let question_type = "text";
+      let whiteboard_elements = null;  
+      let whiteboard_snapshot = null;      // 🆕 Added
+        let user_time_complexity = null;       // 🆕 Added
+        let user_space_complexity = null;      // 🆕 Added
       
       if (typeof candidateAnswerOrPayload === "string") {
         candidateAnswer = candidateAnswerOrPayload;
@@ -338,6 +343,10 @@ const submitAnswer = useCallback(
         candidateAnswer = candidateAnswerOrPayload.answer || candidateAnswerOrPayload.candidateAnswer || "";
         code_execution_result = candidateAnswerOrPayload.code_execution_result ?? null;
         question_type = candidateAnswerOrPayload.question_type || "text";
+        whiteboard_elements = candidateAnswerOrPayload.whiteboard_elements || null;
+        whiteboard_snapshot = candidateAnswerOrPayload.whiteboard_snapshot || null;
+          user_time_complexity = candidateAnswerOrPayload.user_time_complexity || null;
+          user_space_complexity = candidateAnswerOrPayload.user_space_complexity || null;
       }
 
       const conv = buildConversationFromHistory();
@@ -361,6 +370,10 @@ const submitAnswer = useCallback(
         allow_pii: false,
         question_type, // 👈 NEW
         code_execution_result, // 👈 NEW
+        whiteboard_elements,
+        whiteboard_snapshot,
+          user_time_complexity,
+          user_space_complexity
       };
 
       const res = await fetch(`${API}/interview/answer`, {
@@ -429,6 +442,7 @@ const submitAnswer = useCallback(
         setFinalDecision(eliminationDecision);
         setCurrentQuestion(null);
         setStage("done");
+        localStorage.removeItem("active_interview_session");
         return result;
       }
 
@@ -498,6 +512,54 @@ const submitAnswer = useCallback(
   },
   [sessionId, currentQuestion, buildConversationFromHistory, buildQuestionHistory, resumeParsed, token, getAuthHeaders]
 );
+const resumeSession = useCallback(async (storedSessionId: string) => {
+    if (!token) return;
+    setLoading(true);
+    try {
+      console.log("🔄 Resuming session:", storedSessionId);
+      const res = await fetch(`${API}/interview/session/${storedSessionId}`, {
+         headers: { Authorization: `Bearer ${token}` }
+      });
+      
+      if (!res.ok) {
+         localStorage.removeItem("active_interview_session");
+         throw new Error("Session invalid");
+      }
+
+      const data = await res.json();
+      setSessionId(data.sessionId);
+      setStage(data.stage);
+      
+      // Map backend history to frontend format
+      if (data.history) {
+        setHistory(data.history.map((h: any) => ({
+             q: { 
+                 questionText: h.question, 
+                 type: h.type,
+                 target_project: h.target_project 
+             }, 
+             a: h.answer,
+             result: { 
+                 score: h.score, 
+                 verdict: h.verdict 
+             }
+        })));
+      }
+
+      if (data.currentQuestion) {
+         setCurrentQuestion({
+             ...data.currentQuestion,
+             raw: data.currentQuestion,
+             coding_challenge: data.currentQuestion.coding_challenge
+         });
+      }
+    } catch (e) {
+      console.error("Resume error:", e);
+      setError("Could not restore session.");
+    } finally {
+      setLoading(false);
+    }
+  }, [token]);
   const endInterview = useCallback(async (reason?: string, markRejected = false) => {
     setError(null);
 
@@ -546,6 +608,7 @@ const submitAnswer = useCallback(
     } finally {
       setStage("done");
       setCurrentQuestion(null);
+      localStorage.removeItem("active_interview_session");
     }
   }, [sessionId, token, getAuthHeaders, reportViolation]);
 
@@ -569,5 +632,6 @@ const submitAnswer = useCallback(
     setResumeParsed,
     setError,
     fetchHint,
+    resumeSession,
   };
 }

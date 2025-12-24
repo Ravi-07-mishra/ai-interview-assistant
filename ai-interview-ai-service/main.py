@@ -117,26 +117,25 @@ INTERVIEW_ROUNDS = {
     "screening": {
         "name": "Screening Round",
         "focus": ["experience", "resume_basics", "fundamentals"],
-        "min_questions": 1,   # Minimum 1 question to start
-        "max_questions": 3,   # Hard limit of 3
+        "min_questions": 1,
+        "max_questions": 2,
         "pass_threshold": 0.55,
         "elimination": True
     },
     "technical": {
         "name": "Technical Round",
-        "focus": ["project_discussion", "coding_challenge", "system_design"],
-        # ✅ UPDATED: Enforces 3 to 4 questions strictly
-        "min_questions": 3,   
-        "max_questions": 4,   
+        "focus": ["project_discussion", "coding_challenge", "system_design"], # <--- Included here
+        "min_questions": 3, 
+        "max_questions": 5, # Increased max to allow for a design question
         "pass_threshold": 0.60,
         "elimination": True
     },
     "behavioral": {
         "name": "Behavioral Round",
-        "focus": ["achievement", "ownership", "collaboration"],
+        "focus": ["achievement", "collaboration", "ownership"],
         "min_questions": 1,
-        "max_questions": 2,   
-        "pass_threshold": 0.65,
+        "max_questions": 2,
+        "pass_threshold": 0.5,
         "elimination": True
     }
 }
@@ -153,14 +152,16 @@ QUESTION_TYPE_TO_ROUND = {
     # --- Technical (Projects & Coding) ---
     "project_discussion": "technical",  # <--- Moved to Technical
     "coding_challenge": "technical",
-    "debugging": "technical",
     "system_design": "technical",
+        "debugging": "technical",
+
 
     # --- Behavioral (Achievements & HR) ---
+  "behavioral": "behavioral", 
     "achievement": "behavioral",
     "ownership": "behavioral",
     "collaboration": "behavioral",
-    "reflection": "behavioral"
+    "hr": "behavioral"
 }
 
 TERMINATION_RULES = {
@@ -171,7 +172,7 @@ TERMINATION_RULES = {
     "excellence_count": 3,
     
     # 👇 ADD THIS LINE (Fixes the 500 Crash) 👇
-    "max_questions": len(INTERVIEW_FLOW) + 3,
+    "max_questions": 10,
 
     "min_confidence_to_end": 0.85,
     "max_questions_soft_limit": 9,
@@ -181,9 +182,12 @@ TERMINATION_RULES = {
 # ==========================================
 # 🛑 EMERGENCY FALLBACK QUESTIONS (PREVENTS CRASHES)
 # ==========================================
+# ==========================================
+# 🛑 EMERGENCY FALLBACK QUESTIONS (PREVENTS CRASHES)
+# ==========================================
 FALLBACK_QUESTIONS = {
     "coding_challenge": {
-        "question": "Write a Python function to check if a string is a valid palindrome, considering only alphanumeric characters and ignoring case.",
+        "question": "Write a Python function to check if a string is a valid palindrome...",
         "type": "coding_challenge",
         "coding_challenge": {
             "language": "python",
@@ -195,12 +199,29 @@ FALLBACK_QUESTIONS = {
         }
     },
     "project_discussion": {
-        "question": "Can you walk me through the most challenging bug you encountered in your recent project? How did you debug and resolve it?",
+        "question": "Can you walk me through the most challenging bug you encountered in your recent project?",
         "type": "project_discussion"
     },
     "conceptual": {
-        "question": "Explain the difference between a process and a thread in an operating system. When would you choose one over the other?",
+        "question": "Explain the difference between a process and a thread in an operating system.",
         "type": "conceptual"
+    },
+    # 👇 ADD THESE MISSING KEYS TO FIX THE BEHAVIORAL ROUND 👇
+    "behavioral": {
+        "question": "Tell me about a time you had to learn a new technology quickly. How did you approach it?",
+        "type": "behavioral"
+    },
+    "collaboration": {
+        "question": "Describe a situation where you had a disagreement with a team member. How did you resolve it?",
+        "type": "behavioral"
+    },
+    "ownership": {
+        "question": "Tell me about a time you made a mistake in a project. How did you handle it?",
+        "type": "behavioral"
+    },
+    "achievement": {
+        "question": "What is your most significant professional achievement?",
+        "type": "behavioral"
     }
 }
 INTERVIEW_MODE = {
@@ -212,23 +233,22 @@ INTERVIEW_MODE = {
         "practical_implementation"
     ]
 }
-
 SCORING_DIMENSIONS = {
     "technical_accuracy": {
-        "weight": 0.40,
-        "description": "Correctness of technical facts, algorithms, and concepts"
+        "weight": 0.50,  # ⬆️ Increased from 0.40
+        "description": "Correctness of code, logic, complexity analysis, and algorithms"
     },
     "depth_of_understanding": {
         "weight": 0.30,
-        "description": "Ability to explain 'why' and 'how', not just 'what'"
+        "description": "Ability to explain 'why' (trade-offs, edge cases, optimizations)"
     },
     "practical_experience": {
-        "weight": 0.20,
-        "description": "Evidence of real implementation, debugging, trade-offs"
+        "weight": 0.15,
+        "description": "Evidence of real implementation, debugging, and clean code standards"
     },
     "communication_clarity": {
-        "weight": 0.10,
-        "description": "Ability to articulate complex ideas clearly"
+        "weight": 0.05,  # ⬇️ Reduced from 0.10 (Behavioral impact lowered)
+        "description": "Ability to articulate ideas (less critical than code correctness)"
     }
 }
 # ALLOWED_GROQ_MODELS = [
@@ -619,28 +639,51 @@ def safe_truncate(s: str, max_chars: int) -> str:
     if not s or len(s) <= max_chars:
         return s or ""
     return s[:max_chars-3] + "..."
-
 def enforce_budget(payload: dict) -> dict:
-    """Intelligent context truncation while preserving key information"""
-    token_budget = int(payload.get("token_budget") or DEFAULT_TOKEN_BUDGET)
-    char_limit = token_budget * 4
+    """
+    CRITICAL FIX: Aggressively truncates context to prevent token explosion.
+    - Limits RAG chunks to top 3 (saves ~1000 tokens)
+    - Limits Conversation History to last 6 turns (saves ~infinite tokens)
+    - Truncates individual text fields
+    """
+    # 1. Default Token Budget Safety Net
+    token_budget = int(payload.get("token_budget") or 4000)
     
-    resume = safe_truncate(payload.get("resume_summary",""), 1200)
-    chunks = payload.get("retrieved_chunks",[])[:8]
+    # 2. Limit Resume (Strict 1500 chars ~ 375 tokens)
+    # Enough for key skills/projects, prevents bloating
+    resume = safe_truncate(payload.get("resume_summary",""), 1500)
+    
+    # 3. Limit RAG Chunks (Top 3 is sufficient for context)
+    # Reduced from 5 to 3 to save money/tokens
+    raw_chunks = payload.get("retrieved_chunks", []) or []
+    chunks = raw_chunks[:3]
     chunks = [
         {
             "doc_id": c.get("doc_id"),
             "chunk_id": c.get("chunk_id"),
-            "snippet": safe_truncate(c.get("snippet",""), 600),
+            # Truncate content to 500 chars (~125 tokens) per chunk
+            "snippet": safe_truncate(c.get("snippet",""), 500),
             "score": c.get("score", 0)
         }
         for c in chunks
     ]
     
-    conv = payload.get("conversation", [])[-8:]
-    conv = [{"role": t.get("role"), "text": safe_truncate(t.get("text",""), 500)} for t in conv]
+    # 4. Limit Conversation History (Last 3 pairs = 6 turns)
+    # This prevents the "infinite history" bug
+    raw_conv = payload.get("conversation", []) or []
+    conv = raw_conv[-6:] # Strict slice
     
-    question = safe_truncate(payload.get("question",""), 1500)
+    # Sanitize each turn to prevent massive user pastes or system prompt leaks
+    conv = [
+        {
+            "role": t.get("role"), 
+            "text": safe_truncate(t.get("text",""), 600) # Max 600 chars per message
+        } 
+        for t in conv
+    ]
+    
+    # 5. Question Truncation
+    question = safe_truncate(payload.get("question",""), 1000)
     
     return {
         "resume": resume,
@@ -679,6 +722,99 @@ def normalize_overall_score(validated: dict, history: List[Dict[str, Any]]) -> f
         score -= 0.05
 
     return max(0.0, min(1.0, score))
+# Locate the existing function and REPLACE it with this robust version
+def extract_whiteboard_keywords(scene_elements: List[Dict[str, Any]]) -> str:
+    """
+    Parses Excalidraw JSON to find what the user wrote.
+    CRITICAL: Filters out deleted elements so AI doesn't see erased text.
+    """
+    if not scene_elements:
+        return "Whiteboard is empty."
+
+    found_text = []
+    
+    for el in scene_elements:
+        # 1. Skip deleted elements (Excalidraw soft-deletes)
+        if el.get("isDeleted", False):
+            continue
+
+        # 2. Extract text from 'text' elements
+        if el.get("type") == "text" and "text" in el:
+            clean_txt = el["text"].strip()
+            if len(clean_txt) > 1: 
+                found_text.append(clean_txt)
+                
+        # 3. Extract text from labeled arrows/shapes
+        if "label" in el and el["label"] and "text" in el["label"]:
+             clean_txt = str(el["label"]["text"]).strip()
+             if len(clean_txt) > 1:
+                found_text.append(clean_txt)
+
+    if not found_text:
+        return "Whiteboard contains shapes but NO text labels."
+
+    return "Items drawn on whiteboard: " + ", ".join(found_text)
+def analyze_whiteboard_image(base64_img: str) -> str:
+    """
+    Analyze a whiteboard image using available Groq multimodal models.
+    Falls back gracefully if vision models are unavailable.
+    """
+    if not base64_img or not groq_client:
+        return ""
+
+    # Ordered by preference (newest / recommended first)
+    VISION_MODELS = [
+        "meta-llama/llama-4-scout-17b-16e-instruct",
+        "meta-llama/llama-4-maverick-17b-128e-instruct",
+    ]
+
+    # Strip base64 header if present
+    if "base64," in base64_img:
+        base64_img = base64_img.split("base64,", 1)[1]
+
+    for model in VISION_MODELS:
+        try:
+            resp = groq_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Describe this system design architecture diagram. "
+                                    "List the main components (e.g., Load Balancer, API, DB, Cache) "
+                                    "and explain how they connect. Be concise."
+                                ),
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{base64_img}"
+                                },
+                            },
+                        ],
+                    }
+                ],
+                temperature=0.1,
+                max_tokens=500,
+            )
+
+            return resp.choices[0].message.content or ""
+
+        except Exception as e:
+            logger.warning(
+                f"Vision model failed ({model}), trying fallback. Error: {e}"
+            )
+            continue
+
+    # ---- FINAL FALLBACK (TEXT-ONLY MODE) ----
+    logger.error(
+        "All vision models unavailable. Falling back to text-only interview flow."
+    )
+    return ""
+
 def derive_verdict_from_score(score: float) -> str:
     """
     Calibrated grading scale for technical interviews.
@@ -816,7 +952,6 @@ def calculate_performance_metrics(history: List[Dict]) -> Dict[str, Any]:
 # ==========================================
 # TERMINATION LOGIC
 # ==========================================
-
 def check_termination_rules(history: List[Dict]) -> Optional[Dict[str, Any]]:
     """
     BALANCED termination logic for campus / fresher interviews.
@@ -835,7 +970,6 @@ def check_termination_rules(history: List[Dict]) -> Optional[Dict[str, Any]]:
     # --------------------------------------------------
     # RULE 1: Catastrophic Failure (Immediate Reject)
     # --------------------------------------------------
-    # Candidate clearly doesn't know their own resume
     if last is not None and last < rules["instant_fail_threshold"]:
         return {
             "ended": True,
@@ -843,7 +977,11 @@ def check_termination_rules(history: List[Dict]) -> Optional[Dict[str, Any]]:
             "confidence": 0.95,
             "reason": f"Catastrophic failure (score {last:.2f}). Candidate lacks basic understanding.",
             "recommended_role": None,
-            "trigger": "instant_fail"
+            "trigger": "instant_fail",
+            "elimination": True,
+            "key_strengths": [],
+            "critical_weaknesses": [],
+            "feedback_summary": ""
         }
 
     # --------------------------------------------------
@@ -856,7 +994,11 @@ def check_termination_rules(history: List[Dict]) -> Optional[Dict[str, Any]]:
             "confidence": 0.90,
             "reason": f"Failed {metrics['consecutive_fails']} consecutive questions.",
             "recommended_role": None,
-            "trigger": "consecutive_fails"
+            "trigger": "consecutive_fails",
+            "elimination": True,
+            "key_strengths": [],
+            "critical_weaknesses": [],
+            "feedback_summary": ""
         }
 
     # --------------------------------------------------
@@ -869,11 +1011,15 @@ def check_termination_rules(history: List[Dict]) -> Optional[Dict[str, Any]]:
     ):
         return {
             "ended": True,
-            "verdict": "hisre",
+            "verdict": "hire",
             "confidence": 0.95,
             "reason": f"Consistent excellence across {qn} questions.",
             "recommended_role": "SDE-1 / Entry-Level",
-            "trigger": "proven_excellence"
+            "trigger": "proven_excellence",
+            "elimination": False,
+            "key_strengths": [],
+            "critical_weaknesses": [],
+            "feedback_summary": ""
         }
 
     # --------------------------------------------------
@@ -890,7 +1036,11 @@ def check_termination_rules(history: List[Dict]) -> Optional[Dict[str, Any]]:
                 "confidence": 0.88,
                 "reason": f"Below minimum bar in {weak_answers}/{qn} questions.",
                 "recommended_role": None,
-                "trigger": "chronic_underperformance"
+                "trigger": "chronic_underperformance",
+                "elimination": True,
+                "key_strengths": [],
+            "critical_weaknesses": [],
+            "feedback_summary": ""
             }
 
     # --------------------------------------------------
@@ -913,25 +1063,47 @@ def check_termination_rules(history: List[Dict]) -> Optional[Dict[str, Any]]:
                     f"Final decision based on average score {avg:.2f}."
                 ),
                 "recommended_role": "Intern" if verdict == "hire" else None,
-                "trigger": "gray_zone_timeout"
+                "trigger": "gray_zone_timeout",
+                "elimination": verdict == "reject"
             }
 
     # --------------------------------------------------
-    # RULE 6: Hard Safety Limit (Never Infinite)
+    # RULE 6: Hard Safety Limit (Neutral Completion)
     # --------------------------------------------------
-    if qn >= rules.get("max_questions", 12):
-        verdict = "hire" if avg >= 0.60 else "reject"
+    # FIX: Don't treat reaching the limit as a "failure".
+    if qn >= rules.get("max_questions", 10):
+        final_average = avg
+        
+        # Lower threshold to standard pass (0.55)
+        passed = final_average >= 0.55
+        HIRE_THRESHOLD = 0.60   # > 60% = Hire
+        REJECT_THRESHOLD = 0.45 # < 45% = Reject
+        
+        # Use 'maybe' instead of 'reject' for borderline cases at time limit
+# Logic: Python decides the verdict based on math
+        if final_average >= HIRE_THRESHOLD:
+            verdict = "hire"
+            summary = f"Completed with strong performance. Average: {final_average:.0%}"
+        elif final_average < REJECT_THRESHOLD:
+            verdict = "reject"
+            summary = f"Did not meet technical bar. Average: {final_average:.0%}"
+        else:
+            verdict = "maybe"
+            summary = f"Borderline performance. Average: {final_average:.0%}"
+        
         return {
             "ended": True,
-            "verdict": verdict,
-            "confidence": 0.80,
-            "reason": "Interview reached maximum allowed questions.",
-            "recommended_role": "Entry-Level" if verdict == "hire" else None,
-            "trigger": "max_questions"
+            "elimination": False, # Keep False so it shows "Completed" screen, not "Eliminated"
+            "verdict": verdict,   # <--- Python sends the actual decision here
+            "confidence": 0.90, 
+            "reason": summary,
+            "recommended_role": "SDE-1" if verdict == "hire" else None,
+            "trigger": "max_questions",
+            "key_strengths": [],
+            "critical_weaknesses": [],
+            "feedback_summary": summary
         }
-
     return None  # Continue interview
-
 # ==========================================
 # QUESTION GENERATION
 # ==========================================
@@ -1284,7 +1456,7 @@ def build_generate_question_prompt(
     # 1. Build STRICT history context with Status Tags
     # This helps the LLM see if the previous topic was a failure
     recent_q_text_list = []
-    for i, h in enumerate(history[-6:]):
+    for i, h in enumerate(history[-5:]):
         score = h.get("score", 1.0)
         status = "PASSED" if score >= 0.5 else "FAILED"
         recent_q_text_list.append(f"Q{i+1} [{status}]: {h.get('question','')[:120]}")
@@ -1294,10 +1466,19 @@ def build_generate_question_prompt(
     diversity_hint = get_diverse_question_hint(history, required_type)
     round_context = ""
     if state:
-        round_config = INTERVIEW_ROUNDS[state.current_round]
-        round_progress = len(state.round_history[state.current_round]["questions"])
+        if state.current_round == "complete":
+            round_context = """
+═══════════════════════════════════════════════════════════════════
+🎯 CURRENT ROUND: INTERVIEW COMPLETE
+Status: All rounds finished.
+Action: Generate a closing statement or final check.
+═══════════════════════════════════════════════════════════════════
+"""    
+        elif state.current_round in INTERVIEW_ROUNDS:
+            round_config = INTERVIEW_ROUNDS[state.current_round]
+            round_progress = len(state.round_history[state.current_round]["questions"])
         
-        round_context = f"""
+            round_context = f"""
 ═══════════════════════════════════════════════════════════════════
 🎯 CURRENT ROUND: {round_config['name'].upper()}
 Progress: Question {round_progress + 1} of {round_config['max_questions']}
@@ -1376,6 +1557,18 @@ Pass Threshold: {round_config['pass_threshold'] * 100}%
 - Create a solvable problem (not just theory)
 - **CRITICAL**: This MUST be a coding problem with test cases, NOT a conceptual question
 """
+    elif required_type == "system_design":
+        project_focus = f"""
+🎯 FOCUS: SYSTEM DESIGN (WHITEBOARD SESSION)
+- The candidate has indicated backend/architecture skills.
+- Ask a High-Level Design (HLD) question appropriate for a fresher/intern.
+- **Classic Examples**: Design a URL Shortener, Design a Chat App, Design a Parking Lot, Design an Image Upload Service.
+- **Constraints**:
+  1. Ask for High Level Architecture (API, DB, Key Components).
+  2. Do NOT ask for code. Ask for the *Structure*.
+  3. Mention: "You can use the whiteboard to draw your components."
+- Difficulty: {difficulty_level}
+"""    
         
     elif required_type == "experience":
         # ✅ CHECK: Does resume have work experience?
@@ -1420,6 +1613,33 @@ Pass Threshold: {round_config['pass_threshold'] * 100}%
 - Pick the MOST impressive entry
 - Ask about the TECHNICAL challenge solved or skill acquired
 - Example: "What algorithmic approach won you [Competition Name]?" or "How did you apply [Certification skill] in practice?"
+"""
+    elif required_type == "collaboration":
+        project_focus = """
+🎯 FOCUS: TEAMWORK & CONFLICT RESOLUTION (Behavioral)
+- Ask about a time the candidate faced a disagreement or conflict in a team.
+- Focus on: Communication, Empathy, and Resolution.
+- Example: "Tell me about a time you disagreed with a teammate's technical decision. How did you resolve it?"
+- **Constraint**: Do NOT ask about technical details, ask about the *interaction*.
+"""
+
+    # 🟢 NEW BLOCK 2: OWNERSHIP / LEADERSHIP
+    elif required_type == "ownership":
+        project_focus = """
+🎯 FOCUS: OWNERSHIP & INITIATIVE (Behavioral)
+- Ask about a time the candidate went above and beyond or took responsibility for a failure.
+- Focus on: Accountability, Proactivity, and Learning.
+- Example: "Tell me about a mistake you made in a project. How did you fix it and what did you learn?"
+- **Constraint**: Look for "I" statements, not just "We".
+"""
+
+    # 🟢 NEW BLOCK 3: CATCH-ALL BEHAVIORAL (Safety Net)
+    elif required_type == "behavioral" or required_type == "hr":
+        project_focus = """
+🎯 FOCUS: GENERAL BEHAVIORAL / CULTURE FIT
+- Ask a standard behavioral question using the STAR method.
+- Topics: Adaptability, Time Management, or Motivation.
+- Example: "Describe a situation where you had to learn a new technology very quickly."
 """
 
     elif required_type == "project_discussion" and target_project:
@@ -1499,17 +1719,70 @@ OUTPUT FORMAT (JSON ONLY, NO MARKDOWN):
 # ==========================================
 # SCORING SYSTEM
 # ==========================================
+def analyze_coding_behavior(playback: List[Dict[str, Any]]) -> str:
+    """
+    Analyzes coding history for behavioral signals (Paste Detection, Debugging, Timing).
+    """
+    if not playback:
+        return "No playback data available."
 
-def build_score_prompt(question_text: str, ideal_outline: str, candidate_answer: str, context: dict = None) -> str:
+    signals = []
+    
+    # 1. Check for Massive Paste (Anti-Cheat)
+    max_jump = 0
+    prev_len = 0
+    for snap in playback:
+        curr_len = len(snap.get("code", ""))
+        jump = curr_len - prev_len
+        # Ignore initial load or small edits
+        if jump > 50 and snap.get("trigger") != 'initial': 
+            max_jump = max(max_jump, jump)
+        prev_len = curr_len
+    
+    if max_jump > 300:
+        signals.append(f"⚠️ MAJOR RED FLAG: Detected huge paste of {max_jump} chars in <5s. Likely copied solution.")
+    elif max_jump > 100:
+        signals.append(f"⚠️ Warning: Detected large paste of {max_jump} chars.")
+
+    # 2. Check Debugging (Process)
+    run_count = sum(1 for snap in playback if snap.get("trigger") == 'run')
+    if run_count == 0:
+        signals.append("🤔 Suspicious: User never ran the code. Wrote perfectly in one go?")
+    elif run_count > 3:
+        signals.append(f"✅ Good Process: User tested code {run_count} times, showing iterative debugging.")
+
+    # 3. Time
+    if len(playback) > 1:
+        try:
+            start = float(playback[0].get('timestamp', 0))
+            end = float(playback[-1].get('timestamp', 0))
+            duration = (end - start) / 60000
+            signals.append(f"⏱️ Coding Time: {duration:.1f} minutes.")
+        except:
+            pass
+
+    return "\n".join(signals)
+def build_score_prompt(
+    question_text: str, 
+    ideal_outline: str, 
+    candidate_answer: str, 
+    context: Optional[Dict[str, Any]] = None,
+    user_time_complexity: Optional[str] = None,
+    user_space_complexity: Optional[str] = None
+) -> str:
     """
     CAMPUS-LEVEL MULTI-DIMENSIONAL SCORING
     - Designed for Intern / Fresher / Placement interviews
     - Harsh on bluffing, fair on partial understanding
-    - Supports TEXT and CODE modes
+    - Supports TEXT, CODE, and SYSTEM DESIGN modes
     """
     context = context or {}
+    playback_summary =  " "
     resume = context.get("resume", "")
     chunks = context.get("chunks", [])
+    playback_summary = ""
+    if context.get("playback_history"):
+        playback_summary = analyze_coding_behavior(context["playback_history"])
     
     question_type = context.get("question_type", "text")
     exec_result = context.get("code_execution_result", {})
@@ -1527,13 +1800,28 @@ def build_score_prompt(question_text: str, ideal_outline: str, candidate_answer:
     ])
 
     # =========================================================
-    # CODE SCORING (Campus-Friendly)
+    # 1. CODE SCORING (Campus-Friendly)
     # =========================================================
     if question_type == "coding_challenge":
         passed = exec_result.get("passed", False)
         output_log = exec_result.get("output", "No output captured")
         error_type = exec_result.get("error", "None")
+        complexity_check_block = ""
+        if user_time_complexity or user_space_complexity:
+            complexity_check_block = f"""
+        📜 COMPLEXITY AUDIT (CRITICAL):
+        The user CLAIMS:
+        - Time: {user_time_complexity if user_time_complexity else "NOT PROVIDED"}
+        - Space: {user_space_complexity if user_space_complexity else "NOT PROVIDED"}
 
+        YOUR TASK:
+        1. Analyze the 'CANDIDATE ANSWER' code yourself. Determine the ACTUAL Time/Space complexity.
+        2. Compare ACTUAL vs CLAIMED.
+        3. SCORING RULES:
+           - If Claim is Missing: Deduct 0.10 from 'technical_accuracy'.
+           - If Claim is WRONG (e.g. claimed O(n) but code is O(n^2)): Deduct 0.20 from 'technical_accuracy'. Mark as Weak.
+           - If Claim is CORRECT: Award Bonus points.
+        """ 
         system = f"""
 You are a CAMPUS PLACEMENT CODE EVALUATOR.
 
@@ -1545,9 +1833,11 @@ EXECUTION STATUS:
 - Passed: {passed}
 - Error Type: {error_type}
 
+
 EXECUTION LOG:
 {output_log[:800]}
 
+{complexity_check_block}
 CODE SCORING RULES (IMPORTANT):
 1. IF TESTS FAILED:
    - MAX SCORE = 0.5
@@ -1555,18 +1845,33 @@ CODE SCORING RULES (IMPORTANT):
    - Logical misunderstanding → < 0.3
 
 2. IF TESTS PASSED:
-   - BASE SCORE = 0.65
+   - BASE SCORE = 0.7
    - +0.1 to +0.25 for:
      • clean logic
      • readable variable names
      • handling edge cases
      • correct use of data structures
+     • CORRECT COMPLEXITY ANALYSIS (if provided)
    - Do NOT expect optimal Big-O unless resume claims it
-
-3. STRICT CHEATING CHECK:
+3. **OPTIMIZATION & QUALITY (Multipliers)**:
+   - **Brute Force vs Optimal**: If the problem can be solved in O(n) but user wrote O(n^2), score CANNOT exceed 0.75, even if tests pass.
+   - **Code Style**: Penalize for single-letter variables (except i, j, n), lack of comments, or deep nesting.
+   - **Edge Cases**: Did they handle empty inputs/nulls in the code logic?
+4. STRICT CHEATING CHECK:
    - Hardcoded outputs → score = 0.0
    - Printing expected values → score = 0.0
+🕵️ CODING BEHAVIOR ANALYSIS (AUTO-GENERATED):
+{playback_summary}
 
+SCORING ADJUSTMENTS BASED ON BEHAVIOR:
+1. If "MAJOR RED FLAG" (Paste) is present:
+   - Set 'confidence' to < 0.3
+   - Mention "Possible Plagiarism (Large Paste)" in 'red_flags_detected'
+   - Cap the overall score at 0.5 (Code is correct but process is invalid)
+
+2. If "Good Process" (Active Debugging) is present:
+   - Boost 'practical_experience' score by +0.15
+   - Mention "Good iterative debugging" in feedback
 SCORING DIMENSIONS:
 {dimensions_text}
 
@@ -1576,7 +1881,53 @@ CAMPUS CONTEXT:
 """
 
     # =========================================================
-    # TEXT SCORING (Campus Recruiter Mode)
+    # 2. SYSTEM DESIGN SCORING (Whiteboard Consistency)
+    # =========================================================
+    elif question_type == "system_design":
+        # Extract the text labels found in the diagram
+        wb_summary = context.get("whiteboard_text_summary", "No whiteboard usage detected")
+        
+        system = f"""
+You are a SENIOR SOFTWARE ARCHITECT evaluating a System Design interview.
+
+CANDIDATE LEVEL: Intern / Entry Level
+- Expect basic component knowledge (Load Balancer, DB, API, Cache).
+- Do NOT expect complex distributed locking or CAP theorem nuance unless they bring it up.
+
+INPUT DATA:
+- **Verbal Explanation**: See 'CANDIDATE ANSWER' below.
+- **Whiteboard Text Labels**: {wb_summary}
+
+🕵️ WHITEBOARD LOGIC CHECK:
+1. **Completeness**: Does the whiteboard list contain the 'Holy Trinity' of Web Apps?
+   - Frontend/Client
+   - Backend/API/Server
+   - Database/Storage
+   *If any of these 3 are missing from the text labels, CAP score at 0.6.*
+
+2. **Specifics vs Generics**:
+   - "Database" = Weak
+   - "PostgreSQL" / "MongoDB" = Strong
+   - "Cache" = Weak
+   - "Redis" / "CDN" = Strong
+
+3. **Scalability Indicators**:
+   - Look for keywords: "Load Balancer", "Kafka", "Queue", "Sharding", "Replica".
+   - If prompt asked for scaling and these are missing -> Deduct 'depth_of_understanding'.
+
+SCORING CRITERIA:
+- **0.0 - 0.4 (Fail)**: Whiteboard empty or completely disconnected from verbal answer.
+- **0.5 - 0.6 (Weak)**: Generic boxes ("App", "DB") without specific technologies.
+- **0.7 - 0.8 (Pass)**: Standard architecture present. Components connect logically.
+- **0.9 - 1.0 (Strong)**: Specific tech choices (e.g., "S3 for images"), Scalability components (LBs, Queues), and clear data flow.
+SCORING DIMENSIONS:
+{dimensions_text}
+OUTPUT GUIDANCE:
+- If they drew nothing, mention "Candidate failed to utilize whiteboard" in the rationale.
+"""
+        
+    # =========================================================
+    # 3. TEXT SCORING (Standard / Fallback)
     # =========================================================
     else:
         system = f"""
@@ -1604,19 +1955,19 @@ WEAK (0.3-0.5):
 • Avoids specifics
 • Sounds memorized
 
-ACCEPTABLE (0.5-0.7):
+ACCEPTABLE (0.7-0.8):
 • Understands core idea
 • Explains basic implementation
 • Minor gaps are OK
 • Typical intern-level answer
 
-STRONG (0.7-0.85):
+STRONG (0.8-0.9):
 • Explains HOW and WHY
 • Mentions challenges faced
 • Talks about trade-offs
 • Clearly built it themselves
 
-EXCEPTIONAL (0.85-1.0):
+EXCEPTIONAL (0.9-1.0):
 • Discusses debugging, edge cases, metrics
 • Compares approaches
 • Shows placement-ready confidence
@@ -1645,6 +1996,7 @@ Honesty + reasoning > memorized perfection
   "confidence": 0.0-1.0,
   "verdict": "fail|weak|acceptable|strong|exceptional",
   "rationale": "string",
+  "feedback_for_candidate": "string (Constructive criticism. Tell them specifically what they missed or what they did well)",
   "red_flags_detected": ["list"],
   "missing_elements": ["list"],
   "follow_up_probe": "string or null",
@@ -1673,14 +2025,13 @@ INSTRUCTIONS:
 1. Score using campus-level expectations
 2. Penalize bluffing heavily
 3. Be fair to partial but honest answers
-4. Suggest a FOLLOW-UP only if score is 0.4-0.7
-5. Provide a MENTOR TIP suitable for placement prep
+4. **MANDATORY**: Generate `feedback_for_candidate`. This must be helpful and specific (e.g., "You forgot to handle the edge case where X is null").
+5. **MANDATORY**: If the `overall_score` is between **0.35 and 0.75**, you MUST provide a `follow_up_probe` to check their depth.
 
 OUTPUT JSON:
 {schema}
 """
     return prompt.strip()
-
 
 # ==========================================
 # DECISION ENGINE
@@ -1707,21 +2058,12 @@ Answer: {a}
 Score: {score} ({verdict})
 ---"""
     
-    termination_guidance = ""
-    if metrics["consecutive_fails"] >= 2:
-        termination_guidance = "⚠️ CRITICAL: 2+ consecutive fails detected. You MUST reject unless there's exceptional justification."
-    elif metrics["average_score"] < 0.50 and metrics["question_count"] >= 3:
-        termination_guidance = "⚠️ CRITICAL: Average below hiring bar. Recommend reject."
-    elif metrics["consecutive_wins"] >= 3:
-        termination_guidance = "✓ STRONG SIGNAL: Consistent excellence detected. Consider hiring."
-    elif metrics["question_count"] >= 7:
-        termination_guidance = "⏰ TIME LIMIT: Must make final decision now."
-    
     schema = '''{
   "ended": boolean,
   "verdict": "hire|reject|maybe",
   "confidence": 0.0-1.0,
-  "reason": "string (specific, evidence-based)",
+  "reason": "string (Internal hiring justification)",
+  "feedback_summary": "string (A polite, constructive paragraph addressed TO THE CANDIDATE summarizing their performance)",
   "recommended_role": "string|null",
   "key_strengths": ["list"],
   "critical_weaknesses": ["list"]
@@ -1738,18 +2080,15 @@ Score: {score} ({verdict})
     {history_text}
     
     DECISION LOGIC:
-    1. **CONTINUE (ended: false)**: If you are unsure (Confidence < {TERMINATION_RULES['min_confidence_to_end']}) and need to probe more skills.
-    2. **HIRE (ended: true)**: If candidate showed clear expertise across multiple topics.
-    3. **REJECT (ended: true)**: If candidate failed basic questions or was caught bluffing.
+    1. **CONTINUE (ended: false)**: If unsure (Confidence < {TERMINATION_RULES['min_confidence_to_end']}).
+    2. **HIRE (ended: true)**: Strong signals across multiple topics.
+    3. **REJECT (ended: true)**: Failed basic questions or bluffing.
     
-    **CRITICAL**: Do not stop early just to be short. Only stop if you have CONCRETE evidence for a Hire/Reject decision.
+    INSTRUCTIONS:
+    - `reason`: Be blunt and specific for the hiring team (e.g., "Failed basic DSA").
+    - `feedback_summary`: Be professional and helpful for the candidate (e.g., "You showed strong potential in X, but we recommend focusing on Y").
     
-    Output JSON: {{
-      "ended": boolean,
-      "verdict": "hire|reject|maybe",
-      "confidence": 0.0-1.0,
-      "reason": "string"
-    }}
+    Output JSON: {schema}
     """
     return prompt.strip()
 def run_code_in_sandbox(language: str, code: str, stdin: str = "") -> Dict[str, Any]:
@@ -1930,40 +2269,41 @@ def run_code_in_sandbox(language: str, code: str, stdin: str = "") -> Dict[str, 
         "run_stage": None,
         "compile_stage": None
     }
-
 def call_decision(context: dict, temperature: float = 0.0) -> Dict[str, Any]:
     """Make hiring decision with performance-based termination"""
     
-    # 1. First check hard rules (Keep this! It handles catastrophic failure)
+    # 1. First check hard rules
     hard_decision = check_termination_rules(context.get("question_history", []))
     
     if hard_decision:
         hard_decision["ended"] = True
+        # Add default feedback for hard rules
+        if hard_decision.get("verdict") == "reject":
+            hard_decision["feedback_summary"] = "The interview concluded early due to significant gaps in core technical requirements."
+        else:
+            hard_decision["feedback_summary"] = "You demonstrated excellent proficiency and we are happy to move forward."
+            
         return {"ok": True, "parsed": hard_decision, "raw": "hard_rule_triggered"}
 
-    # =========================================================================
-    # 🛡️ SAFETY GUARD: PREVENT PREMATURE MODEL REJECTION (MISSING IN YOUR CODE)
-    # =========================================================================
+    # 2. Safety Guard (Prevent premature rejection on short interviews)
     history = context.get("question_history", [])
-    # We need metrics to check the score
     metrics = calculate_performance_metrics(history) 
     
-    # RULE: If interview is short (< 3 Qs) and score is okay (> 40%), FORCE CONTINUE.
     if len(history) < 3 and metrics["average_score"] > 0.40:
-        logger.info(f"🛡️ Safety Guard Triggered: Forcing CONTINUE (Questions={len(history)}, Score={metrics['average_score']:.2f})")
+        logger.info(f"🛡️ Safety Guard Triggered: Forcing CONTINUE")
         return {
             "ok": True, 
             "parsed": {
                 "ended": False,
                 "verdict": "maybe",
                 "confidence": 1.0,
-                "reason": "Interview is too short to make a final decision. Continuing to gather more signals."
+                "reason": "Interview too short.",
+                "feedback_summary": "Please continue to the next section."
             }, 
             "raw": "safety_guard_triggered"
         }
-    # =========================================================================
 
-    # 2. Otherwise, consult the model (Normal Flow)
+    # 3. Consult AI
     prompt = build_decision_prompt(context)
     resp = llm_call(prompt, temperature=temperature, max_tokens=600)
     
@@ -1972,32 +2312,32 @@ def call_decision(context: dict, temperature: float = 0.0) -> Dict[str, Any]:
     
     parsed = extract_json_from_text(resp["raw"])
     if not parsed:
-        # Fallback decision based on metrics
+        # Fallback
         return {
             "ok": True,
             "parsed": {
                 "ended": metrics["question_count"] >= 6,
                 "verdict": "maybe",
                 "confidence": 0.5,
-                "reason": "Model parse failed, using metrics fallback",
-                "recommended_role": None
+                "reason": "Model parse failed",
+                "feedback_summary": "Review complete. Pending final analysis."
             },
             "raw": resp["raw"]
         }
     
-    # Normalize the parsed decision
+    # Normalize
     normalized = {
         "ended": bool(parsed.get("ended", False)),
         "verdict": parsed.get("verdict", "maybe"),
         "confidence": float(parsed.get("confidence", 0.5)),
         "reason": parsed.get("reason", ""),
+        "feedback_summary": parsed.get("feedback_summary") or "Thank you for completing the interview.",
         "recommended_role": parsed.get("recommended_role"),
         "key_strengths": parsed.get("key_strengths", []),
         "critical_weaknesses": parsed.get("critical_weaknesses", [])
     }
     
-    # Force termination if max questions reached
-    if context.get("question_history") and len(context["question_history"]) >= TERMINATION_RULES["max_questions"]:
+    if len(history) >= TERMINATION_RULES["max_questions"]:
         normalized["ended"] = True
     
     return {"ok": True, "parsed": normalized, "raw": resp["raw"]}
@@ -2313,6 +2653,7 @@ class HintRequest(BaseModel):
     session_id: str
     question: str
     context_type: str = "conceptual"
+    current_answer: Optional[str] = ""
 class InterviewState:
     """
     Stateless Interview Manager.
@@ -2339,7 +2680,13 @@ class InterviewState:
         # Difficulty control
         self.difficulty_level = "medium"
         self.recent_scores: List[float] = []
+        design_keywords = [
+    'backend', 'architecture', 'scalable', 'microservices', 
+    'distributed', 'api', 'database', 'system', 'design',
+    'aws', 'cloud', 'docker', 'server', 'deployment','system_design'
+]
 
+        self.has_system_design_skills = any(kw in resume_text.lower() for kw in design_keywords)
         # Resume signals
         self.has_work_experience = any(
             kw in resume_text.lower()
@@ -2525,9 +2872,28 @@ class InterviewState:
         # Get questions already asked in current round (excluding probes)
         round_questions = self.round_history[self.current_round]["questions"]
         asked_types = [q.get("type") for q in round_questions if not q.get("is_probe", False)]
-        
-        # Try to pick diverse question type from focus areas
-        available_types = [t for t in focus_areas if asked_types.count(t) < 2]
+        valid_focus_areas = []
+        for t in focus_areas:
+            # Only allow system_design if resume supports it
+            if t == "system_design" and not self.has_system_design_skills:
+                continue
+            # Only allow experience/achievement if applicable (existing logic)
+            if t == "experience" and not self.has_work_experience:
+                continue
+            if t == "achievement" and not self.has_achievements:
+                continue
+            valid_focus_areas.append(t)
+        if not valid_focus_areas:
+            valid_focus_areas = ["conceptual", "coding_challenge"]
+
+        # 2. Pick a type we haven't asked much yet
+        # Try to ensure we ask at least 1 coding challenge in technical
+        if self.current_round == "technical":
+            if "coding_challenge" not in asked_types:
+                return "coding_challenge"
+
+        # General rotation logic
+        available_types = [t for t in valid_focus_areas if asked_types.count(t) < 2]
         
         if available_types:
             # Prefer types not asked yet
@@ -2536,8 +2902,10 @@ class InterviewState:
                 return unused[0]
             return available_types[0]
         
-        # Fallback to any focus area type
-        return focus_areas[0] if focus_areas else "conceptual"
+        # Fallback
+        return valid_focus_areas[0]    
+        # Try to pick diverse question type from focus areas
+      
     # =====================================================
     # 🧩 HELPERS
     # =====================================================
@@ -2580,8 +2948,20 @@ class ScoreAnswerRequest(BaseModel):
     question_type: Optional[str] = "text" 
     code_execution_result: Optional[Dict[str, Any]] = None 
     hint_used: Optional[bool] = False
+    whiteboard_elements: Optional[List[Dict[str, Any]]] = None
+    whiteboard_snapshot: Optional[str] = None
+    user_time_complexity: Optional[str] = None   # e.g. "O(n)"
+    user_space_complexity: Optional[str] = None  # e.g. "O(1)"
+    playback_history: Optional[List[Dict[str, Any]]] = []
 
-# Update this class in main.py
+# Update this class in main.py'
+class RoadmapRequest(BaseModel):
+    session_id: str
+    user_id: Optional[str] = "anonymous"
+    # Allow passing history explicitly (stateless mode) or rely on server state
+    question_history: Optional[List[Dict[str, Any]]] = None 
+    # Optional: Allow frontend to pass explicit weak tags
+    detected_weaknesses: Optional[List[str]] = []
 class CodeSubmissionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")  # 🔥 CRITICAL
 
@@ -2703,57 +3083,62 @@ def generate_question(req: GenerateQuestionRequest):
                 "confidence": 0.95
             }
         }
+# =====================================================
+    # 🛑 TERMINATION CHECK (UPDATED WITH AI FEEDBACK)
+    # =====================================================
     rule_termination = check_termination_rules(history)
+    
     if rule_termination:
+        logger.info(f"🛑 Rule Triggered: {rule_termination['trigger']}")
+        
+        # 1. Ask AI to generate qualitative feedback (Strengths/Weaknesses)
+        #    even though a hard rule decided the verdict.
+        try:
+            decision_context = {
+                "resume": payload.get("resume_summary", ""),
+                "question_history": history,
+                "conversation": payload.get("conversation", []),
+                "retrieved_chunks": enforced.get("chunks", [])
+            }
+            
+            # Use low temp for consistent analysis
+            ai_decision_resp = call_decision(decision_context, temperature=0.1)
+            ai_data = ai_decision_resp.get("parsed") or {}
+
+            # 2. Merge AI insights into the Hard Rule decision
+            #    We keep the Rule's VERDICT (e.g. "hire"/"maybe") but add AI details
+            rule_termination["key_strengths"] = ai_data.get("key_strengths", [])
+            rule_termination["critical_weaknesses"] = ai_data.get("critical_weaknesses", [])
+            
+            # Combine reasons if useful
+            ai_reason = ai_data.get("reason", "")
+            if ai_reason and len(ai_reason) > 10:
+                 rule_termination["feedback_summary"] = ai_data.get("feedback_summary", rule_termination.get("reason"))
+            else:
+                 rule_termination["feedback_summary"] = rule_termination.get("reason")
+            
+            # If the rule didn't specify a role, use the AI's suggestion
+            if not rule_termination.get("recommended_role"):
+                rule_termination["recommended_role"] = ai_data.get("recommended_role")
+
+        except Exception as e:
+            logger.error(f"Failed to generate AI feedback for termination: {e}")
+            # Fallbacks in case AI fails
+            rule_termination["key_strengths"] = []
+            rule_termination["critical_weaknesses"] = []
+            rule_termination["feedback_summary"] = rule_termination.get("reason", "Interview concluded.")
+
+        # 3. Return the Final Decision
         return {
             "request_id": payload["request_id"],
             "q_count": current_q_count,
             "ended": True,
-            "elimination": True,
+            # Use 'elimination' flag from the rule (False for Rule 6, True for others)
+            "elimination": rule_termination.get("elimination", False),
             "reason": rule_termination["reason"],
-            "final_decision": rule_termination,
-            "parsed": {"question": "Interview Terminated", "type": "info"}
+            "final_decision": rule_termination, 
+            "parsed": {"question": "Interview Complete", "type": "info"}
         }
-    if state.current_round == "complete":
-        decision = call_decision({
-            "resume": payload.get("resume_summary", ""),
-            "question_history": history,
-            "conversation": payload.get("conversation", []),
-            "retrieved_chunks": enforced.get("chunks", [])
-        }, temperature=0.0)
-
-        return {
-            "request_id": payload["request_id"],
-            "q_count": current_q_count,
-            "ended": True,
-            "elimination": False,
-            "current_round": "complete",
-            "round_history": state.round_history,
-            "final_decision": decision.get("parsed"),
-        }
-    required_type = state.next_question_type()
-    logger.info(f"🎯 Round: {state.current_round} | Required type: {required_type}")
-
-
-    # =====================================================
-    # 🛑 TERMINATION CHECK (ONLY PLACE IT HAPPENS)
-    # =====================================================
-    if len(history) >= TERMINATION_RULES["max_questions"]:
-        decision = call_decision({
-            "resume": payload.get("resume_summary", ""),
-            "question_history": history,
-            "conversation": payload.get("conversation", []),
-            "retrieved_chunks": enforced.get("chunks", [])
-        }, temperature=0.0)
-
-        return {
-            "request_id": payload["request_id"],
-            "q_count": current_q_count,
-            "ended": True,
-            "final_decision": decision.get("parsed"),
-            "parsed": {"question": "Interview Complete", "type": "info"},
-        }
-
     # =====================================================
     # 2. DETERMINE REQUIRED TYPE (ONCE)
     # =====================================================
@@ -2860,7 +3245,11 @@ def generate_question(req: GenerateQuestionRequest):
     # 4. FALLBACK (RARE, SAFE)
     # =====================================================
     if parsed is None:
-        parsed = FALLBACK_QUESTIONS["conceptual"].copy()
+        if required_type in FALLBACK_QUESTIONS:
+            parsed = FALLBACK_QUESTIONS[required_type].copy()
+        else:
+            # Default to conceptual if specific type missing
+            parsed = FALLBACK_QUESTIONS["conceptual"].copy()
         parsed["type"] = "conceptual"
         parsed["_is_fallback"] = True
         chosen_raw = "FALLBACK_TRIGGERED"
@@ -2940,8 +3329,185 @@ def generate_question(req: GenerateQuestionRequest):
         },
         "ended": False
     }
+@app.post("/generate_roadmap")
+def generate_roadmap(req: RoadmapRequest):
+    """
+    Generates a dynamic 4-week study plan with Hybrid Logic.
+    - Many Weaknesses -> Full Recovery Plan
+    - Few Weaknesses -> Hybrid Plan (Week 1 Fix + Weeks 2-4 Mastery)
+    - No Weaknesses -> Full Advanced Mastery Plan
+    - INCORPORATES SPECIFIC FEEDBACK FROM HISTORY
+    """
+    history = req.question_history
+    
+    if not history:
+        if req.session_id in INTERVIEW_STATE:
+            history = INTERVIEW_STATE[req.session_id].history
+        else:
+            logger.warning(f"No history found for {req.session_id}, generating generic roadmap")
+            history = []
 
+    # 1. Analyze Performance
+    weak_areas = {}   # Score < 0.65
+    strong_areas = [] # Score >= 0.65
+    skill_scores = {}
+    
+    if history:
+        for h in history:
+            q_type = h.get("type") or h.get("metadata", {}).get("type") or "conceptual"
+            if q_type == "code": q_type = "coding_challenge"
+            
+            try:
+                raw_score = h.get("score")
+                if isinstance(raw_score, dict): raw_score = raw_score.get("overall_score")
+                score = float(raw_score) if raw_score is not None else 0.0
+            except:
+                score = 0.0
 
+            if q_type not in skill_scores: skill_scores[q_type] = []
+            skill_scores[q_type].append(score)
+            
+            q_text = safe_truncate(h.get("question", ""), 200)
+            
+            # Extract feedback (improvement or rationale)
+            raw_feedback = h.get("feedback") or h.get("result", {}).get("improvement") or h.get("result", {}).get("rationale") or "No specific feedback."
+            clean_feedback = safe_truncate(raw_feedback, 300)
+
+            if score < 0.65:
+                if q_type not in weak_areas: weak_areas[q_type] = []
+                weak_areas[q_type].append({
+                    "question": q_text,
+                    "score": score,
+                    "feedback": clean_feedback
+                })
+            else:
+                strong_areas.append(q_text)
+
+    skill_averages = {
+        k: round(sum(v) / len(v), 2) for k, v in skill_scores.items()
+    }
+
+    # 2. Determine Strategy (SMART HYBRID LOGIC)
+    weak_count = sum(len(v) for v in weak_areas.values())
+    
+    # Flatten lists for context, including the FEEDBACK
+    weak_context = [
+        f"Question: {item['question']}\n   Feedback to Fix: {item['feedback']}" 
+        for sublist in weak_areas.values() for item in sublist
+    ]
+    strong_context = strong_areas[:5]
+
+    if weak_count == 0:
+        # Scenario A: Rock Star (100% Mastery)
+        plan_type = "ADVANCED MASTERY PLAN"
+        context_data = {"strengths": strong_context}
+        task_instruction = (
+            "The candidate PASSED all questions. Create an ADVANCED plan to take their existing skills "
+            "(listed in 'strengths') to an Expert/Architect level. Do NOT suggest basics."
+        )
+    elif weak_count <= 2:
+        # Scenario B: Hybrid (25% Fix, 75% Mastery)
+        plan_type = "HYBRID ACCELERATION PLAN"
+        context_data = {"gaps_to_fix": weak_context, "strengths_to_advance": strong_context}
+        task_instruction = (
+            "The candidate is STRONG but has minor gaps. "
+            "**Week 1 MUST focus strictly on fixing the specific 'Feedback to Fix' mentioned in 'gaps_to_fix'.** "
+            "**Weeks 2-4 MUST focus on advancing their 'strengths_to_advance' to an expert level.** "
+            "Do NOT spend 4 weeks on the small gaps."
+        )
+    else:
+        # Scenario C: Struggling (100% Recovery)
+        plan_type = "RECOVERY PLAN"
+        context_data = {"critical_failures": weak_context}
+        task_instruction = (
+            "The candidate struggled significantly. Create a strict plan to fix these specific knowledge gaps. "
+            "The plan must explicitly address the 'Feedback to Fix' provided for each failure."
+        )
+
+    # 3. Build AI Prompt
+    prompt = f"""
+You are a Senior Technical Mentor creating a personalized 4-week {plan_type}.
+
+PERFORMANCE METRICS:
+{json.dumps(skill_averages, indent=2)}
+
+CONTEXT DATA (Includes specific feedback from the interview):
+{json.dumps(context_data, indent=2)}
+
+TASK:
+{task_instruction}
+
+⚠️ CRITICAL RULES:
+1. **Feedback-Driven**: If the feedback says "You forgot edge cases", the plan MUST include a day for "Testing Edge Cases".
+2. **Context-Driven**: Plans must be about the specific technologies mentioned (e.g., Python, Trading, React).
+3. **Specific Resources**: Suggest real-world resources (e.g., "Designing Data-Intensive Applications", "Python GIL Source Code").
+
+OUTPUT JSON FORMAT:
+{{
+  "overall_assessment": "String summarizing performance and the specific goal of this plan.",
+  "skill_radar": {{
+    "dsa": 0.0-1.0,
+    "system_design": 0.0-1.0,
+    "communication": 0.0-1.0
+  }},
+  "weekly_plan": [
+    {{
+      "week": 1,
+      "theme": "Specific Topic",
+      "goals": ["Goal 1", "Goal 2"],
+      "daily_tasks": [
+        {{
+          "day": "Day 1-2",
+          "activity": "Detailed study activity...",
+          "resources": [
+              {{"type": "video", "title": "Specific Video Title"}},
+              {{"type": "article", "title": "Specific Article Title"}}
+          ]
+        }}
+      ]
+    }}
+  ]
+}}
+"""
+
+    # 4. Call LLM
+    try:
+        resp = llm_call(prompt, temperature=0.4, max_tokens=2500)
+        
+        if not resp.get("ok"):
+            raise HTTPException(status_code=502, detail="AI roadmap generation failed")
+        
+        roadmap = extract_json_from_text(resp["raw"])
+        
+        if not roadmap:
+            raise HTTPException(status_code=500, detail="Failed to parse roadmap JSON")
+        
+        # 5. Add URLs
+        for week in roadmap.get("weekly_plan", []):
+            for task in week.get("daily_tasks", []):
+                for res in task.get("resources", []):
+                    title = res.get("title", "")
+                    if res.get("type") == "video":
+                        res["url"] = f"https://www.youtube.com/results?search_query={title.replace(' ', '+')}"
+                    else:
+                        res["url"] = f"https://www.google.com/search?q={title.replace(' ', '+')}"
+
+        return {
+            "success": True,
+            "roadmap": roadmap,
+            "metrics": {
+                "skill_averages": skill_averages,
+                "weak_count": weak_count
+            }
+        }
+
+    except Exception as e:
+        logger.exception("Roadmap generation error")
+        return {
+            "success": False, 
+            "error": str(e),
+            "roadmap": None 
+        }
 @app.post("/run_code")
 def run_code(req: CodeSubmissionRequest):
     import json, re
@@ -3171,25 +3737,68 @@ async def register_face(request: FaceRegisterRequest):
 @app.post("/generate_hint")
 def generate_hint(req: HintRequest):
     """
-    Generates a helpful nudge without revealing the answer.
+    Context-Aware Socratic Hint. 
+    Analyzes the user's partial answer to give specific, unblocking advice.
     """
+    q_type = req.context_type
+    partial = req.current_answer.strip() if req.current_answer else ""
+    partial = safe_truncate(partial, 1500) # prevent context overflow
+
+    # 1. Define Persona & Strategy
+    if q_type == "coding_challenge":
+        system_instruction = """
+        You are a Senior Engineer mentoring a student.
+        The candidate is writing code but is stuck.
+        
+        ANALYSIS STRATEGY:
+        1. If 'PARTIAL CODE' is empty: Suggest a high-level approach or Data Structure (e.g., "Try a Hash Map").
+        2. If 'PARTIAL CODE' has syntax errors: Point them out gently.
+        3. If 'PARTIAL CODE' has bad logic (e.g., O(n^2)): Hint at optimization.
+        4. If they are almost done: Suggest checking edge cases.
+        
+        DO NOT write the corrected code. Nudge them.
+        """
+    elif q_type == "system_design":
+        system_instruction = """
+        You are a System Architect.
+        The candidate is designing a system on a whiteboard.
+        
+        ANALYSIS STRATEGY:
+        1. If empty: Suggest starting with Functional Requirements or API definition.
+        2. If they have components but no DB: "How will you store the data?"
+        3. If they have a DB but no Scale: "How will this handle 1M users?"
+        """
+    else:
+        system_instruction = """
+        You are an Interviewer.
+        The candidate is answering a conceptual question.
+        If they are off-track, guide them back. If they are stuck, give an analogy.
+        """
+
     prompt = f"""
-    You are a technical interviewer. The candidate is stuck on this question:
+    SYSTEM: {system_instruction}
+    
+    INTERVIEW QUESTION:
     "{req.question}"
     
-    Provide a brief, helpful hint. 
-    - If coding: Suggest a data structure (e.g. HashMap, Heap) or pattern (Two Pointers).
-    - If system design: Suggest which component to start with.
-    - DO NOT write code or give the full solution.
-    - Keep it under 1 sentence.
+    CANDIDATE'S CURRENT PARTIAL WORK:
+    ```
+    {partial if partial else "(Candidate has not started yet)"}
+    ```
+    
+    OUTPUT:
+    Provide a single, specific hint (max 2 short sentences).
     """
     
     try:
-        resp = llm_call(prompt, temperature=0.3, max_tokens=100)
+        # Temperature 0.3 for helpful, consistent advice
+        resp = llm_call(prompt, temperature=0.3, max_tokens=150)
+        
         if not resp.get("ok"):
              raise HTTPException(status_code=502, detail="AI hint generation failed")
         
-        return {"hint": resp["raw"].strip()}
+        raw_hint = resp["raw"].strip().replace('"', '')
+        return {"hint": raw_hint}
     except Exception as e:
         logger.error(f"Hint error: {e}")
         raise HTTPException(status_code=500, detail=str(e))    
@@ -3209,20 +3818,37 @@ def score_answer(req: ScoreAnswerRequest):
         redaction_log = r["redaction_log"]
     
     enforced = enforce_budget(payload)
-    
-    # 2. Build Context & Prompt
+    whiteboard_context = ""
+    if payload.get("question_type") == "system_design":
+        # 1. Try Vision Analysis first (Best for diagrams)
+        if payload.get("whiteboard_snapshot"):
+            logger.info("🎨 Analyzing Whiteboard Snapshot with Vision Model...")
+            vision_desc = analyze_whiteboard_image(payload["whiteboard_snapshot"])
+            if vision_desc:
+                whiteboard_context = f"AI VISION ANALYSIS OF DIAGRAM:\n{vision_desc}"
+        
+        # 2. Fallback to JSON keywords if Vision failed or no snapshot was provided
+        if not whiteboard_context:
+            elements = payload.get("whiteboard_elements", [])
+            whiteboard_context = extract_whiteboard_keywords(elements)
+            
+        logger.info(f"🎨 Final Whiteboard Context: {whiteboard_context[:100]}...")
     context = {
         "resume": enforced.get("resume", ""),
         "chunks": enforced.get("chunks", []),
         "question_type": payload.get("question_type", "text"),
-        "code_execution_result": payload.get("code_execution_result")
+        "code_execution_result": payload.get("code_execution_result"),
+        "whiteboard_text_summary": whiteboard_context,
+        "playback_history": payload.get("playback_history", [])
     }
     
     prompt = build_score_prompt(
         payload.get("question_text", ""),
         payload.get("ideal_outline", ""),
         payload.get("candidate_answer", ""),
-        context
+        context=context,
+        user_time_complexity=payload.get("user_time_complexity"),
+        user_space_complexity=payload.get("user_space_complexity")
     )
     
     # 3. FAST PATH: Try Groq First (Llama 3.3)
@@ -3259,6 +3885,7 @@ def score_answer(req: ScoreAnswerRequest):
         "confidence": 0.5,
         "verdict": "weak",
         "rationale": "",
+        "feedback_for_candidate": "No feedback provided.", # Default
         "red_flags_detected": [],
         "missing_elements": [],
         "follow_up_probe": None
@@ -3284,6 +3911,7 @@ def score_answer(req: ScoreAnswerRequest):
             validated["confidence"] = max(0.0, min(1.0, float(parsed.get("confidence", 0.5))))
             validated["verdict"] = parsed.get("verdict", "weak")
             validated["rationale"] = parsed.get("rationale", "")
+            validated["feedback_for_candidate"] = parsed.get("feedback_for_candidate") or parsed.get("rationale", "No feedback provided.")
             validated["red_flags_detected"] = parsed.get("red_flags_detected", [])
             validated["missing_elements"] = parsed.get("missing_elements", [])
             validated["follow_up_probe"] = parsed.get("follow_up_probe")
@@ -3346,7 +3974,7 @@ def score_answer(req: ScoreAnswerRequest):
     )
     
     # 2. STRICT PROBE SUPPRESSION LOGIC
-    final_in_gray_zone = False  # Default: NO PROBE
+    final_in_gray_zone = raw_in_gray_zone  # Default: NO PROBE
     
     if raw_in_gray_zone and incoming_history:
         # ====================================================================
@@ -3359,31 +3987,16 @@ def score_answer(req: ScoreAnswerRequest):
             similarity = compute_similarity(last_q, prev_q)
             
             # If questions are >25% similar, we JUST probed. STOP.
-            if similarity > 0.25:
+            if similarity > 0.45:
                 logger.info(f"🛑 Anti-Loop Rule 1: Question similarity {similarity:.2f} > 0.25. NO PROBE.")
                 final_in_gray_zone = False
             
             # ================================================================
             # RULE 2: Check Topic Overlap (Prevent drilling same concept)
             # ================================================================
-            elif similarity <= 0.25:
-                # Extract technical topics from both questions
-                last_topics = extract_question_topics(last_q)
-                prev_topics = extract_question_topics(prev_q)
-                
-                # If >50% topic overlap, we're beating a dead horse
-                if last_topics and prev_topics:
-                    overlap_ratio = len(last_topics & prev_topics) / max(len(last_topics), 1)
-                    if overlap_ratio > 0.5:
-                        logger.info(f"🛑 Anti-Loop Rule 2: Topic overlap {overlap_ratio:.2f} > 0.5. NO PROBE.")
-                        final_in_gray_zone = False
-                    else:
-                        # ONLY allow probe if BOTH similarity AND topic overlap are low
-                        final_in_gray_zone = True
-                        logger.info(f"✅ Probe allowed: similarity={similarity:.2f}, topic_overlap={overlap_ratio:.2f}")
-                else:
-                    # If we can't extract topics, err on the side of NO PROBE
-                    final_in_gray_zone = False
+            elif incoming_history[-1].get("is_probe", False):
+                 logger.info("🛑 Anti-Loop: Last question was already a probe. Suppressing.")
+                 final_in_gray_zone = False
         
         # ====================================================================
         # RULE 3: Check if Previous Answer was ALSO Weak (Consecutive Weakness)
@@ -3403,9 +4016,7 @@ def score_answer(req: ScoreAnswerRequest):
         # ====================================================================
         # RULE 4: Hard Limit - Never Probe After Question 5
         # ====================================================================
-        if final_in_gray_zone and current_q_count > 5:
-            logger.info(f"🛑 Anti-Loop Rule 4: Question #{current_q_count} > 5. NO MORE PROBES.")
-            final_in_gray_zone = False
+
     
     # ========================================================================
     # 3. DEBUGGING LOG (Shows why decision was made)
@@ -3473,20 +4084,17 @@ def probe(req: ProbeRequest):
         "parsed": probe_result.get("parsed"),
         "redaction_log": redaction_log
     }
-
 @app.post("/finalize_decision")
 def finalize_decision(req: DecisionRequest):
     """Make final hiring decision with performance-based termination"""
     payload = req.dict()
     
-    # PII redaction
     if not payload.get("allow_pii") and payload.get("resume_summary"):
         r = redact_pii(payload["resume_summary"])
         payload["resume_summary"] = r["redacted"]
     
     enforced = enforce_budget(payload)
     
-    # ✅ Calculate metrics FIRST (fixes bug)
     metrics = calculate_performance_metrics(payload.get("question_history", []))
     
     context = {
@@ -3498,9 +4106,6 @@ def finalize_decision(req: DecisionRequest):
     
     result = call_decision(context, temperature=0.0)
     
-    # -------------------------------------------------
-    # FINALITY LOGIC (RULE-FIRST, MODEL-SECOND)
-    # -------------------------------------------------
     is_final = False
     
     if result.get("ok") and result.get("parsed"):
@@ -3508,16 +4113,11 @@ def finalize_decision(req: DecisionRequest):
         verdict = decision.get("verdict")
         confidence = decision.get("confidence", 0.0)
 
-        # 🔒 HARD RULES ALWAYS FINAL
         if result.get("raw") == "hard_rule_triggered":
             is_final = True
-
-        # 🔒 CLEAR MODEL DECISION
         elif payload.get("accept_model_final", True):
             if verdict in ("hire", "reject") and confidence >= 0.75:
                 is_final = True
-
-            # 🔒 LOW AVERAGE + REJECT = FINAL
             elif verdict == "reject" and metrics["average_score"] < 0.45:
                 is_final = True
 
@@ -3528,7 +4128,6 @@ def finalize_decision(req: DecisionRequest):
         "performance_metrics": metrics,
         "termination_rule_triggered": result.get("raw") == "hard_rule_triggered"
     }
-
 
 @app.post("/parse_resume")
 async def parse_resume(

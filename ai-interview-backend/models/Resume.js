@@ -2,12 +2,16 @@
 const mongoose = require("mongoose");
 
 const ResumeSchema = new mongoose.Schema({
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", index: true, required: false },
-  sourceUrl: { type: String }, // s3 url or pointer
-  parsed: { type: mongoose.Schema.Types.Mixed }, // parsed JSON
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  sourceUrl: { type: String }, 
+  parsed: { type: mongoose.Schema.Types.Mixed }, 
   redactionLog: { type: Array, default: [] },
-  rawTextStored: { type: Boolean, default: false }, // whether raw text recorded in DB (consider false + S3)
+  rawTextStored: { type: Boolean, default: false }, 
   createdAt: { type: Date, default: Date.now }
 }, { timestamps: true });
+
+// 🚀 PERFORMANCE INDEXES
+// Quickly get the latest resume for a user
+ResumeSchema.index({ userId: 1, createdAt: -1 });
 
 module.exports = mongoose.model("Resume", ResumeSchema);

@@ -6,6 +6,8 @@ import { useInterview } from "../hooks/useInterview";
 import { useAuth } from "../context/AuthContext";
 import Link from "next/link";
 import jsPDF from "jspdf";
+import "@excalidraw/excalidraw/index.css";
+// import { exportToBlob } from "@excalidraw/excalidraw";
 import autoTable from "jspdf-autotable";
 import Editor from "@monaco-editor/react";
 import {
@@ -24,7 +26,16 @@ import {
   Lightbulb,
   Loader2,
   FileText, // <--- NEW
-  ArrowRight // <--- NEW // Added for loading indicator
+  ArrowRight,
+  LayoutTemplate,
+  Map,
+  Calendar,
+  BookOpen,
+  Video,
+  Code,
+  Layout,
+  ExternalLink,
+  Zap   // <--- NEW // Added for loading indicator
 } from "lucide-react";
 
 /* -------------------------
@@ -136,11 +147,243 @@ const renderTrendIcon = (trend: string) => {
       return <Minus size={24} className="text-slate-600" />;
   }
 };
-
+import dynamic from "next/dynamic";
+// Replace your current ExcalidrawWrapper import (around line 109) with:
+const ExcalidrawWrapper = dynamic(
+  () => import("@excalidraw/excalidraw").then((mod) => mod.Excalidraw),
+  { 
+    ssr: false,
+    loading: () => (
+      <div className="flex items-center justify-center h-full bg-slate-50">
+        <Loader2 className="animate-spin text-indigo-600" size={32} />
+      </div>
+    )
+  }
+);
 /* -------------------------
     Main component
     ------------------------- */
+const RoadmapDisplay = ({ plan }: { plan: any }) => {
+  if (!plan) return null;
 
+  // 🔍 DEBUG: Log exactly what the frontend is seeing
+  console.log("🔍 Roadmap Data Received:", plan);
+
+  // 🛠️ HELPER: Recursively find the 'weekly_plan' array
+  // This fixes issues where AI returns { roadmap: { weekly_plan: ... } }
+  // or { WeeklyPlan: ... } or other variations.
+  const findSchedule = (obj: any): any[] => {
+    if (!obj || typeof obj !== 'object') return [];
+    
+    // 1. Direct match (case insensitive)
+    const keys = Object.keys(obj);
+    const planKey = keys.find(k => k.toLowerCase().includes('weekly') && k.toLowerCase().includes('plan'));
+    if (planKey && Array.isArray(obj[planKey])) {
+      return obj[planKey];
+    }
+
+    // 2. Check for 'roadmap' wrapper
+    if (obj.roadmap && typeof obj.roadmap === 'object') {
+        return findSchedule(obj.roadmap);
+    }
+
+    return [];
+  };
+ 
+  const schedule = findSchedule(plan);
+  
+  // Extract other fields safely
+  const assessment = plan.overall_assessment || plan.roadmap?.overall_assessment || plan.assessment || "Your personalized recovery plan.";
+  const radar = plan.skill_radar || plan.roadmap?.skill_radar || plan.skills || null;
+  const projects = plan.recommended_projects || plan.roadmap?.recommended_projects || [];
+
+  return (
+    <div className="mt-10 animate-in fade-in slide-in-from-bottom-6 duration-700">
+      <div className="bg-white rounded-3xl border-2 border-indigo-100 shadow-xl overflow-hidden">
+        
+        {/* Header */}
+        <div className="bg-gradient-to-r from-indigo-600 to-blue-600 p-8 text-white">
+          <div className="flex items-center gap-3 mb-2">
+            <Map className="text-indigo-200" size={28} />
+            <h2 className="text-2xl font-black uppercase tracking-wide">4-Week Recovery Plan</h2>
+          </div>
+          <p className="text-indigo-100 text-lg font-medium leading-relaxed max-w-3xl">
+            {assessment}
+          </p>
+        </div>
+
+        <div className="p-8">
+          {/* Skill Radar */}
+          {radar && (
+            <div className="mb-10 p-6 bg-slate-50 rounded-2xl border border-slate-200">
+              <h3 className="font-bold text-slate-700 mb-4 flex items-center gap-2">
+                <Target size={18} /> Skill Gap Analysis
+              </h3>
+              <div className="space-y-4 grid grid-cols-1 md:grid-cols-2 gap-6">
+                {Object.entries(radar).map(([skill, score]: [string, any]) => (
+                  <div key={skill}>
+                    <div className="flex justify-between text-xs font-bold uppercase text-slate-500 mb-1">
+                      <span>{skill.replace(/_/g, " ")}</span>
+                      <span>{Math.round(Number(score) * 100)}%</span>
+                    </div>
+                    <div className="h-2 w-full bg-slate-200 rounded-full overflow-hidden">
+                      <div 
+                        className={`h-full rounded-full ${score > 0.7 ? 'bg-emerald-500' : score > 0.4 ? 'bg-amber-500' : 'bg-rose-500'}`} 
+                        style={{ width: `${Number(score) * 100}%` }} 
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Weekly Timeline */}
+          <div className="space-y-8">
+            <h3 className="font-bold text-xl text-slate-900 flex items-center gap-2 border-b pb-4">
+              <Calendar size={20} className="text-indigo-600" /> Actionable Schedule
+            </h3>
+            
+            {schedule.length === 0 ? (
+               <div className="text-center p-8 bg-slate-50 rounded-xl border border-slate-200 text-slate-500 italic">
+                 <p>No specific schedule generated.</p>
+                 <p className="text-xs mt-2 text-slate-400">(Debug: Check console for 'Roadmap Data Received')</p>
+               </div>
+            ) : (
+              <div className="relative border-l-2 border-indigo-100 ml-3 space-y-8 pb-4">
+                {schedule.map((week: any, wIdx: number) => (
+                  <div key={wIdx} className="relative pl-8">
+                    <div className="absolute -left-[9px] top-0 w-5 h-5 bg-indigo-600 rounded-full border-4 border-white shadow-sm" />
+                    
+                    <div className="mb-4">
+                      <h4 className="text-lg font-bold text-slate-800">Week {week.week}: {week.theme}</h4>
+                      <div className="flex flex-wrap gap-2 mt-2">
+                        {week.goals?.map((g: string, i: number) => (
+                          <span key={i} className="text-xs font-medium px-2 py-0.5 bg-green-50 text-green-700 rounded-md border border-green-200">
+                            🎯 {g}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 gap-4">
+                      {week.daily_tasks?.map((task: any, dIdx: number) => (
+                        <div key={dIdx} className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm hover:shadow-md transition-shadow">
+                          <div className="flex justify-between items-start mb-2">
+                            <span className="text-xs font-bold bg-slate-100 text-slate-600 px-2 py-1 rounded uppercase tracking-wider">
+                              {task.day}
+                            </span>
+                          </div>
+                          <p className="font-medium text-slate-800 mb-3">{task.activity}</p>
+                          
+                          <div className="space-y-2">
+                            {task.resources?.map((res: any, rIdx: number) => (
+                              <a 
+                                key={rIdx} 
+                                href={res.url} 
+                                target="_blank" 
+                                rel="noopener noreferrer"
+                                className="flex items-center gap-3 p-2 rounded-lg bg-slate-50 hover:bg-indigo-50 border border-slate-100 hover:border-indigo-200 transition-colors group"
+                              >
+                                <div className="shrink-0">
+                                  {res.type === 'video' ? <Video size={16} className="text-red-500" /> : <BookOpen size={16} className="text-blue-500" />}
+                                </div>
+                                <div className="flex-1 min-w-0">
+                                  <div className="text-sm font-medium text-slate-700 group-hover:text-indigo-700 truncate">
+                                    {res.title}
+                                  </div>
+                                </div>
+                                <ExternalLink size={14} className="text-slate-400 group-hover:text-indigo-400" />
+                              </a>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+ const CodeReplayPlayer = ({ history }: { history: any[] }) => {
+  const [index, setIndex] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+
+  useEffect(() => {
+    let interval: any;
+    if (isPlaying && index < history.length - 1) {
+      interval = setInterval(() => {
+        setIndex((prev) => prev + 1);
+      }, 500); // 0.5s per frame
+    } else if (index >= history.length - 1) {
+      setIsPlaying(false);
+    }
+    return () => clearInterval(interval);
+  }, [isPlaying, index, history.length]);
+
+  const frame = history[index];
+  if (!frame) return <div className="text-slate-400 text-xs italic p-2">No playback data available.</div>;
+
+  return (
+    <div className="mt-4 border-2 border-slate-200 rounded-xl overflow-hidden bg-white shadow-sm">
+      {/* Player Toolbar */}
+      <div className="bg-slate-100 p-2 flex items-center justify-between border-b border-slate-200">
+        <div className="flex items-center gap-3">
+          <button 
+            onClick={() => setIsPlaying(!isPlaying)}
+            className="flex items-center gap-1 px-3 py-1 bg-white border border-slate-300 rounded hover:bg-slate-50 text-xs font-bold transition-colors"
+          >
+            {isPlaying ? <><Minus size={12} /> Pause</> : <><Play size={12} /> Replay</>}
+          </button>
+          
+          <input 
+            type="range" 
+            min="0" 
+            max={history.length - 1} 
+            value={index} 
+            onChange={(e) => setIndex(Number(e.target.value))}
+            className="w-32 md:w-48 h-2 bg-slate-300 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+          />
+          
+          <span className="text-xs text-slate-500 font-mono">
+            {new Date(frame.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit'})}
+          </span>
+        </div>
+
+        {/* Event Badge */}
+        <div className={`text-[10px] font-bold px-2 py-1 rounded uppercase tracking-wider ${
+          frame.trigger === 'paste' ? 'bg-rose-100 text-rose-700 border border-rose-200' : 
+          frame.trigger === 'run' ? 'bg-indigo-100 text-indigo-700 border border-indigo-200' : 
+          'bg-slate-200 text-slate-600 border border-slate-300'
+        }`}>
+          {frame.trigger}
+        </div>
+      </div>
+
+      {/* Read-Only Editor View */}
+      <div className="h-64 opacity-90 pointer-events-none relative"> 
+        <Editor 
+          height="100%" 
+          defaultLanguage="python" 
+          value={frame.code} 
+          theme="vs-light" 
+          options={{ 
+            minimap: { enabled: false }, 
+            readOnly: true, 
+            lineNumbers: "off",
+            folding: false,
+            scrollBeyondLastLine: false
+          }}
+        />
+      </div>
+    </div>
+  );
+};
 export default function InterviewPage() {
   const {
     stage,
@@ -158,12 +401,15 @@ export default function InterviewPage() {
     endInterview,
     reportViolation,
     sessionId,
+    resumeSession,
     fetchHint
   } = useInterview();
 
   const { token } = useAuth();
   const [answer, setAnswer] = useState("");
   const [showReport, setShowReport] = useState(false);
+  const [timeComplexity, setTimeComplexity] = useState("");
+const [spaceComplexity, setSpaceComplexity] = useState("");
 const [codeOutput, setCodeOutput] = useState<string | null>(null);
 const [codeStatus, setCodeStatus] = useState<"idle" | "running" | "success" | "error">("idle");
 const [executionResult, setExecutionResult] = useState<any>(null); // Store Piston result here
@@ -172,6 +418,8 @@ const [roundProgress, setRoundProgress] = useState<any>(null);
 const [isProbeQuestion, setIsProbeQuestion] = useState(false);
 const [showRoundModal, setShowRoundModal] = useState(false);
   const [nextRoundName, setNextRoundName] = useState("");
+  const [whiteboardElements, setWhiteboardElements] = useState<any[]>([]);
+  const [excalidrawAPI, setExcalidrawAPI] = useState<any>(null);
 const allTestsPassed =
   executionResult?.summary &&
   executionResult.summary.passed === executionResult.summary.total;
@@ -181,13 +429,15 @@ const allTestsPassed =
   const [showViolationWarning, setShowViolationWarning] = useState(false);
   const [terminatedByViolation, setTerminatedByViolation] = useState(false);
   const [violationReason, setViolationReason] = useState<string | null>(null);
-
+const [roadmap, setRoadmap] = useState<any>(null);
+  const [loadingRoadmap, setLoadingRoadmap] = useState(false);
   // Camera refs/state: separate preview and proctor video elements
   const previewVideoRef = useRef<HTMLVideoElement | null>(null);
   const proctorVideoRef = useRef<HTMLVideoElement | null>(null);
   const previewCanvasRef = useRef<HTMLCanvasElement | null>(null); // for reference capture
   const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const inFlightRef = useRef(false);
+const whiteboardElementsRef = useRef<readonly unknown[]>([]);
 
   const [cameraActive, setCameraActive] = useState(false);
   // referenceImage is now the source of truth for successful client-side capture
@@ -225,7 +475,69 @@ const [hint, setHint] = useState<string | null>(null);
   // Synchronous refs to avoid races when multiple DOM events fire
   const violationRef = useRef(0); // immediate counter
   const endingRef = useRef(false); // prevents duplicate terminations
+  interface CodeSnapshot {
+  timestamp: number;
+  code: string;
+  trigger: 'auto' | 'run' | 'paste' | 'initial';
+}
+  const playbackHistory = useRef<CodeSnapshot[]>([]);
 
+const captureSnapshot = useCallback((trigger: CodeSnapshot['trigger']) => {
+    // Only capture for code questions
+    if (currentQuestion?.expectedAnswerType !== "code") return;
+
+    // Avoid duplicates for auto-timer to save memory
+    const currentCode = answer; 
+    const lastCode = playbackHistory.current[playbackHistory.current.length - 1]?.code;
+
+    if (trigger === 'auto' && (!currentCode || currentCode === lastCode)) return;
+
+    playbackHistory.current.push({
+      timestamp: Date.now(),
+      code: currentCode, 
+      trigger
+    });
+    
+    // Debug log
+    if (trigger !== 'auto') {
+        console.log(`📹 Snapshot [${trigger}]: ${playbackHistory.current.length} frames`);
+    }
+  }, [answer, currentQuestion]);
+useEffect(() => {
+    // Attempt resume if logged in, idle, and no session active yet
+    if (token && stage === "idle" && !sessionId) {
+      const savedId = localStorage.getItem("active_interview_session");
+      if (savedId) {
+        resumeSession(savedId);
+      }
+    }
+  }, [token, stage, sessionId, resumeSession]);
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (stage === "running" && currentQuestion?.expectedAnswerType === "code") {
+      interval = setInterval(() => {
+        captureSnapshot('auto');
+      }, 5000); // Snapshot every 5 seconds
+    }
+    return () => { if (interval) clearInterval(interval); };
+  }, [stage, currentQuestion, captureSnapshot]);
+
+  // 2. Reset on New Question
+  useEffect(() => {
+    playbackHistory.current = [];
+    if (currentQuestion?.expectedAnswerType === "code") {
+       // Capture initial state after a brief delay to ensure answer is populated
+       setTimeout(() => captureSnapshot('initial'), 200);
+    }
+  }, [currentQuestion?.questionId]);
+
+  // 3. Handle Paste Events (Anti-Cheat)
+  const handleEditorDidMount = (editor: any) => {
+    editor.onDidPaste(() => {
+        console.warn("⚠️ Paste detected in editor");
+        captureSnapshot('paste');
+    });
+  };
   /* -------------------------
       Helper: stop camera stream
       ------------------------- */
@@ -247,6 +559,30 @@ const [hint, setHint] = useState<string | null>(null);
       console.warn("stopCamera error:", e);
     }
   }, []);
+  const fetchRoadmap = useCallback(async()=>{
+    if(!sessionId || !token || roadmap || loadingRoadmap) return;
+    setLoadingRoadmap(true);
+    try {
+      console.log("🗺️ Fetching AI Roadmap...");
+      const res = await fetch(`${API}/interview/roadmap`,{
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({sessionId},)
+      });
+      const data = await res.json();
+      if (data.roadmap) {
+        setRoadmap(data.roadmap);
+      }
+    } catch (err) {
+      console.error("❌ Failed to fetch roadmap:", err);
+    } finally {
+      setLoadingRoadmap(false);
+    }
+  },[sessionId, token, API, roadmap, loadingRoadmap])
+  
 // --------------------- Helper: normalize testcases ---------------------
 const buildTestCasesFromChallenge = (challenge: any) => {
   const candidateLists = [
@@ -324,6 +660,7 @@ useEffect(() => {
 const handleRunCode = async () => {
   console.log("🔍 handleRunCode called");
   console.trace();
+  captureSnapshot('run');
 
   const codeToRun = answer.trim();
   if (!codeToRun) return;
@@ -414,7 +751,7 @@ const handleRunCode = async () => {
   /* -------------------------
       Violation wrapper (unchanged behavior)
       ------------------------- */
-const VIOLATION_THRESHOLD = 2;
+const VIOLATION_THRESHOLD = 1000;
 
 const reportViolationWrapper = useCallback(
   async (reason: string, isTerminal: boolean = false) => {
@@ -725,7 +1062,8 @@ const captureReferenceImage = useCallback(async () => {
   
   setCameraActive(false);
   setReferenceImage(null);
-  
+ 
+
   const errorMessage = lastError?.message || "Camera capture failed after multiple attempts";
   setCameraError(errorMessage);
   setImageStatus("error");
@@ -1105,53 +1443,113 @@ if (data?.firstQuestion?.is_probe) {
   /* -------------------------
       Answer submit handler (unchanged)
       ------------------------- */
-const handleSubmitAnswer = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!answer.trim() || loading || !currentQuestion) return;
 
-    const payload: any = { 
-        answer, 
-        question_type: "text", 
-        code_execution_result: executionResult 
+  const handleSubmitAnswer = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const isWhiteboard = currentQuestion?.expectedAnswerType === "system_design";
+
+    if ((!answer.trim() && !isWhiteboard) || loading || !currentQuestion) return;
+
+    let finalWhiteboardData: any[] = [];
+    let whiteboardImageBase64: string | null = null;
+
+    if (isWhiteboard) {
+      // 1. Get JSON Elements
+      if (excalidrawAPI && typeof excalidrawAPI.getSceneElements === "function") {
+        const allElements = excalidrawAPI.getSceneElements();
+        finalWhiteboardData = allElements.filter((el: any) => !el.isDeleted);
+        
+        // 2. 📸 CAPTURE IMAGE SNAPSHOT
+        if (finalWhiteboardData.length > 0) {
+          try {
+            console.log("📸 Generating whiteboard snapshot...");
+            
+            // 👇 FIX: Dynamic Import here!
+            // This prevents the "window is not defined" error on the server
+            const { exportToBlob } = await import("@excalidraw/excalidraw");
+
+            const blob = await exportToBlob({
+              elements: finalWhiteboardData,
+              mimeType: "image/jpeg",
+              appState: {
+                ...excalidrawAPI.getAppState(),
+                exportWithDarkMode: false,
+              },
+              files: excalidrawAPI.getFiles(),
+            });
+
+            // Convert Blob to Base64 String
+            whiteboardImageBase64 = await new Promise((resolve) => {
+              const reader = new FileReader();
+              reader.onloadend = () => resolve(reader.result as string);
+              reader.readAsDataURL(blob);
+            });
+            console.log("✅ Snapshot generated (len: " + whiteboardImageBase64?.length + ")");
+          } catch (err) {
+            console.error("❌ Failed to generate whiteboard image:", err);
+          }
+        }
+      } else if (whiteboardElementsRef.current && whiteboardElementsRef.current.length > 0) {
+        finalWhiteboardData = [...whiteboardElementsRef.current];
+      }
+    }
+
+    console.log("🚀 Submitting Payload:", {
+      question_type: isWhiteboard ? "system_design" : "text",
+      whiteboard_count: finalWhiteboardData.length,
+      has_snapshot: !!whiteboardImageBase64
+    });
+if (currentQuestion?.expectedAnswerType === "code") {
+        captureSnapshot('auto');
+    }
+    const payload: any = {
+      answer,
+      question_type: "text",
+      code_execution_result: executionResult,
+      whiteboard_elements: finalWhiteboardData,
+      whiteboard_snapshot: whiteboardImageBase64, 
+      user_time_complexity: timeComplexity,
+      user_space_complexity: spaceComplexity,
+      playback_history: playbackHistory.current
     };
-    
+
     if (currentQuestion.expectedAnswerType === "code") {
-        payload.question_type = "code";
+      payload.question_type = "code";
+    } else if (isWhiteboard) {
+      payload.question_type = "system_design";
     }
 
     try {
       const result = await submitAnswer(payload, currentQuestion.questionId);
+      
       setAnswer("");
       setCodeOutput(null);
       setExecutionResult(null);
+      setTimeComplexity("");
+      setSpaceComplexity("");
+      setWhiteboardElements([]);
+      if (excalidrawAPI) {
+        excalidrawAPI.resetScene();
+      }
 
-      // --- ROUND TRANSITION LOGIC ---
       const newRoundData = result?.round_info || result?.metadata;
       const incomingRound = newRoundData?.current || newRoundData?.current_round;
 
-      // 1. Detect Round Change (and it's not the end of interview)
       if (incomingRound && incomingRound !== currentRound && incomingRound !== "complete" && result?.nextQuestion) {
-          console.log(`🔀 Round Transition: ${currentRound} -> ${incomingRound}`);
-          
-          setNextRoundName(incomingRound); // Store next round name
-          setShowRoundModal(true);         // Trigger the Modal
-          
-          // Update progress in background, but keep currentRound same until user clicks "Start"
-          if (newRoundData.progress) setRoundProgress(newRoundData.progress);
-          return; 
+        setNextRoundName(incomingRound);
+        setShowRoundModal(true);
+        if (newRoundData.progress) setRoundProgress(newRoundData.progress);
+        return;
       }
 
-      // 2. Standard Update (Same round)
       if (newRoundData) {
-         setCurrentRound(incomingRound || currentRound);
-         if (newRoundData.progress) setRoundProgress(newRoundData.progress);
+        setCurrentRound(incomingRound || currentRound);
+        if (newRoundData.progress) setRoundProgress(newRoundData.progress);
       }
-
-    } catch (e) { 
-        console.error("Submit error:", e); 
+    } catch (e) {
+      console.error("Submit error:", e);
     }
   };
-
   // Helper for the modal button
   const handleNextRound = () => {
       setShowRoundModal(false);
@@ -1212,6 +1610,7 @@ const handleSubmitAnswer = async (e: React.FormEvent) => {
     </div>
   );
 };
+
 const RoundTransitionModal = () => {
   if (!showRoundModal) return null;
 
@@ -1255,7 +1654,19 @@ const RoundTransitionModal = () => {
     },
     [stage, reportViolationWrapper]
   );
+const handleExcalidrawChange = useCallback((elements: readonly any[]) => {
+  const activeElements = elements.filter((el) => !el.isDeleted);
+  // Store in ref without triggering re-renders
+  whiteboardElementsRef.current = activeElements;
+  console.log(`📝 Whiteboard updated: ${activeElements.length} elements`);
+}, []);
 
+const handleExcalidrawAPI = useCallback((api: any) => {
+  if (api) {
+    console.log("✅ Excalidraw API linked successfully");
+    setExcalidrawAPI(api);
+  }
+}, []);
   const handleVisibilityChange = useCallback(() => {
     if (stage === "running" && document.visibilityState === "hidden") {
       reportViolationWrapper("Switched to another tab or minimized window.");
@@ -1329,23 +1740,24 @@ const RoundTransitionModal = () => {
   /* --------------------------------------------------------------------------
       Auto-capture reference image when ready (only on idle)
       -------------------------------------------------------------------------- */
-  useEffect(() => {
-    // Only run if the environment is ready AND we haven't already captured a valid image
-    if (
-        stage === "idle" &&
-        resumeParsed &&
-        token &&
-        imageStatus === "pending" && // Only run if status is pending
-        previewVideoRef.current &&
-        previewCanvasRef.current
-    ) {
-      // Attempt auto-capture to ensure the image is ready for the user click
-      captureReferenceImage().catch((e) => {
-        console.warn("Auto-capture failed:", e?.message || e);
-        // captureReferenceImage already sets the error state and imageStatus to 'error'
-      });
-    }
-  }, [stage, resumeParsed, token, imageStatus, captureReferenceImage]);
+ const autoCaptureDoneRef = useRef(false);
+
+useEffect(() => {
+  if (autoCaptureDoneRef.current) return;
+
+  if (
+    stage === "idle" &&
+    resumeParsed &&
+    token &&
+    imageStatus === "pending" &&
+    previewVideoRef.current &&
+    previewCanvasRef.current
+  ) {
+    autoCaptureDoneRef.current = true;
+    captureReferenceImage().catch(() => {});
+  }
+}, [stage, resumeParsed, token, imageStatus, captureReferenceImage]);
+
 useEffect(() => {
   if (currentQuestion) {
     const isProbe = currentQuestion.is_probe || false;
@@ -1515,7 +1927,7 @@ useEffect(() => {
      
      setLoadingHint(true);
      // Pass question type to get better context-aware hints
-     const h = await fetchHint(currentQuestion?.questionText || "", currentQuestion?.type || "conceptual");
+     const h = await fetchHint(currentQuestion?.questionText || "", currentQuestion?.type || "conceptual",answer);
      setHint(h);
      setLoadingHint(false);
   };
@@ -1776,7 +2188,7 @@ const RoundIndicator = () => {
           </div>
         )}
               <EliminationModal />
-
+<RoundTransitionModal />
 
         {/* Header (unchanged) */}
         <div className="mb-8 flex items-center justify-between">
@@ -2156,6 +2568,7 @@ const RoundIndicator = () => {
   value={answer}                          // <- controlled
   // defaultValue removed
   onChange={(val) => setAnswer(val || "")}
+  onMount={handleEditorDidMount}
   theme="vs-dark"
   options={{ minimap: { enabled: false }, fontSize: 14, scrollBeyondLastLine: false, automaticLayout: true }}
 />
@@ -2229,7 +2642,101 @@ const RoundIndicator = () => {
       </div>
     </div>
   </div>
-) : (
+) :currentQuestion.expectedAnswerType === "system_design" ? (
+  /* ============ SYSTEM DESIGN WHITEBOARD - WORKING VERSION ============ */
+  <div className="flex flex-col border-2 border-slate-300 rounded-xl overflow-hidden bg-white shadow-sm">
+    
+    {/* Header */}
+    <div className="bg-slate-100 p-3 flex justify-between items-center border-b border-slate-300 shrink-0">
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-bold text-slate-600 uppercase bg-indigo-100 text-indigo-700 px-2 py-1 rounded flex items-center gap-1">
+          <LayoutTemplate size={14} /> System Design
+        </span>
+        <span className="text-xs text-slate-500">
+          Draw your architecture using the left toolbar ⬅️
+        </span>
+      </div>
+      
+      {/* Clear and Center buttons */}
+      <div className="flex gap-2">
+        <button
+          type="button"
+          onClick={() => {
+            if (excalidrawAPI) {
+              excalidrawAPI.scrollToContent();
+              excalidrawAPI.updateScene({
+                appState: { zoom: { value: 1 } }
+              });
+              console.log("🎯 Canvas centered");
+            }
+          }}
+          className="text-xs px-3 py-1 bg-blue-100 text-blue-700 rounded hover:bg-blue-200 font-medium"
+        >
+          🎯 Center
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            if (excalidrawAPI) {
+              excalidrawAPI.resetScene();
+              whiteboardElementsRef.current = [];
+              console.log("Canvas cleared");
+            }
+          }}
+          className="text-xs px-3 py-1 bg-rose-100 text-rose-700 rounded hover:bg-rose-200 font-medium"
+        >
+          🗑️ Clear
+        </button>
+      </div>
+    </div>
+
+    {/* ✅ WORKING CANVAS - Critical fixes applied */}
+    <div
+      style={{
+        width: "100%",
+        height: "500px",
+        position: "relative",
+        isolation: "isolate",
+      }}
+    >
+      <ExcalidrawWrapper
+        onChange={handleExcalidrawChange}
+        excalidrawAPI={handleExcalidrawAPI}
+        viewModeEnabled={false}         // ✅ Prevents lock icon
+        zenModeEnabled={false}           // ✅ Shows toolbar
+        gridModeEnabled={true}           // ✅ Visual feedback
+        initialData={{
+          appState: {
+            viewBackgroundColor: "#ffffff",
+            currentItemStrokeColor: "#1e88e5",
+            currentItemBackgroundColor: "#e3f2fd",
+            currentItemStrokeWidth: 2,
+            zoom: { value: 1 },
+            scrollX: 0,
+            scrollY: 0,
+          },
+          elements: [],
+        }}
+      />
+    </div>
+
+    {/* Text Explanation Area */}
+    <div className="p-4 bg-slate-50 border-t border-slate-200 shrink-0">
+      <label className="block text-xs font-bold text-slate-500 uppercase mb-2">
+        Verbal Explanation (Describe your architecture)
+      </label>
+      <textarea
+        value={answer}
+        onChange={(e) => setAnswer(e.target.value)}
+        rows={3}
+        placeholder="Explain your system design: components, data flow, scalability, databases..."
+        className="w-full p-3 text-sm bg-white text-slate-800 rounded-lg border border-slate-300 focus:ring-2 focus:ring-indigo-500 outline-none resize-none"
+      />
+    </div>
+  </div>
+
+     
+  ) : (
   /* --- STANDARD TEXT AREA FOR NON-CODE QUESTIONS --- */
   <textarea
     value={answer}
@@ -2240,6 +2747,34 @@ const RoundIndicator = () => {
   />
 )}
 
+{currentQuestion.expectedAnswerType === "code" && (
+  <div className="mt-4 grid grid-cols-2 gap-4 animate-in fade-in slide-in-from-bottom-2">
+    <div className="bg-white p-3 rounded-xl border-2 border-slate-200">
+      <label className="block text-xs font-bold text-slate-500 uppercase mb-1">
+        Time Complexity (Big O)
+      </label>
+      <input
+        type="text"
+        placeholder="e.g. O(n log n)"
+        value={timeComplexity}
+        onChange={(e) => setTimeComplexity(e.target.value)}
+        className="w-full text-sm font-mono text-slate-800 outline-none bg-transparent placeholder:text-slate-400"
+      />
+    </div>
+    <div className="bg-white p-3 rounded-xl border-2 border-slate-200">
+      <label className="block text-xs font-bold text-slate-500 uppercase mb-1">
+        Space Complexity (Big O)
+      </label>
+      <input
+        type="text"
+        placeholder="e.g. O(1)"
+        value={spaceComplexity}
+        onChange={(e) => setSpaceComplexity(e.target.value)}
+        className="w-full text-sm font-mono text-slate-800 outline-none bg-transparent placeholder:text-slate-400"
+      />
+    </div>
+  </div>
+)}
   <div className="mt-5 flex items-center justify-between">
     <button
       type="button"
@@ -2247,6 +2782,12 @@ const RoundIndicator = () => {
         setAnswer("");
         setCodeOutput(null);
         setCodeStatus("idle");
+        setTimeComplexity("");
+      setSpaceComplexity("");
+        setWhiteboardElements([]);
+if (excalidrawAPI) {
+    excalidrawAPI.resetScene();
+}
       }}
       className="text-slate-500 text-sm font-medium hover:text-slate-700 transition-colors px-3 py-2 hover:bg-slate-100 rounded-lg"
     >
@@ -2413,7 +2954,36 @@ const RoundIndicator = () => {
     Processing final results...
   </div>
 )}
-
+{/* 👇 NEW: Roadmap Section Integration */}
+  <div className="mt-12">
+    {loadingRoadmap ? (
+      <div className="flex flex-col items-center justify-center p-12 bg-white rounded-3xl border-2 border-slate-100 shadow-xl">
+        <div className="relative">
+          <div className="w-16 h-16 border-4 border-indigo-100 border-t-indigo-600 rounded-full animate-spin"></div>
+          <div className="absolute inset-0 flex items-center justify-center">
+            <Sparkles size={20} className="text-indigo-600" />
+          </div>
+        </div>
+        <h3 className="mt-6 text-xl font-bold text-slate-900">
+          Generating Personalized Roadmap...
+        </h3>
+        <p className="text-slate-500 mt-2 text-center max-w-md">
+          AI is analyzing your mistakes in DSA and System Design to create a custom 4-week study plan.
+        </p>
+      </div>
+    ) : roadmap ? (
+      <RoadmapDisplay plan={roadmap} />
+    ) : (
+      <div className="text-center mt-8">
+        <button 
+          onClick={fetchRoadmap}
+          className="text-indigo-600 font-bold hover:underline flex items-center justify-center gap-2 mx-auto"
+        >
+          <Zap size={18} /> Generate Study Plan
+        </button>
+      </div>
+    )}
+  </div>
 
               <div className="flex justify-center gap-4">
                 <button
@@ -2496,6 +3066,16 @@ const RoundIndicator = () => {
                         <div className="bg-slate-50 p-4 rounded-xl text-slate-700 text-sm mb-4 border-2 border-slate-100 font-mono">
                           {String(h.a)}
                         </div>
+                        {((h.result as any)?.playback_history?.length > 0 || (h as any).playback_history?.length > 0) && (
+   <div className="mb-6 animate-in fade-in slide-in-from-bottom-2">
+     <div className="text-xs font-bold text-slate-500 uppercase mb-1 flex items-center gap-1">
+       <Video size={14} className="text-indigo-600" /> Code Process Replay
+     </div>
+     <CodeReplayPlayer 
+        history={(h.result as any)?.playback_history || (h as any).playback_history} 
+     />
+   </div>
+)}
 
                         {h.result && (
                           <div className="space-y-3">
@@ -2531,7 +3111,14 @@ const RoundIndicator = () => {
                                 </div>
                               )}
                             </div>
-
+{h.result.improvement && (
+  <div className="text-sm bg-emerald-50 p-4 rounded-lg border-l-4 border-emerald-500 text-emerald-900 mb-3">
+    <span className="font-bold flex items-center gap-2 mb-1">
+      <Lightbulb size={16} /> Feedback & Improvements:
+    </span>
+    {h.result.improvement}
+  </div>
+)}
                             {h.result.rationale && (
                               <div className="text-xs text-slate-600 bg-blue-50 p-3 rounded-lg border border-blue-100">
                                 <span className="font-bold text-blue-900">
