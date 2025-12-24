@@ -222,8 +222,7 @@ async function updateQARecordDB(qaId, patch) {
 
 async function getQAByQaId(qaId) {
   return QA.findOne({ qaId }).lean();
-}
-async function buildQuestionHistory(sessionId, excludeQaId = null) {
+}async function buildQuestionHistory(sessionId, excludeQaId = null) {
   try {
     const query = { sessionId: sessionId };
     
@@ -231,9 +230,9 @@ async function buildQuestionHistory(sessionId, excludeQaId = null) {
         query.qaId = { $ne: excludeQaId };
     }
 
-    // 👇 OPTIMIZATION: Select only fields needed for context
+    // ✅ FIX: Added 'improvement' and 'rationale' to the selection string
     const qaDocs = await QA.find(query)
-      .select("questionText candidateAnswer score verdict ideal_outline metadata.target_project metadata.type metadata.is_probe metadata.round expectedAnswerType askedAt")
+      .select("questionText candidateAnswer score verdict ideal_outline improvement rationale metadata.target_project metadata.type metadata.is_probe metadata.round expectedAnswerType askedAt")
       .sort({ askedAt: 1 })
       .lean();
 
@@ -261,7 +260,10 @@ async function buildQuestionHistory(sessionId, excludeQaId = null) {
         type: qType || "conceptual",
         target_project: r.metadata?.target_project || r.target_project || null,
         is_probe: r.metadata?.is_probe || false,
-        round: r.metadata?.round || null // Pass round info to python
+        round: r.metadata?.round || null,
+        // ✅ These fields will now be populated with actual data
+        improvement: r.improvement || r.metadata?.improvement || "", 
+        rationale: r.rationale || ""
       };
     });
   } catch (error) {
@@ -287,6 +289,34 @@ app.get("/health", (req, res) => {
 });
 
 app.get("/test", (req, res) => res.json({ message: "Server is working!" }));
+app.post("/interview/roadmap", requireAuth, async(req,res)=>{
+  try {
+    const {sessionId} = req.body;
+    if (!sessionId) return res.status(400).json({error: "sessionId required"});
+    const history = await buildQuestionHistory(sessionId);
+    const aiPayload = {
+      session_id: sessionId,
+      user_id: req.userId,
+question_history: history.map(h => ({
+        question: h.question,
+        score: h.score,
+        // Ensure we pass feedback if it exists (check rationale or improvement fields)
+        feedback: h.feedback || h.rationale || h.improvement || "",
+        type: h.type,
+        result: { 
+            improvement: h.feedback || h.improvement || "" 
+        }  
+          }))
+    };
+console.log(`🗺️ Generating roadmap for session ${sessionId}...`);  
+const aiResp = await aiClient.post("/generate_roadmap", aiPayload, {timeout: 45000});
+return res.json(aiResp.data);
+} catch (err) {
+    console.error("❌ Roadmap generation failed:", err.message);
+    const details = err?.response?.data ?? err?.message;
+    return res.status(502).json({ error: "roadmap_generation_failed", details });
+  }
+})
 app.post("/run-code", requireAuth, async (req, res) => {
   try {
     const payload = req.body || {};

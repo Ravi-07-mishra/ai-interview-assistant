@@ -182,6 +182,9 @@ TERMINATION_RULES = {
 # ==========================================
 # 🛑 EMERGENCY FALLBACK QUESTIONS (PREVENTS CRASHES)
 # ==========================================
+# ==========================================
+# 🛑 EMERGENCY FALLBACK QUESTIONS (PREVENTS CRASHES)
+# ==========================================
 FALLBACK_QUESTIONS = {
     "coding_challenge": {
         "question": "Write a Python function to check if a string is a valid palindrome...",
@@ -203,9 +206,21 @@ FALLBACK_QUESTIONS = {
         "question": "Explain the difference between a process and a thread in an operating system.",
         "type": "conceptual"
     },
-    # 👇 ADD THIS SECTION 👇
+    # 👇 ADD THESE MISSING KEYS TO FIX THE BEHAVIORAL ROUND 👇
     "behavioral": {
-        "question": "Tell me about a time you faced a difficult challenge at work or school. How did you handle it?",
+        "question": "Tell me about a time you had to learn a new technology quickly. How did you approach it?",
+        "type": "behavioral"
+    },
+    "collaboration": {
+        "question": "Describe a situation where you had a disagreement with a team member. How did you resolve it?",
+        "type": "behavioral"
+    },
+    "ownership": {
+        "question": "Tell me about a time you made a mistake in a project. How did you handle it?",
+        "type": "behavioral"
+    },
+    "achievement": {
+        "question": "What is your most significant professional achievement?",
         "type": "behavioral"
     }
 }
@@ -1451,10 +1466,19 @@ def build_generate_question_prompt(
     diversity_hint = get_diverse_question_hint(history, required_type)
     round_context = ""
     if state:
-        round_config = INTERVIEW_ROUNDS[state.current_round]
-        round_progress = len(state.round_history[state.current_round]["questions"])
+        if state.current_round == "complete":
+            round_context = """
+═══════════════════════════════════════════════════════════════════
+🎯 CURRENT ROUND: INTERVIEW COMPLETE
+Status: All rounds finished.
+Action: Generate a closing statement or final check.
+═══════════════════════════════════════════════════════════════════
+"""    
+        elif state.current_round in INTERVIEW_ROUNDS:
+            round_config = INTERVIEW_ROUNDS[state.current_round]
+            round_progress = len(state.round_history[state.current_round]["questions"])
         
-        round_context = f"""
+            round_context = f"""
 ═══════════════════════════════════════════════════════════════════
 🎯 CURRENT ROUND: {round_config['name'].upper()}
 Progress: Question {round_progress + 1} of {round_config['max_questions']}
@@ -2872,7 +2896,14 @@ class ScoreAnswerRequest(BaseModel):
     user_time_complexity: Optional[str] = None   # e.g. "O(n)"
     user_space_complexity: Optional[str] = None  # e.g. "O(1)"
 
-# Update this class in main.py
+# Update this class in main.py'
+class RoadmapRequest(BaseModel):
+    session_id: str
+    user_id: Optional[str] = "anonymous"
+    # Allow passing history explicitly (stateless mode) or rely on server state
+    question_history: Optional[List[Dict[str, Any]]] = None 
+    # Optional: Allow frontend to pass explicit weak tags
+    detected_weaknesses: Optional[List[str]] = []
 class CodeSubmissionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")  # 🔥 CRITICAL
 
@@ -3240,8 +3271,185 @@ def generate_question(req: GenerateQuestionRequest):
         },
         "ended": False
     }
+@app.post("/generate_roadmap")
+def generate_roadmap(req: RoadmapRequest):
+    """
+    Generates a dynamic 4-week study plan with Hybrid Logic.
+    - Many Weaknesses -> Full Recovery Plan
+    - Few Weaknesses -> Hybrid Plan (Week 1 Fix + Weeks 2-4 Mastery)
+    - No Weaknesses -> Full Advanced Mastery Plan
+    - INCORPORATES SPECIFIC FEEDBACK FROM HISTORY
+    """
+    history = req.question_history
+    
+    if not history:
+        if req.session_id in INTERVIEW_STATE:
+            history = INTERVIEW_STATE[req.session_id].history
+        else:
+            logger.warning(f"No history found for {req.session_id}, generating generic roadmap")
+            history = []
 
+    # 1. Analyze Performance
+    weak_areas = {}   # Score < 0.65
+    strong_areas = [] # Score >= 0.65
+    skill_scores = {}
+    
+    if history:
+        for h in history:
+            q_type = h.get("type") or h.get("metadata", {}).get("type") or "conceptual"
+            if q_type == "code": q_type = "coding_challenge"
+            
+            try:
+                raw_score = h.get("score")
+                if isinstance(raw_score, dict): raw_score = raw_score.get("overall_score")
+                score = float(raw_score) if raw_score is not None else 0.0
+            except:
+                score = 0.0
 
+            if q_type not in skill_scores: skill_scores[q_type] = []
+            skill_scores[q_type].append(score)
+            
+            q_text = safe_truncate(h.get("question", ""), 200)
+            
+            # Extract feedback (improvement or rationale)
+            raw_feedback = h.get("feedback") or h.get("result", {}).get("improvement") or h.get("result", {}).get("rationale") or "No specific feedback."
+            clean_feedback = safe_truncate(raw_feedback, 300)
+
+            if score < 0.65:
+                if q_type not in weak_areas: weak_areas[q_type] = []
+                weak_areas[q_type].append({
+                    "question": q_text,
+                    "score": score,
+                    "feedback": clean_feedback
+                })
+            else:
+                strong_areas.append(q_text)
+
+    skill_averages = {
+        k: round(sum(v) / len(v), 2) for k, v in skill_scores.items()
+    }
+
+    # 2. Determine Strategy (SMART HYBRID LOGIC)
+    weak_count = sum(len(v) for v in weak_areas.values())
+    
+    # Flatten lists for context, including the FEEDBACK
+    weak_context = [
+        f"Question: {item['question']}\n   Feedback to Fix: {item['feedback']}" 
+        for sublist in weak_areas.values() for item in sublist
+    ]
+    strong_context = strong_areas[:5]
+
+    if weak_count == 0:
+        # Scenario A: Rock Star (100% Mastery)
+        plan_type = "ADVANCED MASTERY PLAN"
+        context_data = {"strengths": strong_context}
+        task_instruction = (
+            "The candidate PASSED all questions. Create an ADVANCED plan to take their existing skills "
+            "(listed in 'strengths') to an Expert/Architect level. Do NOT suggest basics."
+        )
+    elif weak_count <= 2:
+        # Scenario B: Hybrid (25% Fix, 75% Mastery)
+        plan_type = "HYBRID ACCELERATION PLAN"
+        context_data = {"gaps_to_fix": weak_context, "strengths_to_advance": strong_context}
+        task_instruction = (
+            "The candidate is STRONG but has minor gaps. "
+            "**Week 1 MUST focus strictly on fixing the specific 'Feedback to Fix' mentioned in 'gaps_to_fix'.** "
+            "**Weeks 2-4 MUST focus on advancing their 'strengths_to_advance' to an expert level.** "
+            "Do NOT spend 4 weeks on the small gaps."
+        )
+    else:
+        # Scenario C: Struggling (100% Recovery)
+        plan_type = "RECOVERY PLAN"
+        context_data = {"critical_failures": weak_context}
+        task_instruction = (
+            "The candidate struggled significantly. Create a strict plan to fix these specific knowledge gaps. "
+            "The plan must explicitly address the 'Feedback to Fix' provided for each failure."
+        )
+
+    # 3. Build AI Prompt
+    prompt = f"""
+You are a Senior Technical Mentor creating a personalized 4-week {plan_type}.
+
+PERFORMANCE METRICS:
+{json.dumps(skill_averages, indent=2)}
+
+CONTEXT DATA (Includes specific feedback from the interview):
+{json.dumps(context_data, indent=2)}
+
+TASK:
+{task_instruction}
+
+⚠️ CRITICAL RULES:
+1. **Feedback-Driven**: If the feedback says "You forgot edge cases", the plan MUST include a day for "Testing Edge Cases".
+2. **Context-Driven**: Plans must be about the specific technologies mentioned (e.g., Python, Trading, React).
+3. **Specific Resources**: Suggest real-world resources (e.g., "Designing Data-Intensive Applications", "Python GIL Source Code").
+
+OUTPUT JSON FORMAT:
+{{
+  "overall_assessment": "String summarizing performance and the specific goal of this plan.",
+  "skill_radar": {{
+    "dsa": 0.0-1.0,
+    "system_design": 0.0-1.0,
+    "communication": 0.0-1.0
+  }},
+  "weekly_plan": [
+    {{
+      "week": 1,
+      "theme": "Specific Topic",
+      "goals": ["Goal 1", "Goal 2"],
+      "daily_tasks": [
+        {{
+          "day": "Day 1-2",
+          "activity": "Detailed study activity...",
+          "resources": [
+              {{"type": "video", "title": "Specific Video Title"}},
+              {{"type": "article", "title": "Specific Article Title"}}
+          ]
+        }}
+      ]
+    }}
+  ]
+}}
+"""
+
+    # 4. Call LLM
+    try:
+        resp = llm_call(prompt, temperature=0.4, max_tokens=2500)
+        
+        if not resp.get("ok"):
+            raise HTTPException(status_code=502, detail="AI roadmap generation failed")
+        
+        roadmap = extract_json_from_text(resp["raw"])
+        
+        if not roadmap:
+            raise HTTPException(status_code=500, detail="Failed to parse roadmap JSON")
+        
+        # 5. Add URLs
+        for week in roadmap.get("weekly_plan", []):
+            for task in week.get("daily_tasks", []):
+                for res in task.get("resources", []):
+                    title = res.get("title", "")
+                    if res.get("type") == "video":
+                        res["url"] = f"https://www.youtube.com/results?search_query={title.replace(' ', '+')}"
+                    else:
+                        res["url"] = f"https://www.google.com/search?q={title.replace(' ', '+')}"
+
+        return {
+            "success": True,
+            "roadmap": roadmap,
+            "metrics": {
+                "skill_averages": skill_averages,
+                "weak_count": weak_count
+            }
+        }
+
+    except Exception as e:
+        logger.exception("Roadmap generation error")
+        return {
+            "success": False, 
+            "error": str(e),
+            "roadmap": None 
+        }
 @app.post("/run_code")
 def run_code(req: CodeSubmissionRequest):
     import json, re

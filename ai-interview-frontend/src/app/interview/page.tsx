@@ -27,7 +27,16 @@ import {
   Loader2,
   FileText, // <--- NEW
   ArrowRight,
-  LayoutTemplate, // <--- NEW // Added for loading indicator
+  LayoutTemplate,
+  Map,
+  Calendar,
+  BookOpen,
+  Video,
+  Code,
+  Layout,
+  ExternalLink,
+  Zap
+   // <--- NEW // Added for loading indicator
 } from "lucide-react";
 
 /* -------------------------
@@ -201,7 +210,8 @@ const allTestsPassed =
   const [showViolationWarning, setShowViolationWarning] = useState(false);
   const [terminatedByViolation, setTerminatedByViolation] = useState(false);
   const [violationReason, setViolationReason] = useState<string | null>(null);
-
+const [roadmap, setRoadmap] = useState<any>(null);
+  const [loadingRoadmap, setLoadingRoadmap] = useState(false);
   // Camera refs/state: separate preview and proctor video elements
   const previewVideoRef = useRef<HTMLVideoElement | null>(null);
   const proctorVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -276,6 +286,29 @@ useEffect(() => {
       console.warn("stopCamera error:", e);
     }
   }, []);
+  const fetchRoadmap = useCallback(async()=>{
+    if(!sessionId || !token || roadmap || loadingRoadmap) return;
+    setLoadingRoadmap(true);
+    try {
+      console.log("🗺️ Fetching AI Roadmap...");
+      const res = await fetch(`${API}/interview/roadmap`,{
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({sessionId},)
+      });
+      const data = await res.json();
+      if (data.roadmap) {
+        setRoadmap(data.roadmap);
+      }
+    } catch (err) {
+      console.error("❌ Failed to fetch roadmap:", err);
+    } finally {
+      setLoadingRoadmap(false);
+    }
+  },[sessionId, token, API, roadmap, loadingRoadmap])
 // --------------------- Helper: normalize testcases ---------------------
 const buildTestCasesFromChallenge = (challenge: any) => {
   const candidateLists = [
@@ -1298,6 +1331,152 @@ if (data?.firstQuestion?.is_probe) {
       </div>
     </div>
   );
+};const RoadmapDisplay = ({ plan }: { plan: any }) => {
+  if (!plan) return null;
+
+  // 🔍 DEBUG: Log exactly what the frontend is seeing
+  console.log("🔍 Roadmap Data Received:", plan);
+
+  // 🛠️ HELPER: Recursively find the 'weekly_plan' array
+  // This fixes issues where AI returns { roadmap: { weekly_plan: ... } }
+  // or { WeeklyPlan: ... } or other variations.
+  const findSchedule = (obj: any): any[] => {
+    if (!obj || typeof obj !== 'object') return [];
+    
+    // 1. Direct match (case insensitive)
+    const keys = Object.keys(obj);
+    const planKey = keys.find(k => k.toLowerCase().includes('weekly') && k.toLowerCase().includes('plan'));
+    if (planKey && Array.isArray(obj[planKey])) {
+      return obj[planKey];
+    }
+
+    // 2. Check for 'roadmap' wrapper
+    if (obj.roadmap && typeof obj.roadmap === 'object') {
+        return findSchedule(obj.roadmap);
+    }
+
+    return [];
+  };
+
+  const schedule = findSchedule(plan);
+  
+  // Extract other fields safely
+  const assessment = plan.overall_assessment || plan.roadmap?.overall_assessment || plan.assessment || "Your personalized recovery plan.";
+  const radar = plan.skill_radar || plan.roadmap?.skill_radar || plan.skills || null;
+  const projects = plan.recommended_projects || plan.roadmap?.recommended_projects || [];
+
+  return (
+    <div className="mt-10 animate-in fade-in slide-in-from-bottom-6 duration-700">
+      <div className="bg-white rounded-3xl border-2 border-indigo-100 shadow-xl overflow-hidden">
+        
+        {/* Header */}
+        <div className="bg-gradient-to-r from-indigo-600 to-blue-600 p-8 text-white">
+          <div className="flex items-center gap-3 mb-2">
+            <Map className="text-indigo-200" size={28} />
+            <h2 className="text-2xl font-black uppercase tracking-wide">4-Week Recovery Plan</h2>
+          </div>
+          <p className="text-indigo-100 text-lg font-medium leading-relaxed max-w-3xl">
+            {assessment}
+          </p>
+        </div>
+
+        <div className="p-8">
+          {/* Skill Radar */}
+          {radar && (
+            <div className="mb-10 p-6 bg-slate-50 rounded-2xl border border-slate-200">
+              <h3 className="font-bold text-slate-700 mb-4 flex items-center gap-2">
+                <Target size={18} /> Skill Gap Analysis
+              </h3>
+              <div className="space-y-4 grid grid-cols-1 md:grid-cols-2 gap-6">
+                {Object.entries(radar).map(([skill, score]: [string, any]) => (
+                  <div key={skill}>
+                    <div className="flex justify-between text-xs font-bold uppercase text-slate-500 mb-1">
+                      <span>{skill.replace(/_/g, " ")}</span>
+                      <span>{Math.round(Number(score) * 100)}%</span>
+                    </div>
+                    <div className="h-2 w-full bg-slate-200 rounded-full overflow-hidden">
+                      <div 
+                        className={`h-full rounded-full ${score > 0.7 ? 'bg-emerald-500' : score > 0.4 ? 'bg-amber-500' : 'bg-rose-500'}`} 
+                        style={{ width: `${Number(score) * 100}%` }} 
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Weekly Timeline */}
+          <div className="space-y-8">
+            <h3 className="font-bold text-xl text-slate-900 flex items-center gap-2 border-b pb-4">
+              <Calendar size={20} className="text-indigo-600" /> Actionable Schedule
+            </h3>
+            
+            {schedule.length === 0 ? (
+               <div className="text-center p-8 bg-slate-50 rounded-xl border border-slate-200 text-slate-500 italic">
+                 <p>No specific schedule generated.</p>
+                 <p className="text-xs mt-2 text-slate-400">(Debug: Check console for 'Roadmap Data Received')</p>
+               </div>
+            ) : (
+              <div className="relative border-l-2 border-indigo-100 ml-3 space-y-8 pb-4">
+                {schedule.map((week: any, wIdx: number) => (
+                  <div key={wIdx} className="relative pl-8">
+                    <div className="absolute -left-[9px] top-0 w-5 h-5 bg-indigo-600 rounded-full border-4 border-white shadow-sm" />
+                    
+                    <div className="mb-4">
+                      <h4 className="text-lg font-bold text-slate-800">Week {week.week}: {week.theme}</h4>
+                      <div className="flex flex-wrap gap-2 mt-2">
+                        {week.goals?.map((g: string, i: number) => (
+                          <span key={i} className="text-xs font-medium px-2 py-0.5 bg-green-50 text-green-700 rounded-md border border-green-200">
+                            🎯 {g}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 gap-4">
+                      {week.daily_tasks?.map((task: any, dIdx: number) => (
+                        <div key={dIdx} className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm hover:shadow-md transition-shadow">
+                          <div className="flex justify-between items-start mb-2">
+                            <span className="text-xs font-bold bg-slate-100 text-slate-600 px-2 py-1 rounded uppercase tracking-wider">
+                              {task.day}
+                            </span>
+                          </div>
+                          <p className="font-medium text-slate-800 mb-3">{task.activity}</p>
+                          
+                          <div className="space-y-2">
+                            {task.resources?.map((res: any, rIdx: number) => (
+                              <a 
+                                key={rIdx} 
+                                href={res.url} 
+                                target="_blank" 
+                                rel="noopener noreferrer"
+                                className="flex items-center gap-3 p-2 rounded-lg bg-slate-50 hover:bg-indigo-50 border border-slate-100 hover:border-indigo-200 transition-colors group"
+                              >
+                                <div className="shrink-0">
+                                  {res.type === 'video' ? <Video size={16} className="text-red-500" /> : <BookOpen size={16} className="text-blue-500" />}
+                                </div>
+                                <div className="flex-1 min-w-0">
+                                  <div className="text-sm font-medium text-slate-700 group-hover:text-indigo-700 truncate">
+                                    {res.title}
+                                  </div>
+                                </div>
+                                <ExternalLink size={14} className="text-slate-400 group-hover:text-indigo-400" />
+                              </a>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 };
 const RoundTransitionModal = () => {
   if (!showRoundModal) return null;
@@ -1876,7 +2055,7 @@ const RoundIndicator = () => {
           </div>
         )}
               <EliminationModal />
-
+<RoundTransitionModal />
 
         {/* Header (unchanged) */}
         <div className="mb-8 flex items-center justify-between">
@@ -2641,7 +2820,36 @@ if (excalidrawAPI) {
     Processing final results...
   </div>
 )}
-
+{/* 👇 NEW: Roadmap Section Integration */}
+  <div className="mt-12">
+    {loadingRoadmap ? (
+      <div className="flex flex-col items-center justify-center p-12 bg-white rounded-3xl border-2 border-slate-100 shadow-xl">
+        <div className="relative">
+          <div className="w-16 h-16 border-4 border-indigo-100 border-t-indigo-600 rounded-full animate-spin"></div>
+          <div className="absolute inset-0 flex items-center justify-center">
+            <Sparkles size={20} className="text-indigo-600" />
+          </div>
+        </div>
+        <h3 className="mt-6 text-xl font-bold text-slate-900">
+          Generating Personalized Roadmap...
+        </h3>
+        <p className="text-slate-500 mt-2 text-center max-w-md">
+          AI is analyzing your mistakes in DSA and System Design to create a custom 4-week study plan.
+        </p>
+      </div>
+    ) : roadmap ? (
+      <RoadmapDisplay plan={roadmap} />
+    ) : (
+      <div className="text-center mt-8">
+        <button 
+          onClick={fetchRoadmap}
+          className="text-indigo-600 font-bold hover:underline flex items-center justify-center gap-2 mx-auto"
+        >
+          <Zap size={18} /> Generate Study Plan
+        </button>
+      </div>
+    )}
+  </div>
 
               <div className="flex justify-center gap-4">
                 <button
