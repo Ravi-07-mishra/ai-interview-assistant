@@ -31,55 +31,59 @@ async function getProfileDashboard(req, res) {
         : 0;
 
     // ================= INTERVIEW HISTORY =================
-    const interviewHistory = [];
+    // ================= INTERVIEW HISTORY (ROUND-WISE) =================
+const interviewHistory = [];
 
-    for (const session of sessions) {
-      const sessionQAs = qas.filter(
-        q => q.sessionId === session.sessionId
-      );
+for (const session of sessions) {
+  const sessionQAs = qas.filter(q => q.sessionId === session.sessionId);
 
-      const sessionScores = sessionQAs
-        .map(q => q.score)
-        .filter(s => typeof s === "number");
-
-      const sessionAvg =
-        sessionScores.length > 0
-          ? Math.round(
-              (sessionScores.reduce((a, b) => a + b, 0) / sessionScores.length) * 100
-            ) / 100
-          : null;
-
-      const decision = await Decision.findOne({
-        sessionId: session.sessionId
-      }).lean();
-
-      interviewHistory.push({
-        sessionId: session.sessionId,
-        date: session.startedAt,
-        averageScore: sessionAvg,
-        verdict: decision?.verdict || "completed",
-        feedback:
-          decision?.reason ||
-          sessionQAs[sessionQAs.length - 1]?.improvement ||
-          null
-      });
+  const rounds = {
+    screening: [],
+    technical: [],
+    behavioral: []
+  };
+  // group QAs by round
+  sessionQAs.forEach(q => {
+    const round = q.metadata?.round;
+    if (round && rounds[round]) {
+      rounds[round].push(q);
     }
+  });
+  // helper to compute avg + feedback
+  const summarizeRound = (qas) => {
+    if (!qas.length) return null;
 
-   return res.json({
+    const scores = qas.map(q => q.score).filter(s => typeof s === "number");
+    const avgScore = scores.length
+      ? Math.round((scores.reduce((a, b) => a + b, 0) / scores.length) * 100) / 100
+      : null;
+
+    const lastQA = qas[qas.length - 1];
+
+    return {
+      averageScore: avgScore,
+      feedback: lastQA?.improvement || lastQA?.rationale || null
+    };
+  };
+
+  interviewHistory.push({
+    sessionId: session.sessionId,
+    date: session.startedAt,
+    rounds: {
+      screening: summarizeRound(rounds.screening),
+      technical: summarizeRound(rounds.technical),
+      behavioral: summarizeRound(rounds.behavioral)
+    }
+  });
+}
+
+  return res.json({
   user,
   stats: {
     totalInterviews,
     averageScore
   },
-  pastSessions: interviewHistory.map(i => ({
-    sessionId: i.sessionId,
-    startedAt: i.date,
-    status: i.verdict,
-    qas: [{
-      score: i.averageScore,
-      feedback: i.feedback
-    }]
-  }))
+  interviewHistory
 });
   } catch (err) {
     console.error("Profile dashboard error:", err);
